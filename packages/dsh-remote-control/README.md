@@ -309,6 +309,42 @@ relay 根本收不到。relay 拿到这个头之后只给 HTML 注入一个 `<ba
 而生产环境挂在 `/harness/` 下会彻底不可用。现在 `ui-check` 会起一个**和 nginx 行为一致的代理**
 （剥前缀 + 加头）专门复现这个挂载方式，`relay-check` 里也有一条零依赖的等价断言。
 
+### 3·5、服务器上的代码在哪（部署后必读）
+
+中转台的代码放在服务器 **`/opt/dsh-remote-control/`**，而且**它现在是一个 git 检出**，
+不是散装上传的文件——这样可以随时确认线上跑的是哪一版，也能直接 `git pull` 更新。
+
+```
+/opt/dsh-remote-control/                                  ← git 检出（完整 monorepo）
+└── packages/dsh-remote-control/relay/server.js           ← 服务实际执行的文件
+    packages/dsh-remote-control/relay/public/index.html   ← 问答页
+/etc/dsh-remote-relay.env                                 ← 两个令牌（600 root）
+/etc/systemd/system/dsh-remote-relay.service              ← 单元文件
+```
+
+> **注意路径。** 早期版本是把 `packages/dsh-remote-control` 的内容直接铺在
+> `/opt/dsh-remote-control/` 下的，所以 `ExecStart` 一度是 `<那个目录>/relay/server.js`。
+> 现在是完整仓库，正确路径多了 `packages/dsh-remote-control/` 一层。
+> 改单元文件后**必须 `daemon-reload`**，否则 systemd 会继续用缓存里的旧路径去启动，
+> 表现为服务反复 `activating (auto-restart)` + 日志里 `MODULE_NOT_FOUND`。
+
+更新线上代码：
+
+```sh
+cd /opt/dsh-remote-control && sudo -u ubuntu git pull
+sudo systemctl restart dsh-remote-relay
+```
+
+改过单元文件的话，restart 之前先 `sudo systemctl daemon-reload`。
+
+自检：
+
+```sh
+systemctl is-active dsh-remote-relay                     # active
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/api/state   # 401
+curl -s -o /dev/null -w '%{http_code}\n' https://icyu.online/harness/      # 200
+```
+
 ### 4. 验收
 
 ```sh
