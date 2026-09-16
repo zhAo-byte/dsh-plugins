@@ -21,11 +21,9 @@
  * @module dsh-remote-control
  */
 
-import Schema from '@deepseek-ai/schemastery'
-import { createHash } from 'node:crypto'
-import { homedir, hostname, platform, release } from 'node:os'
+import { hostname, platform, release } from 'node:os'
 import { RelayAuthError, RelayClient, RelayUnreachableError } from './client.js'
-import { DEFAULT_CONFIG, resolveConfig } from './config.js'
+import { deriveNodeId, resolveConfig } from './config.js'
 import { RemoteRunner, normalizeWorkspaces } from './runner.js'
 
 /** Cordis plugin name; also the id used in a profile patch. */
@@ -40,36 +38,15 @@ export const name = 'dsh-remote-control'
  */
 export const REQUIRED_SERVICES = ['agents', 'agentPresets', 'permissionPresets', 'workspaceRegistry']
 
-/** Configuration schema, doubles as the documented key list. */
-export const Config = Schema.object({
-  /** Absolute base URL of the relay, e.g. `https://icyu.online/harness`. */
-  relayUrl: Schema.string().required(),
-  /** Token this node presents to the relay; the relay's `DSH_REMOTE_AGENT_TOKEN`. */
-  nodeToken: Schema.string().required(),
-  /** Stable identity for this installation. Derived from the host name by default. */
-  nodeId: Schema.string().default(DEFAULT_CONFIG.nodeId),
-  /** Display name on the control page. Defaults to the host name. */
-  displayName: Schema.string().default(DEFAULT_CONFIG.displayName),
-  /**
-   * Workbenches this node offers. Accepts `- ~/Desktop/project` or
-   * `- { name: project, path: ~/Desktop/project }`.
-   */
-  workspaces: Schema.array(Schema.any()).default([]),
-  /** Agent preset remote sessions are composed from. */
-  agentPreset: Schema.string().default(DEFAULT_CONFIG.agentPreset),
-  /**
-   * Permission preset pinned onto every remote session. The shipped
-   * `workspace-write` bundles the `workspace-write` sandbox with the `ask`
-   * approval policy, so anything outside the workspace stops and waits for a
-   * human at this machine.
-   */
-  permissionPreset: Schema.string().default(DEFAULT_CONFIG.permissionPreset),
-  /** Reconnect delay after a failed exchange, doubled up to the cap. */
-  reconnectMinMs: Schema.number().default(DEFAULT_CONFIG.reconnectMinMs),
-  reconnectMaxMs: Schema.number().default(DEFAULT_CONFIG.reconnectMaxMs),
-  /** Set false to validate configuration and log the verdict without connecting. */
-  enabled: Schema.boolean().default(DEFAULT_CONFIG.enabled)
-})
+// There is deliberately no `Config` schema here.
+//
+// One used to live at this spot, and it was a static import of
+// `@deepseek-ai/schemastery` — a peer dependency — at the top of the entry
+// point. That made the module impossible to load wherever the package was not
+// installed, which broke every check and every non-Harness context, while nothing
+// actually read the schema: the defaults and validation that take effect are in
+// `config.js`. The accepted keys are documented there instead. If a schema is
+// ever genuinely needed, import it lazily inside a function.
 
 /**
  * Mount the node.
@@ -249,20 +226,6 @@ function report(logger, level, message) {
   const line = `dsh-remote-control: ${message}`
   logger?.[level]?.(line)
   process.stderr.write(`${line}\n`)
-}
-
-/**
- * Derive a stable node id from the machine's host name and home directory.
- *
- * The hash keeps the id opaque and ASCII-safe, while staying stable across
- * restarts so the control page keeps the same entry. Two machines sharing a host
- * name would collide; `nodeId` exists for exactly that case.
- *
- * @returns {string} a stable, URL-safe node id.
- */
-export function deriveNodeId() {
-  const seed = `${hostname()}:${homedir()}`
-  return `node-${createHash('sha256').update(seed).digest('hex').slice(0, 12)}`
 }
 
 /**

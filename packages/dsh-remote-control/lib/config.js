@@ -15,15 +15,36 @@
  * genuinely invalid value (an empty or non-absolute URL) is raised as a clear
  * `TypeError` the caller can print. The plugin body then reads a complete object.
  *
+ * **The accepted keys are documented here and nowhere else.** There used to be a
+ * `@deepseek-ai/schemastery` schema in `index.js` describing them, which was a
+ * mistake twice over: it was a static import of a peer dependency in the plugin
+ * entry point, so any machine without that package present could not even *load*
+ * the plugin; and nothing consumed it, because the defaults and validation that
+ * actually take effect live in this file. A decorative schema that can stop the
+ * module from loading is worse than no schema. If a real need for one appears, it
+ * must be loaded lazily inside a function, never at module top level.
+ *
+ * | key | default | meaning |
+ * | --- | --- | --- |
+ * | `relayUrl` | required | absolute relay base URL, sub-path included, no trailing slash |
+ * | `nodeToken` | required | the relay's `DSH_REMOTE_AGENT_TOKEN` |
+ * | `nodeId` | hash of host name + home | stable identity; set only to break a collision |
+ * | `displayName` | host name | label on the control page |
+ * | `workspaces` | `[]` | allow-list; `'~/dir'` or `{ name, path }` |
+ * | `agentPreset` | `standard` | agent preset remote sessions compose from |
+ * | `permissionPreset` | `workspace-write` | pinned onto every remote session |
+ * | `reconnectMinMs` / `reconnectMaxMs` | `2000` / `60000` | reconnect backoff bounds |
+ * | `enabled` | `true` | `false` validates and logs without connecting |
+ *
  * @module dsh-remote-control/config
  */
 
+import { createHash } from 'node:crypto'
+import { homedir, hostname } from 'node:os'
+import { isAbsolute, join } from 'node:path'
+
 /**
  * The defaults, in one place.
- *
- * The schema and the resolver must agree on every default; keeping two copies is
- * how a key ends up documented as `standard` while the code falls back to
- * something else. Both read this object.
  */
 export const DEFAULT_CONFIG = Object.freeze({
   nodeId: '',
@@ -85,4 +106,21 @@ export function resolveConfig(raw = {}) {
     // the more surprising default for a plugin you installed on purpose.
     enabled: source.enabled !== false
   }
+}
+
+/**
+ * Derive a stable node id from the machine's host name and home directory.
+ *
+ * The hash keeps the id opaque and ASCII-safe, while staying stable across
+ * restarts so the control page keeps the same entry. Two machines sharing a host
+ * name would collide; an explicit `nodeId` exists for exactly that case.
+ *
+ * This lives here rather than in the entry point so that the identity rule can be
+ * exercised without loading the plugin, which mounts against the Harness.
+ *
+ * @returns {string} a stable, URL-safe node id.
+ */
+export function deriveNodeId() {
+  const seed = `${hostname()}:${homedir()}`
+  return `node-${createHash('sha256').update(seed).digest('hex').slice(0, 12)}`
 }

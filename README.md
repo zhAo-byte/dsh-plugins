@@ -62,9 +62,9 @@ dsh plugin --profile web add ./packages/dsh-remote-control
 每个包都自带零依赖的自检，且都能在**本仓原地**跑通。
 
 ```sh
-# 远程控制：5 套，共 182 项
+# 远程控制：5 套，共 184 项
 cd packages/dsh-remote-control
-npm test                 # relay 41 / node 48 / runner 51
+npm test                 # relay 41 / node 50 / runner 51
 npm run test:live        # 隔离 DSH_HOME 里真启动一次 web profile（21）
 npm run test:ui          # 真 Chromium 驱动问答页（21，需要浏览器）
 

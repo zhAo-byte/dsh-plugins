@@ -14,7 +14,7 @@
 
 import { createServer } from 'node:http'
 import { RelayAuthError, RelayClient, RelayUnreachableError, normalizeRelayUrl } from '../lib/client.js'
-import { deriveNodeId } from '../lib/index.js'
+import { deriveNodeId } from '../lib/config.js'
 import { normalizeWorkspaces } from '../lib/runner.js'
 
 let failures = 0
@@ -85,6 +85,69 @@ const base = `http://127.0.0.1:${String(port)}`
 
 try {
   process.stdout.write('node-check\n')
+
+  // ── the plugin module must load without the Harness present ──────────────
+  // A real regression, caught by CI on all three platforms: `lib/index.js` used
+  // to begin with a static `import Schema from '@deepseek-ai/schemastery'`. A peer
+  // dependency imported at module top level is a hard requirement to *load* the
+  // module — so every check, and every non-Harness context, died with
+  // ERR_MODULE_NOT_FOUND while the schema itself was never read. It never showed
+  // up locally because the development symlink made the package visible.
+  //
+  // Two assertions: no `@deepseek-ai/*` static import anywhere in the package's
+  // own lib, and the entry point actually importing in a subprocess.
+  {
+    const { readFile, readdir } = await import('node:fs/promises')
+    const { spawn } = await import('node:child_process')
+    const { fileURLToPath } = await import('node:url')
+    const { dirname, join } = await import('node:path')
+    const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+    const offenders = []
+    for (const file of await readdir(join(packageRoot, 'lib'))) {
+      if (!file.endsWith('.js')) continue
+      const source = await readFile(join(packageRoot, 'lib', file), 'utf8')
+      for (const line of source.split('\n')) {
+        if (/^\s*import\b/.test(line) && line.includes('@deepseek-ai/')) {
+          offenders.push(`lib/${file}: ${line.trim()}`)
+        }
+      }
+    }
+    check(
+      'no package-internal module statically imports a Harness peer dependency',
+      offenders.length === 0,
+      offenders.join(' | ')
+    )
+
+    // The value helpers are reached through a lazy `require`-based resolver, so
+    // the entry point must import cleanly even with no `@deepseek-ai` in sight.
+    const probe = spawn(
+      process.execPath,
+      [
+        '-e',
+        `import(${JSON.stringify(join(packageRoot, 'lib', 'index.js'))})` +
+          `.then((m) => { console.log(typeof m.apply === 'function' ? 'apply-ok' : 'no-apply'); process.exit(0) })` +
+          `.catch((e) => { console.error(e.code ?? e.message); process.exit(3) })`
+      ],
+      { env: { ...process.env, DSH_REMOTE_CONTROL_PROFILE_DIR: '/nonexistent-on-purpose' } }
+    )
+    let out = ''
+    let err = ''
+    probe.stdout.setEncoding('utf8')
+    probe.stdout.on('data', (chunk) => {
+      out += chunk
+    })
+    probe.stderr.setEncoding('utf8')
+    probe.stderr.on('data', (chunk) => {
+      err += chunk
+    })
+    const code = await new Promise((resolve) => probe.once('exit', resolve))
+    check(
+      'the entry point imports with no Harness packages reachable',
+      code === 0 && out.includes('apply-ok'),
+      `${err.trim().slice(0, 200)} (exit ${String(code)})`
+    )
+  }
 
   // ── URL normalization ────────────────────────────────────────────────────
   check('a bare origin survives normalization', normalizeRelayUrl('https://icyu.online') === 'https://icyu.online')
