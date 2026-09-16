@@ -1,0 +1,36 @@
+# dsh-git-repos bundle patch.
+#
+# One row: the host half registers `/dsh-git-repos/api/*` on the web server, and
+# the same package's `./client` export is the right-sidebar tab that calls it.
+# Listed in `dsh.profile.bundles` this patch is merged automatically by profile
+# boot; the user patch layer can override any field below by id.
+#
+# All fields are optional. Defaults are shown commented out.
+- insert:
+    - id: git-repos
+      name: 'dsh-git-repos'
+      config:
+        # Directory scan budget when the panel enumerates repositories.
+        discover:
+          maxDepth: 4
+          limit: 60
+        # Extra roots the API may touch, beyond the DSH workspace registry.
+        # extraRoots:
+        #   - /Users/me/work
+        # A root is allowed when it lives under a registered workspace, under an
+        # extra root, or under $HOME when this is true.
+        allowHome: true
+        # Hosts treated as GitLab when reading remotes. Any hostname containing
+        # "gitlab" is always treated as GitLab; list self-hosted ones here.
+        gitlabHosts: []
+        # API token for merge requests / pipelines. Prefer $GITLAB_TOKEN or
+        # ~/.dsh/settings.yaml over writing a token into this file:
+        #
+        #   git-repos:
+        #     gitlabToken: glpat-...
+        #
+        # token: ''
+        # Command timeouts, milliseconds.
+        timeouts:
+          read: 20000
+          network: 180000

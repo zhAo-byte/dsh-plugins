@@ -1,0 +1,51 @@
+{
+  "name": "dsh-git-repos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-repository Git manager for DeepSeek Harness: a Rider-style Git tool window inside the official right sidebar, with GitLab hosting awareness (merge requests, pipelines, clone URLs).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./git": "./lib/git.js",
+    "./gitlab": "./lib/gitlab.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "git",
+    "gitlab",
+    "sidebar",
+    "multi-repo"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "scripts": {
+    "check": "node tools/check.mjs .",
+    "check:client": "node tools/client-check.mjs",
+    "check:host": "node tools/host-check.mjs .",
+    "check:gui": "node tools/gui-check.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  }
+}
