@@ -271,9 +271,14 @@ export class RemoteRunner {
       if (prompt === '') throw new Error('prompt is empty')
       const workspacePath = this.resolveWorkspace(command.workspace)
       const existing = typeof command.sessionId === 'string' ? this.sessions.get(command.sessionId) : undefined
-      const outcome = existing === undefined
+      // A session is created inside one workspace and cannot be moved, so a
+      // `sessionId` that arrives alongside a *different* workspace starts a fresh
+      // conversation. Continuing the old one would run the question in the wrong
+      // directory and report success — a failure with no visible symptom.
+      const reusable = existing !== undefined && existing.workspacePath === workspacePath ? existing : undefined
+      const outcome = reusable === undefined
         ? await this.startConversation(workspacePath, prompt)
-        : await this.continueConversation(existing, prompt)
+        : await this.continueConversation(reusable, prompt)
       return { ...base, ok: true, sessionId: outcome.sessionId, text: outcome.text, durationMs: Date.now() - started }
     } catch (error) {
       return {

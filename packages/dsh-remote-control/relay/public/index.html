@@ -4,176 +4,617 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
+<meta name="theme-color" content="#0a0c11">
+<meta name="color-scheme" content="dark">
 <title>DSH Remote Control</title>
 <style>
+  /* ── design tokens ────────────────────────────────────────────────────
+     Layered surfaces rather than one flat pair of greys: the shell, the
+     raised cards and the inputs are three distinguishable steps, which is
+     what keeps a dark UI from reading as a single undifferentiated slab.
+     The accent is deliberately desaturated — the old #4c8dff on a #0f1115
+     background was loud enough to be the only thing the eye could land on. */
   :root {
-    --bg: #0f1115;
-    --bg-raised: #171a21;
-    --bg-input: #1d212a;
-    --line: #262b36;
-    --fg: #e6e9ef;
-    --fg-dim: #9aa3b2;
-    --fg-faint: #6b7385;
-    --accent: #4c8dff;
-    --ok: #46b96a;
-    --warn: #d9a441;
-    --err: #e0625d;
-    --radius: 10px;
+    --bg: #0a0c11;
+    --surface: #101319;
+    --surface-2: #151922;
+    --surface-3: #1b202a;
+    --line: rgba(255, 255, 255, .07);
+    --line-2: rgba(255, 255, 255, .13);
+    --fg: #e9ecf3;
+    --fg-dim: #a3abbb;
+    --fg-faint: #6d7589;
+    --accent: #5b8cff;
+    --accent-2: #8aabff;
+    --accent-soft: rgba(91, 140, 255, .13);
+    --accent-line: rgba(91, 140, 255, .34);
+    --ok: #3ecf8e;
+    --warn: #e0a94a;
+    --err: #f2685f;
+    --radius: 14px;
+    --radius-sm: 10px;
+    --shadow: 0 20px 44px -20px rgba(0, 0, 0, .8);
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+            "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    background: var(--bg);
+    /* Two soft light sources give the flat background depth without any
+       image asset, which matters: this page ships as one standalone file. */
+    background:
+      radial-gradient(1100px 520px at 80% -14%, rgba(91, 140, 255, .10), transparent 62%),
+      radial-gradient(880px 460px at 6% 108%, rgba(62, 207, 142, .055), transparent 64%),
+      var(--bg);
     color: var(--fg);
-    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font: 14px/1.6 var(--font);
     -webkit-text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
   }
   button, input, textarea, select { font: inherit; color: inherit; }
+  ::selection { background: rgba(91, 140, 255, .32); }
+  /* Scrollbars are part of the furniture on a page that is mostly scroll area. */
+  * { scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, .14) transparent; }
+  *::-webkit-scrollbar { width: 11px; height: 11px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, .10); background-clip: content-box;
+    border: 3px solid transparent; border-radius: 8px;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, .19); background-clip: content-box; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .ico {
+    width: 1em; height: 1em; display: block; fill: none; stroke: currentColor;
+    stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .sr {
+    position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+  }
+
+  /* ── brand mark ───────────────────────────────────────────────────── */
+  .mark {
+    display: grid; place-items: center; flex: none; width: 36px; height: 36px;
+    border-radius: 12px; color: #fff;
+    background: linear-gradient(145deg, #6f9aff, #3f68dd);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .28), 0 8px 18px -10px rgba(91, 140, 255, .95);
+  }
+  .mark .ico { width: 19px; height: 19px; }
+  .mark.sm { width: 30px; height: 30px; border-radius: 10px; }
+  .mark.sm .ico { width: 16px; height: 16px; }
+
+  /* ── buttons ──────────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    padding: 9px 15px; border: 0; border-radius: 11px; font-size: 13px;
+    font-weight: 600; cursor: pointer; white-space: nowrap;
+    transition: background .15s, border-color .15s, color .15s, transform .1s, box-shadow .15s;
+  }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: .42; cursor: not-allowed; }
+  .btn-primary {
+    color: #fff; background: linear-gradient(180deg, #6b97ff, #4a7bf0);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .22), 0 10px 22px -14px rgba(91, 140, 255, 1);
+  }
+  .btn-primary:hover:not(:disabled) { background: linear-gradient(180deg, #7ba3ff, #5585f5); }
+  .btn-ghost {
+    color: var(--fg-dim); background: var(--surface-2); border: 1px solid var(--line);
+  }
+  .btn-ghost:hover:not(:disabled) { color: var(--fg); background: var(--surface-3); border-color: var(--line-2); }
+  .icon-btn {
+    display: none; place-items: center; width: 34px; height: 34px; flex: none;
+    padding: 0; border-radius: 10px; cursor: pointer; color: var(--fg-dim);
+    background: var(--surface-2); border: 1px solid var(--line);
+  }
+  .icon-btn:hover { color: var(--fg); border-color: var(--line-2); }
+  .icon-btn .ico { width: 17px; height: 17px; }
 
   /* ── gate ─────────────────────────────────────────────────────────── */
-  #gate {
-    position: fixed; inset: 0; display: grid; place-items: center;
-    background: var(--bg); z-index: 20;
+  #gate { position: fixed; inset: 0; display: grid; place-items: center; z-index: 20; padding: 20px; }
+  /* A stored token is the common case, and validating it takes a round trip.
+     Without this the login card flashes on every single page load. `display` is
+     left alone so the gate is still measurable while it is hidden this way. */
+  body.booting #gate { opacity: 0; visibility: hidden; }
+  .gate-card {
+    position: relative; width: min(400px, 100%);
+    display: flex; flex-direction: column;
+    padding: 26px 26px 22px;
+    border: 1px solid var(--line-2); border-radius: 20px;
+    background: linear-gradient(180deg, #171c26, #11151d 62%);
+    box-shadow: var(--shadow);
   }
-  #gate form {
-    width: min(360px, calc(100vw - 40px));
-    background: var(--bg-raised); border: 1px solid var(--line);
-    border-radius: var(--radius); padding: 24px;
+  .brand { display: flex; align-items: center; gap: 11px; margin-bottom: 20px; }
+  .brand-text { display: flex; flex-direction: column; line-height: 1.35; min-width: 0; }
+  .brand-text strong { font-size: 14px; letter-spacing: -.01em; }
+  .brand-text span { font-size: 11.5px; color: var(--fg-faint); }
+  #gate h1 { margin: 0 0 6px; font-size: 19px; letter-spacing: -.015em; font-weight: 650; }
+  #gate p { margin: 0 0 18px; color: var(--fg-dim); font-size: 12.5px; line-height: 1.6; }
+  #gate code {
+    font-family: var(--mono); font-size: 11.5px; color: var(--fg);
+    background: var(--surface-3); border: 1px solid var(--line);
+    padding: 1px 6px; border-radius: 6px; white-space: nowrap;
   }
-  #gate h1 { margin: 0 0 4px; font-size: 17px; }
-  #gate p { margin: 0 0 18px; color: var(--fg-dim); font-size: 13px; }
-  #gate .err { color: var(--err); font-size: 13px; min-height: 18px; margin-top: 10px; }
+  .field { display: flex; flex-direction: column; gap: 7px; }
+  .field label { font-size: 11.5px; font-weight: 600; color: var(--fg-dim); letter-spacing: .02em; }
+  .input {
+    width: 100%; padding: 11px 13px; border-radius: 11px; outline: none;
+    color: var(--fg); background: var(--surface);
+    border: 1px solid var(--line-2);
+    transition: border-color .15s, box-shadow .15s, background .15s;
+  }
+  .input::placeholder { color: var(--fg-faint); }
+  .input:hover { border-color: rgba(255, 255, 255, .2); }
+  .input:focus { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(91, 140, 255, .14); }
+  .input.bad { border-color: var(--err); box-shadow: 0 0 0 4px rgba(242, 104, 95, .13); }
+  /* An empty error line collapses instead of reserving a dead 18px gap —
+     the old fixed min-height was the single most visible seam in the card. */
+  .err { margin-top: 10px; font-size: 12.5px; color: var(--err); }
+  .err:empty { display: none; }
+  .gate-actions { margin-top: 16px; }
+  .gate-actions .btn { width: 100%; padding: 11px 15px; }
+  .gate-foot {
+    margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line);
+    font-size: 11.5px; color: var(--fg-faint); text-align: center;
+  }
 
   /* ── shell ────────────────────────────────────────────────────────── */
   #app { display: none; height: 100%; }
-  #app.on { display: grid; grid-template-columns: 264px 1fr; }
+  #app.on { display: grid; grid-template-columns: 292px 1fr; }
 
   aside {
-    border-right: 1px solid var(--line); background: var(--bg-raised);
-    overflow-y: auto; padding: 14px;
+    display: flex; flex-direction: column; min-height: 0;
+    background: linear-gradient(180deg, #12161e, #0d1017);
+    border-right: 1px solid var(--line);
   }
-  aside h2 {
-    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
-    color: var(--fg-faint); margin: 18px 0 8px; font-weight: 600;
+  .aside-head {
+    display: flex; align-items: center; gap: 10px; flex: none;
+    padding: 14px 14px 12px; border-bottom: 1px solid var(--line);
   }
-  aside h2:first-child { margin-top: 0; }
+  .aside-head .as-title { font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
+  .aside-head .as-sub { font-size: 11px; color: var(--fg-faint); }
+  .aside-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 6px 10px 14px; }
+  /* Sticky labels: the two lists can each get long, and a section header that
+     scrolls away turns "which list am I in" into a guess. */
+  .aside-label {
+    position: sticky; top: 0; z-index: 2;
+    display: flex; align-items: center; gap: 8px;
+    margin: 12px 0 7px; padding: 8px 4px 6px;
+    font-size: 10.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--fg-faint);
+    background: linear-gradient(180deg, #11151c 62%, rgba(17, 21, 28, 0));
+  }
+  .aside-label .count {
+    margin-left: auto; padding: 1px 7px; border-radius: 999px;
+    font-size: 10px; letter-spacing: 0;
+    color: var(--fg-dim); background: var(--surface-3); border: 1px solid var(--line);
+  }
+  .aside-foot {
+    display: flex; align-items: center; gap: 8px; flex: none;
+    padding: 10px 16px; border-top: 1px solid var(--line);
+    font-size: 11px; color: var(--fg-faint);
+  }
+
+  .dot { position: relative; width: 8px; height: 8px; border-radius: 50%; flex: none; background: #3a4152; }
+  .dot.online { background: var(--ok); box-shadow: 0 0 0 3px rgba(62, 207, 142, .13); }
+  .dot.busy { background: var(--warn); box-shadow: 0 0 0 3px rgba(224, 169, 74, .13); }
+  .dot.busy::after {
+    content: ''; position: absolute; inset: -3px; border-radius: 50%;
+    border: 1px solid var(--warn); animation: ping 1.7s ease-out infinite;
+  }
+  @keyframes ping { 0% { transform: scale(.7); opacity: .8; } 100% { transform: scale(1.9); opacity: 0; } }
 
   .node {
-    padding: 9px 10px; border-radius: 8px; cursor: pointer;
-    border: 1px solid transparent; margin-bottom: 4px;
+    position: relative; display: block; width: 100%; margin-bottom: 4px;
+    padding: 10px 11px 10px 14px; border-radius: 12px; text-align: left;
+    cursor: pointer; color: inherit; background: transparent;
+    border: 1px solid transparent;
+    transition: background .14s, border-color .14s;
   }
-  .node:hover { background: var(--bg-input); }
-  .node.sel { background: var(--bg-input); border-color: var(--accent); }
-  .node .row { display: flex; align-items: center; gap: 7px; }
-  .node .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .node .meta { font-size: 12px; color: var(--fg-faint); margin-top: 3px; padding-left: 15px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--fg-faint); }
-  .dot.online { background: var(--ok); }
-  .dot.busy { background: var(--warn); }
-  .dot.offline { background: #4a4f5c; }
+  .node:hover { background: var(--surface-2); }
+  .node.sel { background: var(--accent-soft); border-color: var(--accent-line); }
+  .node.sel::before {
+    content: ''; position: absolute; left: 3px; top: 11px; bottom: 11px; width: 3px;
+    border-radius: 3px; background: var(--accent);
+  }
+  .node .row { display: flex; align-items: center; gap: 8px; }
+  .node .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .node .meta {
+    margin-top: 3px; padding-left: 16px; font-size: 11.5px; color: var(--fg-faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 
   .ws {
-    width: 100%; text-align: left; padding: 8px 10px; border-radius: 8px;
-    background: transparent; border: 1px solid transparent; cursor: pointer;
-    margin-bottom: 3px; color: var(--fg-dim);
+    display: flex; align-items: center; gap: 9px; width: 100%; margin-bottom: 3px;
+    padding: 8px 10px; border-radius: 11px; text-align: left; cursor: pointer;
+    color: var(--fg-dim); background: transparent; border: 1px solid transparent;
+    transition: background .14s, border-color .14s, color .14s;
   }
-  .ws:hover { background: var(--bg-input); }
-  .ws.sel { background: var(--bg-input); border-color: var(--accent); color: var(--fg); }
-  .ws .p { display: block; font-size: 11px; color: var(--fg-faint); overflow: hidden;
-           text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .ws:hover { background: var(--surface-2); color: var(--fg); }
+  .ws.sel { background: var(--surface-3); border-color: var(--line-2); color: var(--fg); }
+  .ws .ico { width: 15px; height: 15px; flex: none; color: var(--fg-faint); }
+  .ws.sel .ico { color: var(--accent-2); }
+  .ws-body { display: flex; flex-direction: column; min-width: 0; }
+  .ws-name { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* The path used to be rendered with `direction: rtl` to keep its tail
+     visible, which also moved the leading slash to the wrong end. Truncating
+     the tail normally and offering the full path in `title` is honest and
+     does not lie about where the directory is. */
+  .ws-path {
+    font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 
-  main { display: flex; flex-direction: column; min-width: 0; }
+  .empty-sm { padding: 8px 6px 10px; display: flex; flex-direction: column; gap: 3px; }
+  .empty-sm strong { font-size: 12.5px; font-weight: 600; color: var(--fg-dim); }
+  .empty-sm span { font-size: 11.5px; color: var(--fg-faint); line-height: 1.55; }
+
+  /* ── main column ──────────────────────────────────────────────────── */
+  main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   header {
-    padding: 12px 18px; border-bottom: 1px solid var(--line);
-    display: flex; align-items: baseline; gap: 10px; flex: none;
+    display: flex; align-items: center; gap: 10px; flex: none;
+    padding: 13px 20px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(21, 25, 34, .92), rgba(14, 17, 23, .78));
+    backdrop-filter: blur(12px);
   }
-  header .t { font-weight: 600; }
-  header .s { color: var(--fg-faint); font-size: 12px; }
-  header .spacer { flex: 1; }
-  header button {
-    background: transparent; border: 1px solid var(--line); border-radius: 7px;
-    padding: 4px 10px; cursor: pointer; color: var(--fg-dim); font-size: 12px;
+  .head-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  header .t {
+    font-weight: 650; font-size: 14.5px; letter-spacing: -.01em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  header button:hover { color: var(--fg); border-color: var(--fg-faint); }
+  header .s {
+    flex: none; padding: 2px 9px; border-radius: 999px; font-size: 11px;
+    color: var(--fg-dim); background: var(--surface-3); border: 1px solid var(--line);
+  }
+  header .s:empty { display: none; }
+  header .s.ok { color: var(--ok); background: rgba(62, 207, 142, .10); border-color: rgba(62, 207, 142, .26); }
+  header .s.busy { color: var(--warn); background: rgba(224, 169, 74, .10); border-color: rgba(224, 169, 74, .26); }
+  header .s.off { color: var(--fg-faint); }
+  .spacer { flex: 1; }
+  header .btn { padding: 7px 13px; font-size: 12.5px; }
 
-  #log { flex: 1; overflow-y: auto; padding: 18px; }
-  .empty { color: var(--fg-faint); text-align: center; margin-top: 15vh; }
+  #log { flex: 1; min-height: 0; overflow-y: auto; padding: 26px 20px 10px; }
 
-  .turn { margin-bottom: 18px; max-width: 860px; }
+  .empty {
+    display: flex; flex-direction: column; align-items: center; gap: 7px;
+    max-width: 340px; margin: 14vh auto 0; text-align: center;
+  }
+  .empty-icon {
+    display: grid; place-items: center; width: 46px; height: 46px; margin-bottom: 4px;
+    border-radius: 15px; color: var(--fg-faint);
+    background: var(--surface-2); border: 1px solid var(--line);
+  }
+  .empty-icon .ico { width: 22px; height: 22px; }
+  .empty-title { font-size: 14px; font-weight: 600; color: var(--fg-dim); }
+  .empty-sub { font-size: 12.5px; color: var(--fg-faint); line-height: 1.65; }
+
+  /* One centred reading column. The old layout pinned every turn to the left
+     edge of a full-width pane, which left most of a desktop window empty. */
+  .turn { display: flex; flex-direction: column; gap: 12px; max-width: 820px; margin: 0 auto 24px; }
+  .turn:last-child { margin-bottom: 6px; }
+
   .q {
-    background: var(--bg-input); border-left: 3px solid var(--accent);
-    padding: 9px 13px; border-radius: 0 8px 8px 0; white-space: pre-wrap; word-break: break-word;
-  }
-  .a {
-    margin-top: 10px; padding: 2px 0 2px 13px; border-left: 3px solid var(--line);
+    align-self: flex-end; max-width: min(86%, 560px);
+    padding: 10px 15px; border-radius: 15px 15px 4px 15px;
+    color: #eef3ff; background: linear-gradient(180deg, rgba(91, 140, 255, .22), rgba(91, 140, 255, .13));
+    border: 1px solid var(--accent-line);
+    box-shadow: 0 10px 24px -18px rgba(91, 140, 255, 1);
     white-space: pre-wrap; word-break: break-word;
   }
-  .a.err { border-left-color: var(--err); color: #f0b3b0; }
-  .a .who { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
-            color: var(--fg-faint); margin-bottom: 5px; }
-  .pending { color: var(--fg-faint); font-style: italic; }
-  .stamp { font-size: 11px; color: var(--fg-faint); margin-top: 7px; }
 
-  footer { flex: none; border-top: 1px solid var(--line); padding: 12px 18px; }
-  .composer { display: flex; gap: 10px; align-items: flex-end; max-width: 860px; }
+  .a { display: flex; align-items: flex-start; gap: 11px; }
+  .avatar {
+    display: grid; place-items: center; flex: none; width: 28px; height: 28px; margin-top: 1px;
+    border-radius: 9px; color: var(--accent-2);
+    background: linear-gradient(145deg, rgba(91, 140, 255, .26), rgba(91, 140, 255, .09));
+    border: 1px solid rgba(91, 140, 255, .26);
+  }
+  .avatar .ico { width: 15px; height: 15px; }
+  .a-body { flex: 1; min-width: 0; }
+  .a .who {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--fg-faint); margin-bottom: 4px;
+  }
+  .a-text { white-space: pre-wrap; word-break: break-word; line-height: 1.7; }
+  .a.err .avatar {
+    color: var(--err); background: rgba(242, 104, 95, .13); border-color: rgba(242, 104, 95, .3);
+  }
+  .a.err .a-text { color: #ffc7c2; }
+  .a-foot { display: flex; align-items: center; gap: 9px; margin-top: 7px; }
+  .stamp { font-size: 11px; color: var(--fg-faint); font-variant-numeric: tabular-nums; }
+  .copy {
+    padding: 2px 8px; font-size: 11px; border-radius: 6px; cursor: pointer;
+    color: var(--fg-faint); background: transparent; border: 1px solid var(--line);
+    opacity: .55; transition: opacity .15s, color .15s, border-color .15s;
+  }
+  .a:hover .copy, .copy:focus-visible { opacity: 1; }
+  .copy:hover { color: var(--fg); border-color: var(--line-2); }
+
+  .a.pending .a-body { display: flex; flex-direction: column; }
+  .pending-text { color: var(--fg-faint); font-style: italic; font-size: 13px; }
+  .typing { display: inline-flex; gap: 4px; margin-top: 10px; }
+  .typing i {
+    width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
+    opacity: .25; animation: blink 1.25s infinite;
+  }
+  .typing i:nth-child(2) { animation-delay: .18s; }
+  .typing i:nth-child(3) { animation-delay: .36s; }
+  @keyframes blink {
+    0%, 60%, 100% { opacity: .22; transform: translateY(0); }
+    30% { opacity: .95; transform: translateY(-2px); }
+  }
+
+  /* ── composer ─────────────────────────────────────────────────────── */
+  footer {
+    flex: none; padding: 12px 20px 16px; border-top: 1px solid var(--line);
+    background: linear-gradient(0deg, rgba(10, 12, 17, .96), rgba(10, 12, 17, .72));
+  }
+  /* Positioned so the toast can hang directly above the composer at whatever
+     height that happens to be, instead of guessing a fixed offset that the hint
+     row's wrapping would invalidate. Without this the toast's containing block is
+     the viewport and `bottom: calc(100% + 12px)` puts it off the top of the
+     screen — which is exactly as invisible as never showing it. */
+  .composer-wrap { position: relative; max-width: 820px; margin: 0 auto; }
+  .composer {
+    display: flex; align-items: flex-end; gap: 10px;
+    padding: 8px 8px 8px 14px; border-radius: 17px;
+    background: var(--surface-2); border: 1px solid var(--line-2);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .03);
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 4px rgba(91, 140, 255, .13); }
   textarea {
-    flex: 1; background: var(--bg-input); border: 1px solid var(--line);
-    border-radius: 8px; padding: 10px 12px; resize: none; min-height: 46px;
-    max-height: 200px; outline: none;
+    flex: 1; min-height: 26px; max-height: 200px; padding: 8px 0;
+    background: transparent; border: 0; outline: none; resize: none; line-height: 1.6;
   }
-  textarea:focus { border-color: var(--accent); }
-  .send {
-    background: var(--accent); border: 0; border-radius: 8px; padding: 11px 18px;
-    font-weight: 600; cursor: pointer; color: #fff; flex: none;
+  textarea::placeholder { color: var(--fg-faint); }
+  .send { flex: none; padding: 10px 16px; }
+  .hint {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+    margin-top: 10px; font-size: 11.5px; color: var(--fg-faint);
   }
-  .send:disabled { opacity: .4; cursor: not-allowed; }
-  .hint { color: var(--fg-faint); font-size: 12px; margin-top: 8px; max-width: 860px; }
-  .hint code { background: var(--bg-input); padding: 1px 5px; border-radius: 4px; }
+  /* Plain inline flow, not a flex container. As a flex container each contiguous
+     run of text became its own anonymous flex item, so the long permission
+     sentence — "权限 …；越界操作…" — was shrunk until it wrapped *per character*,
+     stacking 权 over 限 on a narrow screen. `display: inline` is blockified by
+     the parent flex container, which is exactly what makes the sentence wrap
+     like a sentence. */
+  .hint-item { display: inline; }
+  .hint code {
+    font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+    background: var(--surface-3); border: 1px solid var(--line);
+    padding: 1px 7px; border-radius: 6px; white-space: nowrap;
+  }
 
-  @media (max-width: 760px) {
-    #app.on { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
-    aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 42vh; }
+  /* ── target tabs ──────────────────────────────────────────────────────
+     One tab per (node, workspace). This is the piece that makes "several
+     machines at once" a thing the page can do at all: the transcript pane and
+     the composer bind to the selected tab, not to a single global selection. */
+  .tabs {
+    display: flex; align-items: stretch; gap: 6px; flex: none;
+    padding: 9px 14px 0; overflow-x: auto; overflow-y: hidden;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(16, 19, 25, .55), rgba(16, 19, 25, 0));
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { height: 0; }
+  /* An author `display` beats the UA stylesheet's `[hidden]`, so the attribute
+     needs an explicit rule or an empty strip keeps its 9px of padding. */
+  .tabs[hidden] { display: none; }
+  .tab {
+    display: flex; align-items: center; gap: 8px; flex: none;
+    max-width: 235px; padding: 7px 8px 7px 11px; cursor: pointer;
+    color: var(--fg-dim); background: rgba(255, 255, 255, .02);
+    border: 1px solid var(--line); border-bottom: 0;
+    border-radius: 10px 10px 0 0;
+    transition: background .14s, color .14s, border-color .14s;
+  }
+  .tab:hover { background: var(--surface-2); color: var(--fg); }
+  .tab.sel {
+    color: var(--fg); background: var(--surface-2); border-color: var(--line-2);
+    /* A 2px accent line along the bottom edge is what ties the open tab to the
+       pane underneath it, the way a file tab reads. */
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .tab-main { display: flex; flex-direction: column; min-width: 0; line-height: 1.32; }
+  .tab-node { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tab-ws {
+    font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tab.sel .tab-ws { color: var(--fg-dim); }
+  .tab-queued {
+    flex: none; padding: 1px 6px; border-radius: 999px; font-size: 10px;
+    color: var(--warn); background: rgba(224, 169, 74, .12);
+    border: 1px solid rgba(224, 169, 74, .26);
+  }
+  .tab-x {
+    display: grid; place-items: center; flex: none; width: 20px; height: 20px;
+    padding: 0; border: 0; border-radius: 6px; cursor: pointer;
+    color: var(--fg-faint); background: transparent;
+    transition: background .14s, color .14s;
+  }
+  .tab-x:hover { color: var(--fg); background: rgba(255, 255, 255, .09); }
+  .tab-x .ico { width: 13px; height: 13px; }
+
+  .node-tabs {
+    flex: none; margin-left: auto; padding: 1px 7px; border-radius: 999px;
+    font-size: 10px; color: var(--accent-2); background: var(--accent-soft);
+    border: 1px solid var(--accent-line);
+  }
+  .ws-body { flex: 1; }
+  .ws-flag {
+    display: grid; place-items: center; flex: none; width: 18px; height: 18px;
+    margin-left: auto; color: var(--fg-faint); opacity: .55;
+    transition: opacity .14s, color .14s;
+  }
+  .ws-flag .ico { width: 13px; height: 13px; }
+  .ws:hover .ws-flag { opacity: 1; }
+  .ws.open .ws-flag { color: var(--accent-2); opacity: 1; }
+
+  .composer-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+  .composer-actions .btn { padding: 10px 14px; }
+
+  /* ── toast ────────────────────────────────────────────────────────────
+     Sends and history loads can fail while the page keeps re-rendering around
+     them; a message that lives outside every re-rendered subtree is the only
+     kind that survives long enough to be read. */
+  .toast {
+    position: absolute; left: 50%; bottom: calc(100% + 12px); z-index: 40;
+    transform: translateX(-50%);
+    max-width: min(560px, calc(100vw - 32px));
+    padding: 10px 15px; border-radius: 12px; font-size: 12.5px;
+    color: var(--fg); background: #1c2230;
+    border: 1px solid var(--line-2); box-shadow: var(--shadow);
+    animation: toast-in .18s ease;
+    /* The toast floats over the transcript, where the copy button on the last
+       answer lives. It must never eat a click that was meant for the page. */
+    pointer-events: none;
+  }
+  .toast[hidden] { display: none; }
+  .toast.ok { border-color: rgba(62, 207, 142, .42); }
+  .toast.err { color: #ffd2ce; border-color: rgba(242, 104, 95, .45); }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translate(-50%, 10px); }
+    to { opacity: 1; transform: translate(-50%, 0); }
+  }
+
+  #scrim { display: none; }
+
+  /* ── narrow screens ───────────────────────────────────────────────── */
+  @media (max-width: 880px) {
+    #app.on { grid-template-columns: 1fr; }
+    /* The sidebar becomes a drawer instead of a 42vh band that pushed the
+       composer off the screen and still showed only three nodes. */
+    aside {
+      position: fixed; inset: 0 auto 0 0; z-index: 30;
+      width: min(320px, 86vw);
+      transform: translateX(-102%);
+      transition: transform .22s ease;
+      box-shadow: var(--shadow);
+    }
+    body.nav-open aside { transform: none; }
+    #scrim {
+      display: block; position: fixed; inset: 0; z-index: 25;
+      background: rgba(0, 0, 0, .5); opacity: 0; pointer-events: none;
+      transition: opacity .22s ease;
+    }
+    body.nav-open #scrim { opacity: 1; pointer-events: auto; }
+    .icon-btn { display: grid; }
+    header { padding: 10px 14px; }
+    #log { padding: 18px 14px 8px; }
+    footer { padding: 10px 14px 14px; }
+    .turn { margin-bottom: 20px; }
+    .q { max-width: 92%; }
+    .tabs { padding: 8px 10px 0; }
+    .tab { max-width: 185px; }
+    // Icon-only broadcast on a phone: the label is in the title, and the pixels
+    // it frees are the difference between a one-line composer and a wrapped one.
+    #broadcast { padding: 10px 11px; }
+    #broadcast .label { display: none; }
+    /* A phone has no ⇧ and no ⌘, so the shortcut line is noise that costs a row. */
+    .hint-kbd { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
   }
 </style>
 </head>
 <body>
 
 <div id="gate">
-  <form id="gate-form">
-    <h1>DSH Remote Control</h1>
-    <p>输入控制令牌（relay 上的 <code>DSH_REMOTE_CONTROL_TOKEN</code>）。</p>
-    <input id="gate-token" type="password" placeholder="control token" autocomplete="current-password"
-           style="width:100%;background:var(--bg-input);border:1px solid var(--line);border-radius:8px;padding:10px 12px;outline:none">
-    <div class="err" id="gate-err"></div>
-    <button class="send" type="submit" style="width:100%;margin-top:6px">进入</button>
+  <form id="gate-form" class="gate-card">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><circle cx="2" cy="20" r="1" fill="currentColor" stroke="none"/></svg>
+      </span>
+      <span class="brand-text">
+        <strong>DSH Remote Control</strong>
+        <span>公网中转台</span>
+      </span>
+    </div>
+    <h1>输入控制令牌</h1>
+    <p>relay 上的 <code>DSH_REMOTE_CONTROL_TOKEN</code>。验证通过后令牌只存在这台设备的浏览器里。</p>
+    <div class="field">
+      <label for="gate-token">控制令牌</label>
+      <input id="gate-token" class="input" type="password" placeholder="control token"
+             autocomplete="current-password" spellcheck="false" autofocus>
+    </div>
+    <div class="err" id="gate-err" role="alert"></div>
+    <div class="gate-actions">
+      <button class="btn btn-primary" type="submit">进入控制台</button>
+    </div>
+    <div class="gate-foot">令牌缺失或不匹配时，relay 一律返回 401，页面不会泄露任何节点信息。</div>
   </form>
 </div>
 
 <div id="app">
   <aside>
-    <h2>在线的 Harness</h2>
-    <div id="nodes"><div class="empty" style="margin:8px 0;text-align:left">暂无节点</div></div>
-    <h2>工作台</h2>
-    <div id="workspaces"><div class="empty" style="margin:8px 0;text-align:left">先选一个节点</div></div>
+    <div class="aside-head">
+      <span class="mark sm" aria-hidden="true">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><circle cx="2" cy="20" r="1" fill="currentColor" stroke="none"/></svg>
+      </span>
+      <span class="brand-text">
+        <span class="as-title">Remote Control</span>
+        <span class="as-sub">公网中转台</span>
+      </span>
+      <span class="spacer"></span>
+      <button id="aside-close" class="icon-btn" type="button" aria-label="收起节点列表">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="aside-scroll">
+      <div class="aside-label"><span>在线的 Harness</span><span class="count" id="node-count">0</span></div>
+      <div id="nodes"></div>
+      <div class="aside-label"><span>工作台</span></div>
+      <div id="workspaces"></div>
+    </div>
+    <div class="aside-foot">
+      <span class="dot" id="live-dot"></span>
+      <span id="live-text">连接中…</span>
+    </div>
   </aside>
+  <div id="scrim"></div>
 
   <main>
     <header>
-      <span class="t" id="title">未选择</span>
-      <span class="s" id="subtitle"></span>
-      <span class="spacer"></span>
-      <button id="newchat" type="button">新对话</button>
-      <button id="signout" type="button">退出</button>
-    </header>
-    <div id="log"><div class="empty">选一个在线节点和工作台，然后在下面提问。</div></div>
-    <footer>
-      <div class="composer">
-        <textarea id="prompt" rows="1" placeholder="给这台 harness 下达指令…（Enter 发送，Shift+Enter 换行）"></textarea>
-        <button class="send" id="send" type="button">发送</button>
+      <button id="menu" class="icon-btn" type="button" aria-label="打开节点列表">
+        <svg class="ico" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+      <div class="head-main">
+        <span class="t" id="title">未选择</span>
+        <span class="s" id="subtitle"></span>
       </div>
-      <div class="hint" id="hint"></div>
+      <span class="spacer"></span>
+      <button id="newchat" class="btn btn-ghost" type="button">新对话</button>
+      <button id="signout" class="btn btn-ghost" type="button">退出</button>
+    </header>
+
+    <div id="tabs" class="tabs" role="tablist" aria-label="已打开的目标"></div>
+
+    <div id="log"></div>
+
+    <footer>
+      <div class="composer-wrap">
+        <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+        <div class="composer">
+          <textarea id="prompt" rows="1" placeholder="给当前标签下达指令…"></textarea>
+          <div class="composer-actions">
+            <button class="btn btn-ghost" id="broadcast" type="button" title="把同一句话发给所有标签（⌘/Ctrl+Enter）">
+              <svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M3 11v2a1 1 0 0 0 1 1h2l6 4V6L6 10H4a1 1 0 0 0-1 1Z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg>
+              <span class="label">广播</span>
+            </button>
+            <button class="btn btn-primary send" id="send" type="button">
+              <span>发送</span>
+              <svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M5 12h13M12 5l7 7-7 7"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="hint" id="hint"></div>
+      </div>
     </footer>
   </main>
 </div>
@@ -182,20 +623,63 @@
 'use strict'
 
 const TOKEN_KEY = 'dsh-remote-control-token'
-const SESSION_KEY = 'dsh-remote-control-sessions'
+// Bumped when the shape changed from `nodeId -> sessionId` to
+// `targetKey -> sessionId`. Reusing the old key would read a node-keyed map as a
+// target-keyed one, so every lookup would miss and the symptom would be "it
+// forgot my conversation" rather than anything that looks like a bug.
+const SESSION_KEY = 'dsh-remote-control-sessions-v2'
+const TARGETS_KEY = 'dsh-remote-control-targets-v1'
 const POLL_FALLBACK_MS = 10000
 
+/** Static icon markup. Never interpolated with remote data, so `innerHTML` is safe. */
+const ICON_CAST = '<svg class="ico" viewBox="0 0 24 24"><path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><circle cx="2" cy="20" r="1" fill="currentColor" stroke="none"/></svg>'
+const ICON_ALERT = '<svg class="ico" viewBox="0 0 24 24"><path d="M12 8v5M12 17h.01"/><path d="M10.3 3.9 2.4 17.5A2 2 0 0 0 4.1 20.5h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>'
+const ICON_FOLDER = '<svg class="ico" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h3.6a2 2 0 0 1 1.5.7l1 1.3H19a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>'
+const ICON_PLUS = '<svg class="ico" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>'
+const ICON_OPEN = '<svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/></svg>'
+const ICON_X = '<svg class="ico" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>'
+const ICON_SEND = '<svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M5 12h13M12 5l7 7-7 7"/></svg>'
+const ICON_MEGAPHONE = '<svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M3 11v2a1 1 0 0 0 1 1h2l6 4V6L6 10H4a1 1 0 0 0-1 1Z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg>'
+
+/**
+ * The page's whole state.
+ *
+ * A *target* is one `(nodeId, workspace)` pair, and it is the unit the UI is
+ * built around: one tab, one transcript view, one DSH session, one composer
+ * destination. `nodeId` and `workspace` used to be single values, which is
+ * exactly why the page could only ever drive one machine at a time.
+ */
 const state = {
   token: '',
   nodes: [],
-  nodeId: null,
-  workspace: null,
-  /** nodeId -> sessionId, so a follow-up continues the same DSH session. */
+  /** The node whose workspaces the sidebar is listing. */
+  browsing: null,
+  /** Open targets, in tab order: `{ key, nodeId, workspace }`. */
+  targets: [],
+  /** Key of the target the transcript pane and composer are bound to. */
+  active: null,
+  /**
+   * targetKey -> sessionId.
+   *
+   * The key includes the workspace on purpose. A DSH session is created inside
+   * one workspace and the node cannot move it, so a node-keyed map answered a
+   * question asked in `notes` by continuing the conversation that was started in
+   * `deepseek` — silently, in the wrong directory.
+   */
   sessions: {},
-  /** nodeId -> transcript entries */
+  /**
+   * nodeId -> transcript entries, in the relay's own shape.
+   *
+   * The relay keeps one transcript per *node*, not per target, so every entry
+   * carries its `workspace` and the page partitions on read. That is why
+   * multi-target view needs no protocol change.
+   */
   transcript: new Map(),
+  /** Nodes whose history has already been fetched once. */
+  loadedNodes: new Set(),
   source: null,
-  rosterTimer: null
+  rosterTimer: null,
+  toastTimer: null
 }
 
 const $ = (id) => document.getElementById(id)
@@ -246,24 +730,325 @@ async function api(path, options = {}) {
   return payload
 }
 
+// ── target model ───────────────────────────────────────────────────────────
+
+/**
+ * The join key for one `(node, workspace)` pair.
+ *
+ * `\u0000` cannot appear in a path or a node id, so no two pairs can collide.
+ *
+ * @param {string} nodeId - owning node.
+ * @param {string} workspace - absolute workspace path.
+ * @returns {string} the key.
+ */
+function targetKey(nodeId, workspace) {
+  return nodeId + '\u0000' + workspace
+}
+
+/**
+ * Split a target key back into its parts.
+ * @param {string} key - a key from `targetKey`.
+ * @returns {{ nodeId: string, workspace: string }} the parts.
+ */
+function splitKey(key) {
+  const cut = key.indexOf('\u0000')
+  return { nodeId: key.slice(0, cut), workspace: key.slice(cut + 1) }
+}
+
+/** @returns {object|null} the target the composer writes to. */
+function activeTarget() {
+  return state.targets.find((target) => target.key === state.active) ?? null
+}
+
+/**
+ * The roster record for a node id.
+ * @param {string|null} nodeId - node to look up.
+ * @returns {object|null} the record, or null when the relay has not listed it.
+ */
+function nodeOf(nodeId) {
+  return state.nodes.find((node) => node.nodeId === nodeId) ?? null
+}
+
+/**
+ * The last path segment, for a short label.
+ * @param {string} path - a path with `/` or `\` separators.
+ * @returns {string} the last segment.
+ */
+function baseName(path) {
+  const trimmed = String(path).replace(/[\\/]+$/, '')
+  const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  return cut < 0 ? trimmed : trimmed.slice(cut + 1)
+}
+
+/**
+ * What to call a target's workspace on screen.
+ * @param {object} target - a target.
+ * @returns {string} the advertised name, else the last path segment.
+ */
+function workspaceLabel(target) {
+  const node = nodeOf(target.nodeId)
+  const advertised = node === null ? undefined : node.workspaces.find((ws) => ws.path === target.workspace)
+  const label = advertised === undefined ? '' : advertised.name
+  return label !== undefined && label !== '' ? label : (baseName(target.workspace) || target.workspace)
+}
+
+/**
+ * Split one node's transcript into per-workspace lists.
+ *
+ * Answers are attributed through the question they answer, matched by
+ * `commandId` — not by position. A node running two queued commands appends both
+ * questions before either answer comes back, so "the answer follows its
+ * question" is not a safe assumption to make about this array.
+ *
+ * @param {string} nodeId - owning node.
+ * @returns {Map<string, object[]>} workspace path -> entries.
+ */
+function partitionTranscript(nodeId) {
+  const entries = state.transcript.get(nodeId) ?? []
+  const askedIn = new Map()
+  for (const entry of entries) {
+    if (entry.kind === 'question') askedIn.set(entry.commandId, entry.workspace ?? '')
+  }
+  const byWorkspace = new Map()
+  for (const entry of entries) {
+    const workspace = entry.kind === 'question'
+      ? (entry.workspace ?? '')
+      : (askedIn.get(entry.commandId) ?? entry.workspace ?? '')
+    const list = byWorkspace.get(workspace)
+    if (list === undefined) byWorkspace.set(workspace, [entry])
+    else list.push(entry)
+  }
+  return byWorkspace
+}
+
+/**
+ * The transcript entries belonging to one target.
+ * @param {object|null} target - a target.
+ * @returns {object[]} its entries, oldest first.
+ */
+function entriesFor(target) {
+  if (target === null) return []
+  return partitionTranscript(target.nodeId).get(target.workspace) ?? []
+}
+
+/**
+ * The command ids in a list of entries that have been asked but not answered.
+ * @param {object[]} entries - one target's entries.
+ * @returns {Set<string>} outstanding command ids.
+ */
+function pendingIds(entries) {
+  const pending = new Set()
+  for (const entry of entries) if (entry.kind === 'question') pending.add(entry.commandId)
+  for (const entry of entries) if (entry.kind !== 'question') pending.delete(entry.commandId)
+  return pending
+}
+
+/**
+ * Open a target, or focus it when its tab already exists.
+ *
+ * @param {string} nodeId - target node.
+ * @param {string} workspace - target workspace path.
+ * @param {object} [options] - `{ activate }`, default true.
+ */
+function openTarget(nodeId, workspace, options = {}) {
+  const key = targetKey(nodeId, workspace)
+  if (!state.targets.some((target) => target.key === key)) state.targets.push({ key, nodeId, workspace })
+  if (options.activate !== false) state.active = key
+  state.browsing = nodeId
+  persistTargets()
+  renderAll()
+  void loadTranscript(nodeId)
+}
+
+/**
+ * Close one target's tab.
+ * @param {string} key - the target to close.
+ */
+function closeTarget(key) {
+  const index = state.targets.findIndex((target) => target.key === key)
+  if (index < 0) return
+  state.targets.splice(index, 1)
+  if (state.active === key) {
+    // Fall back to whatever slid into its place, so closing a tab lands next to
+    // it instead of dropping the user on an empty pane.
+    const next = state.targets[Math.min(index, state.targets.length - 1)]
+    state.active = next === undefined ? null : next.key
+    if (next !== undefined) state.browsing = next.nodeId
+  }
+  persistTargets()
+  renderAll()
+}
+
+/**
+ * Focus one target's tab.
+ * @param {string} key - the target to focus.
+ */
+function activateTarget(key) {
+  const target = state.targets.find((entry) => entry.key === key)
+  if (target === undefined) return
+  state.active = key
+  state.browsing = target.nodeId
+  renderAll()
+  void loadTranscript(target.nodeId)
+}
+
+/**
+ * Drop targets the relay no longer offers.
+ *
+ * A workspace that was removed from a node's configuration, or a node that
+ * deregistered entirely, must not leave a tab that can only ever fail. An empty
+ * roster is deliberately *not* treated as "everything is gone": a relay that has
+ * just restarted reports no nodes for a moment, and wiping the user's tabs then
+ * would be worse than showing them briefly offline.
+ */
+function reconcileTargets() {
+  if (state.nodes.length === 0) return
+  const kept = state.targets.filter((target) => {
+    const node = nodeOf(target.nodeId)
+    return node !== null && node.workspaces.some((ws) => ws.path === target.workspace)
+  })
+  if (kept.length === state.targets.length) return
+  state.targets = kept
+  if (!kept.some((target) => target.key === state.active)) {
+    const last = kept[kept.length - 1]
+    state.active = last === undefined ? null : last.key
+  }
+  persistTargets()
+}
+
+/** Remember the open tabs, so a reload does not lose them. */
+function persistTargets() {
+  try {
+    localStorage.setItem(TARGETS_KEY, JSON.stringify({
+      targets: state.targets.map((target) => ({ nodeId: target.nodeId, workspace: target.workspace })),
+      active: state.active
+    }))
+  } catch { /* storage blocked or full; the page works without it */ }
+}
+
+/** Restore tabs from the last visit. */
+function restoreTargets() {
+  let saved
+  try { saved = JSON.parse(localStorage.getItem(TARGETS_KEY) ?? 'null') } catch { saved = null }
+  if (saved === null || !Array.isArray(saved.targets)) return
+  for (const entry of saved.targets) {
+    if (typeof entry?.nodeId !== 'string' || typeof entry?.workspace !== 'string') continue
+    const key = targetKey(entry.nodeId, entry.workspace)
+    if (state.targets.some((target) => target.key === key)) continue
+    state.targets.push({ key, nodeId: entry.nodeId, workspace: entry.workspace })
+  }
+  if (typeof saved.active === 'string' && state.targets.some((target) => target.key === saved.active)) {
+    state.active = saved.active
+  } else if (state.targets.length > 0) {
+    state.active = state.targets[0].key
+  }
+  if (state.active !== null) state.browsing = splitKey(state.active).nodeId
+}
+
+/** Remember which session each target is continuing. */
+function persistSessions() {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(state.sessions)) } catch { /* see above */ }
+}
+
+// ── small DOM helpers ──────────────────────────────────────────────────────
+
+/**
+ * Build an inline empty-state block for one of the sidebar lists.
+ * @param {string} title - one-line summary.
+ * @param {string} [sub] - the explanation that makes it actionable.
+ * @returns {HTMLElement} the block.
+ */
+function emptySmall(title, sub) {
+  const box = document.createElement('div')
+  box.className = 'empty-sm'
+  const head = document.createElement('strong')
+  head.textContent = title
+  box.append(head)
+  if (sub !== undefined && sub !== '') {
+    const body = document.createElement('span')
+    body.textContent = sub
+    box.append(body)
+  }
+  return box
+}
+
+/**
+ * Build the centred empty state for the transcript pane.
+ * @param {string} title - one-line summary.
+ * @param {string} sub - the explanation that makes it actionable.
+ * @returns {HTMLElement} the block.
+ */
+function emptyState(title, sub) {
+  const box = document.createElement('div')
+  box.className = 'empty'
+  const icon = document.createElement('div')
+  icon.className = 'empty-icon'
+  icon.innerHTML = ICON_CAST
+  const head = document.createElement('div')
+  head.className = 'empty-title'
+  head.textContent = title
+  const body = document.createElement('div')
+  body.className = 'empty-sub'
+  body.textContent = sub
+  box.append(icon, head, body)
+  return box
+}
+
+/**
+ * Show a transient message.
+ *
+ * Transient failures used to be written into the composer hint, where the next
+ * roster or transcript push overwrote them — so a send could fail and leave no
+ * trace at all. A toast is outside every re-rendered subtree.
+ *
+ * @param {string} message - what to say.
+ * @param {'info'|'ok'|'err'} [kind] - tone.
+ */
+function toast(message, kind = 'info') {
+  const el = $('toast')
+  el.textContent = message
+  el.className = `toast ${kind}`
+  el.hidden = false
+  clearTimeout(state.toastTimer)
+  // An error is worth reading; a confirmation is not worth waiting for.
+  state.toastTimer = setTimeout(() => { el.hidden = true }, kind === 'err' ? 8000 : 4000)
+}
+
+/**
+ * Report the event-stream state in the sidebar footer.
+ *
+ * The page previously gave no sign whether it was live or had quietly fallen
+ * back to polling, which made "the node is idle but nothing updates" impossible
+ * to tell apart from "the stream is dead".
+ *
+ * @param {'online'|'busy'|''} kind - dot state.
+ * @param {string} text - label.
+ */
+function setLive(kind, text) {
+  $('live-dot').className = kind === '' ? 'dot' : `dot ${kind}`
+  $('live-text').textContent = text
+}
+
+/** Collapse the narrow-screen drawer. */
+function closeNav() {
+  document.body.classList.remove('nav-open')
+}
+
 // ── rendering ──────────────────────────────────────────────────────────────
 
-/** Re-render the node list and keep the selection honest. */
+/** Re-render the node list. */
 function renderNodes() {
   const box = $('nodes')
   box.textContent = ''
+  $('node-count').textContent = String(state.nodes.length)
   if (state.nodes.length === 0) {
-    const empty = document.createElement('div')
-    empty.className = 'empty'
-    empty.style.margin = '8px 0'
-    empty.style.textAlign = 'left'
-    empty.textContent = '暂无节点（确认机器上的 dsh 已启动且插件配置正确）'
-    box.append(empty)
+    box.append(emptySmall('还没有机器连上来', '确认那台机器的 dsh 已启动，并且它配置里的中转台地址和节点令牌都填对了。'))
     return
   }
   for (const node of state.nodes) {
-    const el = document.createElement('div')
-    el.className = 'node' + (node.nodeId === state.nodeId ? ' sel' : '')
+    const el = document.createElement('button')
+    el.type = 'button'
+    el.className = 'node' + (node.nodeId === state.browsing ? ' sel' : '')
     const row = document.createElement('div')
     row.className = 'row'
     const dot = document.createElement('span')
@@ -271,7 +1056,15 @@ function renderNodes() {
     const nm = document.createElement('span')
     nm.className = 'nm'
     nm.textContent = node.name || node.nodeId
+    nm.title = node.name || node.nodeId
     row.append(dot, nm)
+    const open = state.targets.filter((target) => target.nodeId === node.nodeId).length
+    if (open > 0) {
+      const tabs = document.createElement('span')
+      tabs.className = 'node-tabs'
+      tabs.textContent = `${open} 个标签`
+      row.append(tabs)
+    }
     const meta = document.createElement('div')
     meta.className = 'meta'
     const bits = []
@@ -280,72 +1073,230 @@ function renderNodes() {
     else bits.push('空闲')
     if (node.platform) bits.push(node.platform)
     bits.push(`${node.workspaces.length} 个工作台`)
+    if (typeof node.queued === 'number' && node.queued > 0) bits.push(`排队 ${node.queued}`)
     meta.textContent = bits.join(' · ')
     el.append(row, meta)
-    el.addEventListener('click', () => selectNode(node.nodeId))
-    box.append(el)
-  }
-}
-
-/** Re-render the workspace list for the selected node. */
-function renderWorkspaces() {
-  const box = $('workspaces')
-  box.textContent = ''
-  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
-  if (!node) {
-    const empty = document.createElement('div')
-    empty.className = 'empty'
-    empty.style.margin = '8px 0'
-    empty.style.textAlign = 'left'
-    empty.textContent = '先选一个节点'
-    box.append(empty)
-    return
-  }
-  if (node.workspaces.length === 0) {
-    const empty = document.createElement('div')
-    empty.className = 'empty'
-    empty.style.margin = '8px 0'
-    empty.style.textAlign = 'left'
-    empty.textContent = '这个节点没有配置工作台'
-    box.append(empty)
-    return
-  }
-  for (const ws of node.workspaces) {
-    const el = document.createElement('button')
-    el.type = 'button'
-    el.className = 'ws' + (ws.path === state.workspace ? ' sel' : '')
-    el.textContent = ws.name || ws.path
-    const p = document.createElement('span')
-    p.className = 'p'
-    p.textContent = ws.path
-    el.append(p)
     el.addEventListener('click', () => {
-      state.workspace = ws.path
-      renderWorkspaces()
-      renderLog()
-      renderHint()
+      state.browsing = node.nodeId
+      // Jump to a tab this machine already has: clicking a node reads as
+      // navigation, and a sidebar that ignores the click feels broken.
+      const existing = state.targets.find((target) => target.nodeId === node.nodeId)
+      if (existing !== undefined) state.active = existing.key
+      closeNav()
+      renderAll()
     })
     box.append(el)
   }
 }
 
-/** Render the selected node's transcript. */
+/** Re-render the workspace list for the node the sidebar is browsing. */
+function renderWorkspaces() {
+  const box = $('workspaces')
+  box.textContent = ''
+  const node = nodeOf(state.browsing)
+  if (node === null) {
+    box.append(emptySmall('先选一个节点', '点上面的一台机器，就会列出它允许远程操作的目录。'))
+    return
+  }
+  if (node.workspaces.length === 0) {
+    box.append(emptySmall('这个节点没有可用的工作台', '它的配置里没有写 workspaces，也没有开启目录注册模式。'))
+    return
+  }
+  for (const ws of node.workspaces) {
+    const key = targetKey(node.nodeId, ws.path)
+    const isOpen = state.targets.some((target) => target.key === key)
+    const el = document.createElement('button')
+    el.type = 'button'
+    el.className = 'ws' + (key === state.active ? ' sel' : '') + (isOpen ? ' open' : '')
+    const icon = document.createElement('span')
+    icon.innerHTML = ICON_FOLDER
+    const body = document.createElement('span')
+    body.className = 'ws-body'
+    const label = ws.name || ws.path
+    const name = document.createElement('span')
+    name.className = 'ws-name'
+    name.textContent = label
+    body.append(name)
+    // Only repeat the path when it adds something the label did not already say.
+    if (label !== ws.path) {
+      const path = document.createElement('span')
+      path.className = 'ws-path'
+      path.textContent = ws.path
+      body.append(path)
+    }
+    const flag = document.createElement('span')
+    flag.className = 'ws-flag'
+    // A closed workspace offers "+"; an open one shows the dot that matches its
+    // tab, so "is this already open?" is answerable without reading the tab bar.
+    flag.innerHTML = isOpen ? ICON_OPEN : ICON_PLUS
+    flag.title = isOpen ? '已在这个工作台上开了标签' : '点一下开一个标签'
+    el.title = ws.path
+    el.append(icon, body, flag)
+    el.addEventListener('click', () => {
+      closeNav()
+      openTarget(node.nodeId, ws.path)
+    })
+    box.append(el)
+  }
+}
+
+/** Re-render the target tab strip. */
+function renderTabs() {
+  const strip = $('tabs')
+  strip.textContent = ''
+  strip.hidden = state.targets.length === 0
+  if (state.targets.length === 0) return
+  for (const target of state.targets) {
+    const node = nodeOf(target.nodeId)
+    const online = node !== null && node.online === true
+    const entries = entriesFor(target)
+    const waiting = pendingIds(entries).size > 0
+    const busy = online && (node.status === 'busy' || waiting)
+    const queued = node === null || typeof node.queued !== 'number' ? 0 : node.queued
+
+    const tab = document.createElement('div')
+    tab.className = 'tab' + (target.key === state.active ? ' sel' : '')
+    tab.setAttribute('role', 'tab')
+    tab.setAttribute('aria-selected', target.key === state.active ? 'true' : 'false')
+    tab.tabIndex = 0
+    tab.title = `${node === null ? target.nodeId : (node.name || target.nodeId)}\n${target.workspace}`
+
+    const dot = document.createElement('span')
+    dot.className = 'dot ' + (online ? (busy ? 'busy' : 'online') : 'offline')
+
+    const main = document.createElement('span')
+    main.className = 'tab-main'
+    const nm = document.createElement('span')
+    nm.className = 'tab-node'
+    nm.textContent = node === null ? target.nodeId : (node.name || node.nodeId)
+    const ws = document.createElement('span')
+    ws.className = 'tab-ws'
+    ws.textContent = workspaceLabel(target)
+    main.append(nm, ws)
+    tab.append(dot, main)
+
+    if (queued > 0) {
+      const badge = document.createElement('span')
+      badge.className = 'tab-queued'
+      badge.textContent = `排队 ${queued}`
+      badge.title = `这台机器上还有 ${queued} 条指令在队列里`
+      tab.append(badge)
+    }
+
+    const close = document.createElement('button')
+    close.type = 'button'
+    close.className = 'tab-x'
+    close.setAttribute('aria-label', `关闭标签：${nm.textContent} / ${ws.textContent}`)
+    close.innerHTML = ICON_X
+    close.addEventListener('click', (event) => {
+      event.stopPropagation()
+      closeTarget(target.key)
+    })
+    tab.append(close)
+
+    tab.addEventListener('click', () => activateTarget(target.key))
+    tab.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return
+      event.preventDefault()
+      activateTarget(target.key)
+    })
+    strip.append(tab)
+  }
+}
+
+/**
+ * Render one answer (or failure) row.
+ * @param {object} answer - a transcript entry that is not a question.
+ * @returns {HTMLElement} the row.
+ */
+function answerNode(answer) {
+  const failed = answer.kind === 'error'
+  const text = failed ? answer.error : answer.text
+  const wrap = document.createElement('div')
+  wrap.className = 'a' + (failed ? ' err' : '')
+  const avatar = document.createElement('span')
+  avatar.className = 'avatar'
+  avatar.innerHTML = failed ? ICON_ALERT : ICON_CAST
+  const body = document.createElement('div')
+  body.className = 'a-body'
+  const who = document.createElement('div')
+  who.className = 'who'
+  who.textContent = failed ? '失败' : 'DSH'
+  const content = document.createElement('div')
+  content.className = 'a-text'
+  content.textContent = text
+  body.append(who, content)
+
+  const foot = document.createElement('div')
+  foot.className = 'a-foot'
+  if (answer.durationMs) {
+    const stamp = document.createElement('span')
+    stamp.className = 'stamp'
+    stamp.textContent = `${(answer.durationMs / 1000).toFixed(1)}s · ${new Date(answer.at).toLocaleTimeString()}`
+    foot.append(stamp)
+  }
+  if (typeof text === 'string' && text !== '') {
+    const copy = document.createElement('button')
+    copy.type = 'button'
+    copy.className = 'copy'
+    copy.textContent = '复制'
+    copy.addEventListener('click', () => void copyText(text, copy))
+    foot.append(copy)
+  }
+  if (foot.childElementCount > 0) body.append(foot)
+
+  wrap.append(avatar, body)
+  return wrap
+}
+
+/**
+ * Render the "waiting for the node" row.
+ * @param {boolean} online - whether the target's node is online.
+ * @returns {HTMLElement} the row.
+ */
+function pendingNode(online) {
+  const wrap = document.createElement('div')
+  wrap.className = 'a pending'
+  const avatar = document.createElement('span')
+  avatar.className = 'avatar'
+  avatar.innerHTML = ICON_CAST
+  const body = document.createElement('div')
+  body.className = 'a-body'
+  const text = document.createElement('div')
+  text.className = 'pending-text'
+  text.textContent = online ? '已下发，等待 DSH 跑完这一轮…' : '节点离线，命令在队列里等它回来…'
+  const typing = document.createElement('div')
+  typing.className = 'typing'
+  typing.innerHTML = '<i></i><i></i><i></i>'
+  body.append(text, typing)
+  wrap.append(avatar, body)
+  return wrap
+}
+
+/** Render the active target's transcript. */
 function renderLog() {
   const log = $('log')
+  // Keep the user where they were reading: an answer that arrives while they
+  // are scrolled up in the history must not yank the viewport to the bottom.
+  const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 140
   log.textContent = ''
-  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
-  if (!node) {
-    log.innerHTML = '<div class="empty">选一个在线节点和工作台，然后在下面提问。</div>'
+  const target = activeTarget()
+  if (target === null) {
+    log.append(emptyState(
+      state.targets.length === 0 ? '选一台机器开始' : '选一个标签',
+      state.targets.length === 0
+        ? '左边点一台在线的 harness，再点一个工作台，就会开出一个标签。想同时盯几台，就多开几个标签。'
+        : '在中间的标签条里点一个目标，或者回到左边再开一个工作台。'
+    ))
     return
   }
-  const entries = state.transcript.get(state.nodeId) ?? []
+  const node = nodeOf(target.nodeId)
+  const entries = entriesFor(target)
   if (entries.length === 0) {
-    log.innerHTML = '<div class="empty">还没有对话。在下面提问开始。</div>'
+    log.append(emptyState('这个标签还没有对话', `${workspaceLabel(target)} 上还没有问过。在下面输入第一条指令，它会在工作台里开一个新会话。`))
     return
   }
-  const pending = new Set()
-  for (const entry of entries) if (entry.kind === 'question') pending.add(entry.commandId)
-  for (const entry of entries) if (entry.kind !== 'question') pending.delete(entry.commandId)
+  const pending = pendingIds(entries)
 
   const groups = []
   for (const entry of entries) {
@@ -367,51 +1318,35 @@ function renderLog() {
       q.textContent = group.q.prompt
       turn.append(q)
     }
-    for (const answer of group.answers) {
-      const a = document.createElement('div')
-      a.className = 'a' + (answer.kind === 'error' ? ' err' : '')
-      const who = document.createElement('div')
-      who.className = 'who'
-      who.textContent = answer.kind === 'error' ? '失败' : 'DSH'
-      const body = document.createElement('div')
-      body.textContent = answer.kind === 'error' ? answer.error : answer.text
-      a.append(who, body)
-      if (answer.durationMs) {
-        const stamp = document.createElement('div')
-        stamp.className = 'stamp'
-        stamp.textContent = `${(answer.durationMs / 1000).toFixed(1)}s · ${new Date(answer.at).toLocaleTimeString()}`
-        a.append(stamp)
-      }
-      turn.append(a)
-    }
+    for (const answer of group.answers) turn.append(answerNode(answer))
     if (group.q && pending.has(group.q.commandId)) {
-      const a = document.createElement('div')
-      a.className = 'a'
-      const body = document.createElement('div')
-      body.className = 'pending'
-      body.textContent = node.online ? '已下发，等待 DSH 跑完这一轮…' : '节点离线，命令在队列里等它回来…'
-      a.append(body)
-      turn.append(a)
+      turn.append(pendingNode(node !== null && node.online === true))
     }
     log.append(turn)
   }
-  log.scrollTop = log.scrollHeight
+  if (pinned) log.scrollTop = log.scrollHeight
 }
 
-/** Update the composer hint to match the current selection. */
+/** Update the composer hint to match the active target. */
 function renderHint() {
-  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
+  const target = activeTarget()
   const parts = []
-  if (!node) parts.push('先选节点')
-  else {
-    parts.push(`目标 <code>${escapeHtml(node.name || node.nodeId)}</code>`)
-    if (state.sessions[node.nodeId]) parts.push(`续接会话 <code>${escapeHtml(short(state.sessions[node.nodeId]))}</code>`)
-    else parts.push('将开一个新会话')
+  if (target === null) {
+    parts.push({ html: '先点一个工作台开标签' })
+  } else {
+    const node = nodeOf(target.nodeId)
+    parts.push({ html: `目标 <code>${escapeHtml(node === null ? target.nodeId : (node.name || node.nodeId))}</code>` })
+    parts.push({ html: `工作台 <code>${escapeHtml(workspaceLabel(target))}</code>` })
+    const session = state.sessions[target.key]
+    if (session !== undefined && session !== '') parts.push({ html: `续接会话 <code>${escapeHtml(short(session))}</code>` })
+    else parts.push({ html: '将开一个新会话' })
   }
-  if (state.workspace) parts.push(`工作台 <code>${escapeHtml(state.workspace)}</code>`)
-  else parts.push('未选工作台')
-  parts.push('权限 <code>workspace-write + ask</code>；越界操作会弹在你本机 DSH 里等确认')
-  $('hint').innerHTML = parts.join(' · ')
+  if (state.targets.length > 1) parts.push({ html: `共 <code>${state.targets.length}</code> 个标签` })
+  parts.push({ html: '权限 <code>workspace-write + ask</code>；越界操作会弹在你本机 DSH 里等确认' })
+  parts.push({ html: 'Enter 发送 · ⇧Enter 换行 · ⌘/Ctrl+Enter 广播', cls: 'hint-kbd' })
+  $('hint').innerHTML = parts
+    .map((part) => `<span class="hint-item${part.cls === undefined ? '' : ` ${part.cls}`}">${part.html}</span>`)
+    .join('')
 }
 
 /** Escape text for the few places that need markup. */
@@ -422,45 +1357,64 @@ function escapeHtml(value) {
 /** Shorten a session id for display. */
 function short(id) { return String(id).length > 18 ? `${String(id).slice(0, 18)}…` : String(id) }
 
-/** Sync the header line with the current selection. */
+/** Sync the header line with the active target, or the browsed node. */
 function renderHeader() {
-  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
-  $('title').textContent = node ? node.name || node.nodeId : '未选择'
-  $('subtitle').textContent = node ? (node.online ? (node.status === 'busy' ? node.detail || '执行中' : '空闲') : '离线') : ''
+  const target = activeTarget()
+  // Fall back to the target's own node id when the relay is not listing that node
+  // — a restored tab survives a relay restart, and a header reading "未选择" next
+  // to a live selected tab looks like the selection was lost.
+  const nodeId = target === null ? state.browsing : target.nodeId
+  const node = nodeOf(nodeId)
+  const sub = $('subtitle')
+  if (nodeId === null) {
+    $('title').textContent = '未选择'
+    sub.textContent = ''
+    sub.className = 's'
+    return
+  }
+  $('title').textContent = node === null ? nodeId : (node.name || node.nodeId)
+  if (node === null) { sub.textContent = '离线'; sub.className = 's off'; return }
+  if (!node.online) { sub.textContent = '离线'; sub.className = 's off' }
+  else if (node.status === 'busy') { sub.textContent = node.detail || '执行中'; sub.className = 's busy' }
+  else { sub.textContent = '空闲'; sub.className = 's ok' }
 }
 
-/** Re-render everything that depends on the current selection. */
+/** Re-render everything. */
 function renderAll() {
   renderNodes()
   renderWorkspaces()
+  renderTabs()
   renderHeader()
   renderLog()
   renderHint()
-  $('send').disabled = !state.nodeId || !state.workspace
+  $('send').disabled = activeTarget() === null
+  $('broadcast').disabled = state.targets.length === 0
 }
 
 // ── selection ──────────────────────────────────────────────────────────────
 
 /**
- * Select a node, loading its transcript from the relay.
- * @param {string} nodeId - target node.
+ * Fetch one node's transcript and merge it into the cache.
+ *
+ * Fetched once per node per page load; later changes arrive over the event
+ * stream. Re-fetching on every roster push would turn every status change on
+ * every machine into a request per open tab.
+ *
+ * @param {string} nodeId - node whose history to load.
  */
-async function selectNode(nodeId) {
-  state.nodeId = nodeId
-  const node = state.nodes.find((n) => n.nodeId === nodeId)
-  if (node && node.workspaces.length > 0) {
-    const stillValid = node.workspaces.some((ws) => ws.path === state.workspace)
-    if (!stillValid) state.workspace = node.workspaces[0].path
-  } else {
-    state.workspace = null
-  }
-  renderAll()
+async function loadTranscript(nodeId) {
+  if (state.loadedNodes.has(nodeId)) return
+  state.loadedNodes.add(nodeId)
   try {
     const snap = await api(`/api/state?nodeId=${encodeURIComponent(nodeId)}`)
     state.transcript.set(nodeId, Array.isArray(snap.transcript) ? snap.transcript : [])
+    renderTabs()
     renderLog()
   } catch (error) {
-    $('hint').textContent = `读取历史失败：${error.message}`
+    // Let a later attempt retry: this is the one place the page can recover a
+    // missed history from, and remembering the failure would make it permanent.
+    state.loadedNodes.delete(nodeId)
+    toast(`读取历史失败：${error.message}`, 'err')
   }
 }
 
@@ -469,22 +1423,25 @@ async function selectNode(nodeId) {
 /** Apply a roster push from the relay. */
 function applyRoster(nodes) {
   state.nodes = Array.isArray(nodes) ? nodes : []
-  if (state.nodeId && !state.nodes.some((n) => n.nodeId === state.nodeId)) {
-    state.nodeId = null
-    state.workspace = null
-  }
+  reconcileTargets()
+
   // Pick a target for a first-time visitor. Without this the roster renders and
-  // the page still looks broken: no workspaces, no history, and a dead send
-  // button, because every one of those depends on a selection the user has no
-  // reason to know they must make. Prefer a node that is online and actually
-  // offers somewhere to work.
-  if (!state.nodeId) {
+  // the page still looks broken: no transcript, a dead send button, and no hint
+  // that a selection was ever required. Prefer a machine that is online and
+  // actually offers somewhere to work.
+  if (state.targets.length === 0) {
     const candidate = state.nodes.find((node) => node.online && node.workspaces.length > 0)
-    if (candidate) {
-      void selectNode(candidate.nodeId)
+    if (candidate !== undefined) {
+      void openTarget(candidate.nodeId, candidate.workspaces[0].path)
       return
     }
   }
+  if (state.browsing === null) {
+    const first = state.nodes.find((node) => node.workspaces.length > 0) ?? state.nodes[0]
+    state.browsing = first === undefined ? null : first.nodeId
+  }
+  // Restored tabs have no history yet: the relay push only carries changes.
+  for (const target of state.targets) void loadTranscript(target.nodeId)
   renderAll()
 }
 
@@ -501,18 +1458,23 @@ function applyTranscript(entry) {
   list.sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
   state.transcript.set(entry.nodeId, list)
   if (entry.kind === 'answer' && entry.sessionId) {
-    state.sessions[entry.nodeId] = entry.sessionId
-    try { localStorage.setItem(SESSION_KEY, JSON.stringify(state.sessions)) } catch {}
+    // The session belongs to the workspace that ran it, so it is remembered
+    // against that exact target — never against the node as a whole.
+    state.sessions[targetKey(entry.nodeId, entry.workspace ?? '')] = entry.sessionId
+    persistSessions()
   }
-  if (entry.nodeId === state.nodeId) { renderLog(); renderHint() }
+  renderTabs()
+  if (entry.nodeId === (activeTarget()?.nodeId ?? null)) { renderLog(); renderHint() }
 }
 
 /** Open the event stream; fall back to polling when SSE is unavailable. */
 function connect() {
   if (state.source) state.source.close()
   if (typeof EventSource === 'undefined') { startPolling(); return }
+  setLive('busy', '连接中…')
   const source = new EventSource(`${endpoint('/api/events')}?token=${encodeURIComponent(state.token)}`)
   state.source = source
+  source.onopen = () => setLive('online', '实时同步')
   source.onmessage = (event) => {
     let payload
     try { payload = JSON.parse(event.data) } catch { return }
@@ -521,18 +1483,22 @@ function connect() {
   }
   source.onerror = () => {
     // EventSource retries on its own; the roster refresh below covers the gap.
-    refresh()
+    setLive('busy', '重连中…')
+    void refresh()
   }
 }
 
-/** Refresh the roster and the focused transcript once. */
+/** Refresh the roster and the active transcript once. */
 async function refresh() {
   try {
-    const snap = await api('/api/state' + (state.nodeId ? `?nodeId=${encodeURIComponent(state.nodeId)}` : ''))
+    const snap = await api('/api/state' + (state.active === null ? '' : `?nodeId=${encodeURIComponent(activeTarget()?.nodeId ?? '')}`))
     applyRoster(snap.nodes)
-    if (state.nodeId && Array.isArray(snap.transcript)) {
-      state.transcript.set(state.nodeId, snap.transcript)
-      renderLog()
+    if (state.active !== null && Array.isArray(snap.transcript)) {
+      const target = activeTarget()
+      if (target !== null) {
+        state.transcript.set(target.nodeId, snap.transcript)
+        renderLog()
+      }
     }
   } catch { /* transient; the next tick retries */ }
 }
@@ -540,49 +1506,126 @@ async function refresh() {
 /** Polling fallback for browsers without EventSource. */
 function startPolling() {
   if (state.rosterTimer !== null) return
-  state.rosterTimer = setInterval(refresh, POLL_FALLBACK_MS)
+  setLive('busy', `轮询中（${POLL_FALLBACK_MS / 1000}s）`)
+  state.rosterTimer = setInterval(() => void refresh(), POLL_FALLBACK_MS)
 }
 
 // ── actions ────────────────────────────────────────────────────────────────
 
-/** Send the composer contents to the selected node. */
+/**
+ * Copy one answer to the clipboard, confirming on the button itself.
+ *
+ * `navigator.clipboard` is unavailable on insecure origins, and this page is
+ * reachable over plain HTTP on a LAN, so the selection-based fallback is not
+ * dead code.
+ *
+ * @param {string} text - the answer body.
+ * @param {HTMLButtonElement} button - the button that was pressed.
+ */
+async function copyText(text, button) {
+  let ok = true
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text)
+    else {
+      const area = document.createElement('textarea')
+      area.value = text
+      area.setAttribute('readonly', '')
+      area.style.position = 'fixed'
+      area.style.opacity = '0'
+      document.body.append(area)
+      area.select()
+      ok = document.execCommand('copy')
+      area.remove()
+    }
+  } catch { ok = false }
+  button.textContent = ok ? '已复制' : '复制失败'
+  setTimeout(() => { button.textContent = '复制' }, 1500)
+}
+
+/**
+ * Submit one question to one target.
+ * @param {object} target - destination target.
+ * @param {string} prompt - the question.
+ * @returns {Promise<object>} the relay's acknowledgement.
+ */
+async function submit(target, prompt) {
+  const session = state.sessions[target.key]
+  return api('/api/command', {
+    body: {
+      nodeId: target.nodeId,
+      workspace: target.workspace,
+      prompt,
+      ...(session === undefined || session === '' ? {} : { sessionId: session })
+    }
+  })
+}
+
+/** Send the composer contents to the active target. */
 async function send() {
   const box = $('prompt')
   const prompt = box.value.trim()
-  if (prompt === '' || !state.nodeId || !state.workspace) return
-  const button = $('send')
-  button.disabled = true
-  // Clear the composer synchronously: this is the only part of sending the user
-  // waits on, and it must not depend on the round trip.
+  const target = activeTarget()
+  if (prompt === '' || target === null) return
   box.value = ''
   box.style.height = 'auto'
+  // Clear the composer synchronously: this is the only part of sending the user
+  // waits on, and it must not depend on the round trip.
+  $('send').disabled = true
   try {
-    await api('/api/command', {
-      body: {
-        nodeId: state.nodeId,
-        workspace: state.workspace,
-        prompt,
-        ...(state.sessions[state.nodeId] ? { sessionId: state.sessions[state.nodeId] } : {})
-      }
-    })
+    await submit(target, prompt)
     // The question is rendered from the relay's own broadcast rather than from a
     // local guess. An optimistic entry here would carry no `seq`, so the matching
     // push would not dedupe against it and the turn would render twice — once as
     // pending forever and once as answered.
   } catch (error) {
     box.value = prompt
-    $('hint').textContent = `发送失败：${error.message}`
+    toast(`发送失败：${error.message}`, 'err')
   } finally {
-    button.disabled = false
+    renderAll()
   }
 }
 
-/** Start a fresh conversation on the selected node. */
+/**
+ * Send one question to every open target.
+ *
+ * Each machine still runs its remote turns one at a time, so this dispatches
+ * rather than parallelises — the point is not needing to retype the same
+ * question once per tab.
+ */
+async function broadcast() {
+  const box = $('prompt')
+  const prompt = box.value.trim()
+  if (prompt === '' || state.targets.length === 0) return
+  const targets = [...state.targets]
+  box.value = ''
+  box.style.height = 'auto'
+  $('broadcast').disabled = true
+  const failures = []
+  await Promise.all(targets.map(async (target) => {
+    try {
+      await submit(target, prompt)
+    } catch (error) {
+      failures.push(`${workspaceLabel(target)}：${error.message}`)
+    }
+  }))
+  if (failures.length === 0) {
+    toast(`已把这条指令派给全部 ${targets.length} 个目标`, 'ok')
+  } else {
+    // The prompt is deliberately *not* restored: some targets did accept it, so
+    // putting the text back would invite a second send to those.
+    toast(`派发 ${targets.length - failures.length}/${targets.length} 成功；失败：${failures.join('；')}`, 'err')
+  }
+  renderAll()
+}
+
+/** Start a fresh conversation on the active target. */
 function newChat() {
-  if (state.nodeId) delete state.sessions[state.nodeId]
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(state.sessions)) } catch {}
+  const target = activeTarget()
+  if (target === null) return
+  delete state.sessions[target.key]
+  persistSessions()
   renderHint()
-  $('hint').textContent = '下一条指令会在这台 harness 上开一个新会话。'
+  toast(`下一条指令会在 ${workspaceLabel(target)} 上开一个新会话。`)
 }
 
 // ── gate ───────────────────────────────────────────────────────────────────
@@ -595,6 +1638,7 @@ async function enter(token) {
   state.token = token
   const snap = await api('/api/state')
   try { localStorage.setItem(TOKEN_KEY, token) } catch {}
+  document.body.classList.remove('booting')
   $('gate').style.display = 'none'
   $('app').classList.add('on')
   applyRoster(snap.nodes)
@@ -605,15 +1649,20 @@ $('gate-form').addEventListener('submit', async (event) => {
   event.preventDefault()
   const token = $('gate-token').value.trim()
   if (token === '') return
+  const input = $('gate-token')
+  input.classList.remove('bad')
   $('gate-err').textContent = ''
   try {
     await enter(token)
   } catch (error) {
     $('gate-err').textContent = error.message
+    input.classList.add('bad')
+    input.select()
   }
 })
 
 $('send').addEventListener('click', send)
+$('broadcast').addEventListener('click', broadcast)
 $('newchat').addEventListener('click', newChat)
 $('signout').addEventListener('click', () => {
   try { localStorage.removeItem(TOKEN_KEY) } catch {}
@@ -621,11 +1670,24 @@ $('signout').addEventListener('click', () => {
   location.reload()
 })
 
+$('menu').addEventListener('click', () => document.body.classList.toggle('nav-open'))
+$('aside-close').addEventListener('click', closeNav)
+$('scrim').addEventListener('click', closeNav)
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') closeNav()
+})
+
 $('prompt').addEventListener('keydown', (event) => {
-  if (event.key === 'Enter' && !event.shiftKey) {
+  if (event.key !== 'Enter') return
+  // ⌘/Ctrl+Enter reaches every tab; Enter reaches the one being read.
+  if (event.metaKey || event.ctrlKey) {
     event.preventDefault()
-    void send()
+    void broadcast()
+    return
   }
+  if (event.shiftKey) return
+  event.preventDefault()
+  void send()
 })
 $('prompt').addEventListener('input', (event) => {
   const el = event.target
@@ -640,11 +1702,19 @@ try {
   if (stored !== null) state.sessions = JSON.parse(stored)
 } catch { state.sessions = {} }
 
+restoreTargets()
+renderAll()
+
 const savedToken = (() => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } })()
 if (savedToken) {
+  // Hold the gate back until the stored token has been checked, so a returning
+  // visitor never sees the login card at all.
+  document.body.classList.add('booting')
   enter(savedToken).catch(() => {
+    document.body.classList.remove('booting')
     $('gate').style.display = 'grid'
     $('gate-err').textContent = '保存的令牌已失效，请重新输入'
+    $('gate-token').classList.add('bad')
   })
 }
 </script>

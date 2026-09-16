@@ -580,6 +580,156 @@ try {
   const finalImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
   await writeFile(finalShot, Buffer.from(finalImage.data, 'base64'))
 
+  // ── a second target, and the isolation that makes it worth having ────────
+  // Everything above proves that one machine in one workspace works. The whole
+  // point of the tab strip is that a second target works *alongside* the first
+  // without either leaking into the other, so this opens a second workspace on
+  // the same node and checks exactly that — through the sidebar, the way a
+  // person would.
+  const opened = await devtools.evaluate(
+    sessionId,
+    `(() => {
+       const buttons = [...document.querySelectorAll('#workspaces .ws')];
+       const notes = buttons.find((button) => button.textContent.includes('notes'));
+       if (notes === undefined) return 'no notes workspace in the sidebar';
+       notes.click();
+       return 'clicked';
+     })()`
+  )
+  check('the sidebar offers the second workspace as a target', opened === 'clicked', String(opened))
+
+  const twoTabs = await waitFor(
+    () => devtools.evaluate(sessionId, `document.querySelectorAll('#tabs .tab').length`),
+    (count) => Number(count) === 2,
+    5_000
+  )
+  check('opening a second workspace adds a second tab', twoTabs, 'the tab strip never reached two tabs')
+
+  const secondTab = await devtools.evaluate(
+    sessionId,
+    `JSON.stringify({
+       label: document.querySelectorAll('#tabs .tab')[1]?.textContent ?? '',
+       selected: document.querySelectorAll('#tabs .tab')[1]?.classList.contains('sel') ?? false,
+       log: document.getElementById('log').textContent
+     })`
+  )
+  const parsedSecond = JSON.parse(secondTab)
+  check('the new tab is the active one', parsedSecond.selected === true, secondTab)
+  check('the new tab names its own workspace', parsedSecond.label.includes('notes'), parsedSecond.label)
+  // The relay keeps one transcript per node, so without partitioning the second
+  // tab would open showing the first workspace's conversation.
+  check(
+    'the first workspace history does not leak into the second tab',
+    !parsedSecond.log.includes('改了远程控制插件的中转协议。'),
+    parsedSecond.log
+  )
+
+  await devtools.evaluate(
+    sessionId,
+    `(() => {
+       const box = document.getElementById('prompt');
+       box.value = 'notes 里有什么？';
+       box.dispatchEvent(new Event('input', { bubbles: true }));
+       document.getElementById('send').click();
+       return box.value;
+     })()`
+  )
+  let notesCommand
+  const notesDeadline = Date.now() + 20_000
+  while (Date.now() < notesDeadline) {
+    const polled = await asNode('/api/agent/poll', { nodeId: 'mac-1' })
+    if (polled.command === null || polled.command === undefined) continue
+    if (polled.command.prompt === 'notes 里有什么？') {
+      notesCommand = polled.command
+      break
+    }
+    // A straggler from an earlier step: answer it so the poll moves on.
+    await asNode('/api/agent/report', {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: polled.command.commandId,
+      result: {
+        ok: true,
+        prompt: polled.command.prompt,
+        workspace: polled.command.workspace,
+        sessionId: 'remote-straggler',
+        text: '（历史命令）',
+        durationMs: 10
+      }
+    })
+  }
+  check(
+    'the second tab dispatches to its own workspace',
+    notesCommand?.workspace === '/Users/dev/notes',
+    JSON.stringify(notesCommand)
+  )
+  // The regression this guards: a session belongs to the workspace it was
+  // created in, so inheriting the first workspace's `sessionId` here would run
+  // the question in the wrong directory and still report success.
+  check(
+    'the second tab does not inherit the first workspace session',
+    notesCommand !== undefined && notesCommand.sessionId === undefined,
+    JSON.stringify(notesCommand)
+  )
+
+  if (notesCommand !== undefined) {
+    await asNode('/api/agent/report', {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: notesCommand.commandId,
+      result: {
+        ok: true,
+        prompt: notesCommand.prompt,
+        workspace: notesCommand.workspace,
+        sessionId: 'remote-notes',
+        text: 'notes 工作台里只有会议记录。',
+        durationMs: 700
+      }
+    })
+  }
+  const notesRendered = await waitFor(
+    () => devtools.evaluate(sessionId, `document.getElementById('log').textContent`),
+    (text) => String(text).includes('notes 工作台里只有会议记录。'),
+    15_000
+  )
+  check('the second tab renders its own answer', notesRendered)
+
+  await devtools.evaluate(sessionId, `document.querySelectorAll('#tabs .tab')[0].click(); 'ok'`)
+  const backToFirst = await waitFor(
+    () => devtools.evaluate(sessionId, `document.getElementById('log').textContent`),
+    (text) => String(text).includes('改了远程控制插件的中转协议。') && !String(text).includes('notes 工作台里只有会议记录。'),
+    5_000
+  )
+  check('switching tabs swaps the transcript back', backToFirst)
+  const tabsShot = join(workdir, '05-two-targets.png')
+  const tabsImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
+  await writeFile(tabsShot, Buffer.from(tabsImage.data, 'base64'))
+
+  // ── a transient message has to be somewhere a person can see it ──────────
+  // The toast is `position: absolute` against the composer, so a missing
+  // `position: relative` on that ancestor silently resolves it against the
+  // viewport and flings it above the top of the page: in the DOM, invisible on
+  // screen, and passing any check that only asked whether it existed.
+  await devtools.evaluate(sessionId, `document.getElementById('newchat').click(); 'ok'`)
+  const toastBox = await devtools.evaluate(
+    sessionId,
+    `(() => {
+       const el = document.getElementById('toast');
+       if (el.hidden) return 'hidden';
+       const rect = el.getBoundingClientRect();
+       return JSON.stringify({
+         top: Math.round(rect.top), bottom: Math.round(rect.bottom),
+         width: Math.round(rect.width), height: window.innerHeight
+       });
+     })()`
+  )
+  let toastOnScreen = false
+  if (toastBox !== 'hidden') {
+    const box = JSON.parse(String(toastBox))
+    toastOnScreen = box.width > 0 && box.top >= 0 && box.bottom <= box.height
+  }
+  check('a transient message renders inside the viewport', toastOnScreen, String(toastBox))
+
   // ── the production mount: the same page behind a stripped prefix ─────────
   // This is the case that matters in deployment and the one a root-mounted test
   // cannot see. nginx serves the page at `/harness/` but passes `/` to the relay
@@ -655,7 +805,7 @@ try {
   proxy.closeAllConnections?.()
 
   process.stdout.write(`\nui-check: ${String(checks - failures)}/${String(checks)} passed\n`)
-  process.stdout.write(`ui-check: screenshots ${workdir}/0{1,2,3,4}-*.png\n`)
+  process.stdout.write(`ui-check: screenshots ${workdir}/0{1,2,3,4,5}-*.png\n`)
 } catch (error) {
   failures += 1
   process.stdout.write(`\nui-check: harness error — ${error?.stack ?? error}\n`)

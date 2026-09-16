@@ -440,6 +440,30 @@ try {
     check('the fresh session gets its own id', result.sessionId !== 'remote-somebody-elses')
   }
 
+  // ── a session cannot be dragged into another workspace ───────────────────
+  // A DSH session is created inside one working directory and cannot be moved, so
+  // a `sessionId` that arrives alongside a different workspace has to start a
+  // fresh conversation. Continuing the old session instead would run the
+  // question in the wrong directory and still report success — a failure with no
+  // symptom to notice. The page keys its sessions by target for the same reason,
+  // and this is the check that keeps the runner honest if a different client
+  // gets it wrong.
+  {
+    const { runner, ledger } = await makeRunner({
+      workspaces: [
+        { name: 'proj', path: '/workspace/proj' },
+        { name: 'notes', path: '/workspace/notes' }
+      ]
+    })
+    const first = await runner.run(command())
+    const second = await runner.run(
+      command({ commandId: 'cmd-2', workspace: '/workspace/notes', prompt: 'and the notes?', sessionId: first.sessionId })
+    )
+    check('a session id from another workspace starts a fresh session', second.ok === true && ledger.creates.length === 2)
+    check('the fresh session does not reuse the other workspace id', second.sessionId !== first.sessionId)
+    check('the fresh session is created in the requested workspace', ledger.creates[1]?.meta?.cwd === '/workspace/notes')
+  }
+
   // ── refusal paths ────────────────────────────────────────────────────────
   {
     const { runner, ledger } = await makeRunner()
