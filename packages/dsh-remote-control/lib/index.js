@@ -61,111 +61,82 @@ export const REQUIRED_SERVICES = ['agents', 'agentPresets', 'permissionPresets',
  */
 export function apply(ctx, config) {
   const logger = ctx.logger
-  let resolved
-  try {
-    resolved = resolveConfig(config)
-  } catch (error) {
-    report(logger, 'error', error.message)
-    return
-  }
-  let workspaces
-  try {
-    workspaces = normalizeWorkspaces(resolved.workspaces)
-  } catch (error) {
-    report(logger, 'error', error.message)
-    return
-  }
 
-  const identity = {
-    nodeId: resolved.nodeId === '' ? deriveNodeId() : resolved.nodeId,
-    name: resolved.displayName === '' ? hostname() : resolved.displayName,
-    platform: `${platform()} ${release()}`,
-    version: 'dsh-remote-control/0.1.0',
-    workspaces
-  }
+  /**
+   * Where the live configuration comes from.
+   *
+   * Starts at the composed YAML entry, and is replaced by the settings scope once
+   * that service installs the namespace — which is what makes a GUI edit take
+   * effect without restarting the backend. Per plugin instance, so two rows in one
+   * tree cannot fight over it.
+   *
+   * @type {() => object}
+   */
+  let currentSource = () => config
+  /** A prepared configuration waiting for the Harness services to come up. */
+  let pending
 
-  let client
-  try {
-    client = new RelayClient({ relayUrl: resolved.relayUrl, nodeToken: resolved.nodeToken, logger })
-  } catch (error) {
-    report(logger, 'error', error.message)
-    return
-  }
-
-  if (!resolved.enabled) {
-    report(
-      logger,
-      'info',
-      `disabled by configuration (node "${identity.nodeId}", ${String(workspaces.length)} workspace(s), relay ${client.baseUrl})`
-    )
-    return
-  }
-  if (workspaces.length === 0) {
-    report(logger, 'warn', 'no workspaces configured; this node will register but offer nothing to run in')
-  }
-
-  /** @type {RemoteRunner|undefined} */
-  let runner
-  /** @type {AbortController|undefined} */
-  let lifetime
-
-  ctx.inject(REQUIRED_SERVICES, (scoped) => {
-    const controller = new AbortController()
-    lifetime = controller
-    const nodeConfig = { ...resolved, ...identity, workspaces }
-    runner = new RemoteRunner({ ctx: scoped, config: nodeConfig, logger })
-
-    /**
-     * Advertise, then poll until disposed.
-     *
-     * Failures never propagate out of this loop: an unreachable relay is an
-     * ordinary condition (a laptop on a train, a relay restart), so the node
-     * backs off and keeps trying while the rest of the Harness is unaffected.
-     *
-     * @returns {Promise<void>} resolves when the node is disposed.
-     */
-    const run = async () => {
-      let pollHoldMs = 25_000
-      let delay = resolved.reconnectMinMs
-      let announced = false
-      while (!controller.signal.aborted) {
-        try {
-          const ack = await client.hello({ ...identity, workspaces: runner.workspaces() })
-          if (typeof ack.pollHoldMs === 'number' && ack.pollHoldMs > 0) pollHoldMs = ack.pollHoldMs
-          if (!announced) {
-            report(
-              logger,
-              'info',
-              `node "${identity.nodeId}" (${identity.name}) → ${client.baseUrl}, ` +
-                `${String(runner.workspaces().length)} workspace(s), preset ${resolved.agentPreset}, ` +
-                `permission ${resolved.permissionPreset}`
-            )
-            announced = true
-          } else {
-            report(logger, 'info', `reconnected to ${client.baseUrl} as "${identity.nodeId}"`)
-          }
-          delay = resolved.reconnectMinMs
-          while (!controller.signal.aborted) {
-            const command = await client.poll({ nodeId: identity.nodeId, idle: true }, pollHoldMs, controller.signal)
-            if (command === null) continue
-            await handleCommand(command)
-          }
-        } catch (error) {
-          if (controller.signal.aborted) return
-          if (error instanceof RelayAuthError) {
-            report(logger, 'error', `${error.message}; correct nodeToken and restart the backend`)
-            return
-          }
-          if (!(error instanceof RelayUnreachableError)) {
-            report(logger, 'error', `poll loop stopped unexpectedly: ${error?.stack ?? error}`)
-            return
-          }
-          logger?.warn?.(`dsh-remote-control: ${error.message}; retrying in ${String(Math.round(delay / 1000))}s`)
-          await sleep(delay, controller.signal)
-          delay = Math.min(Math.round(delay * 2), resolved.reconnectMaxMs)
-        }
+  /**
+   * Turn one raw configuration object into everything a node needs, or an error.
+   *
+   * Split out because it now runs more than once: on the YAML configuration at
+   * load, and again on every committed settings change.
+   *
+   * @param {object} raw - raw configuration.
+   * @returns {{ resolved: object, workspaces: Array<object>, identity: object } | { error: string }} the prepared node inputs.
+   */
+  const prepare = (raw) => {
+    let resolved
+    try {
+      resolved = resolveConfig(raw)
+    } catch (error) {
+      return { error: error.message }
+    }
+    let workspaces
+    try {
+      workspaces = normalizeWorkspaces(resolved.workspaces)
+    } catch (error) {
+      return { error: error.message }
+    }
+    return {
+      resolved,
+      workspaces,
+      identity: {
+        nodeId: resolved.nodeId === '' ? deriveNodeId() : resolved.nodeId,
+        name: resolved.displayName === '' ? hostname() : resolved.displayName,
+        platform: `${platform()} ${release()}`,
+        version: 'dsh-remote-control/0.1.0',
+        workspaces
       }
     }
+  }
+
+  /**
+   * Stop the running node, if any.
+   *
+   * Awaitable so a rebuild cannot race its predecessor: the old poll loop is
+   * aborted *and* the sessions it started are disposed before the next node
+   * advertises the same identity.
+   *
+   * @returns {Promise<void>} resolves once the node is fully stopped.
+   */
+  let stopCurrent = async () => {}
+
+  /**
+   * Build and start a node from one prepared configuration.
+   *
+   * @param {{ resolved: object, workspaces: Array<object>, identity: object }} prepared - output of `prepare`.
+   * @param {object} scoped - context carrying the Harness services the runner needs.
+   */
+  const start = (prepared, scoped) => {
+    const { resolved, workspaces, identity } = prepared
+    const controller = new AbortController()
+    const client = new RelayClient({ relayUrl: resolved.relayUrl, nodeToken: resolved.nodeToken, logger })
+    const runner = new RemoteRunner({
+      ctx: scoped,
+      config: { ...resolved, ...identity, workspaces },
+      logger
+    })
 
     /**
      * Execute one command and report its outcome.
@@ -196,19 +167,169 @@ export function apply(ctx, config) {
       })
     }
 
+    /**
+     * Advertise, then poll until aborted.
+     *
+     * Failures never propagate out of this loop: an unreachable relay is an
+     * ordinary condition (a laptop on a train, a relay restart), so the node backs
+     * off and keeps trying while the rest of the Harness is unaffected.
+     *
+     * @returns {Promise<void>} resolves when the node is stopped.
+     */
+    const run = async () => {
+      let pollHoldMs = 25_000
+      let delay = resolved.reconnectMinMs
+      let announced = false
+      while (!controller.signal.aborted) {
+        try {
+          const ack = await client.hello({ ...identity, workspaces: runner.workspaces() })
+          if (typeof ack.pollHoldMs === 'number' && ack.pollHoldMs > 0) pollHoldMs = ack.pollHoldMs
+          if (!announced) {
+            report(
+              logger,
+              'info',
+              `node "${identity.nodeId}" (${identity.name}) → ${client.baseUrl}, ` +
+                `${String(runner.workspaces().length)} workspace(s), preset ${resolved.agentPreset}, ` +
+                `permission ${resolved.permissionPreset}`
+            )
+            announced = true
+          } else {
+            report(logger, 'info', `reconnected to ${client.baseUrl} as "${identity.nodeId}"`)
+          }
+          delay = resolved.reconnectMinMs
+          while (!controller.signal.aborted) {
+            const command = await client.poll({ nodeId: identity.nodeId, idle: true }, pollHoldMs, controller.signal)
+            if (command === null) continue
+            await handleCommand(command)
+          }
+        } catch (error) {
+          if (controller.signal.aborted) return
+          if (error instanceof RelayAuthError) {
+            report(
+              logger,
+              'error',
+              `${error.message}; correct the node token (Settings → Plugins → Remote control) and it will reconnect`
+            )
+            return
+          }
+          if (!(error instanceof RelayUnreachableError)) {
+            report(logger, 'error', `poll loop stopped unexpectedly: ${error?.stack ?? error}`)
+            return
+          }
+          logger?.warn?.(`dsh-remote-control: ${error.message}; retrying in ${String(Math.round(delay / 1000))}s`)
+          await sleep(delay, controller.signal)
+          delay = Math.min(Math.round(delay * 2), resolved.reconnectMaxMs)
+        }
+      }
+    }
+
+    if (!resolved.enabled) {
+      report(
+        logger,
+        'info',
+        `disabled (node "${identity.nodeId}", ${String(workspaces.length)} workspace(s), relay ${client.baseUrl})`
+      )
+      stopCurrent = async () => {}
+      return
+    }
+    if (workspaces.length === 0) {
+      report(logger, 'warn', 'no workspaces configured; this node will register but offer nothing to run in')
+    }
+
     run().catch((error) => {
       report(logger, 'error', `poll loop rejected: ${error?.message ?? error}`)
     })
 
-    // Both lifetimes are wired: the injection's own disposer stops the loop, and
-    // the outer one disposes the agents it created. Splitting them matters
-    // because the Harness keeps a session alive after the node stops polling.
-    scoped.effect(() => () => controller.abort())
-    ctx.effect(() => () => {
+    stopCurrent = async () => {
       controller.abort()
-      return runner.dispose()
+      await runner.dispose()
+    }
+  }
+
+  /** The services the runner needs; declared here so the plugin still loads without them. */
+  let scopedContext
+
+  /**
+   * Apply one configuration object, replacing whatever is running.
+   *
+   * Ordering matters in two places, and both are deliberate:
+   *
+   * - `pending` is updated on *every* successful prepare, not only while the
+   *   services are missing. The injection below starts from whatever
+   *   `pending` holds, so leaving a stale value there would start the node with a
+   *   configuration the operator had already replaced.
+   * - teardown is sequenced with `then` before the replacement starts, so the old
+   *   poll loop is aborted and its sessions disposed before the new node advertises
+   *   the same identity. A rejection in teardown is reported rather than becoming
+   *   an unhandled rejection, and the replacement still runs.
+   *
+   * @param {object} raw - raw configuration.
+   */
+  const applyConfig = (raw) => {
+    const prepared = prepare(raw)
+    if (prepared.error !== undefined) {
+      report(logger, 'error', prepared.error)
+      pending = undefined
+      const previous = stopCurrent
+      stopCurrent = async () => {}
+      void previous().catch((error) => {
+        report(logger, 'warn', `stopping the node failed: ${error?.message ?? error}`)
+      })
+      return
+    }
+    pending = prepared
+    if (scopedContext === undefined) return
+    const previous = stopCurrent
+    stopCurrent = async () => {}
+    void previous()
+      .catch((error) => {
+        report(logger, 'warn', `stopping the previous node failed: ${error?.message ?? error}`)
+      })
+      .then(() => start(prepared, scopedContext))
+  }
+
+  // Start from the composed YAML configuration first, so a deployment that
+  // configures the node in `cordis.patch.yml` behaves exactly as before and does
+  // not depend on the settings service being present at all.
+  applyConfig(config)
+
+  ctx.inject(REQUIRED_SERVICES, (scoped) => {
+    scopedContext = scoped
+    // Re-apply now that the services exist, then follow the settings namespace so
+    // an edit in the GUI takes effect without restarting the backend.
+    ctx.inject(['settings'], (settingsCtx) => {
+      const namespace = 'remote-control'
+      void (async () => {
+        try {
+          const { loadSchema } = await import('./settings-schema.js')
+          settingsCtx.settings.installSection(ctx, namespace, await loadSchema(), config, {
+            setSource: (source) => {
+              currentSource = source
+            },
+            onChange: () => {
+              applyConfig(currentSource())
+            }
+          })
+        } catch (error) {
+          // Settings are a convenience, not a requirement: without schemastery or a
+          // provider the node still runs from YAML. Saying so beats a silent no-op.
+          report(
+            logger,
+            'warn',
+            `settings are not editable from the GUI (${error?.message ?? error}); the YAML configuration still applies`
+          )
+        }
+      })()
     })
+    if (pending !== undefined) {
+      const prepared = pending
+      start(prepared, scoped)
+    }
   })
+
+  // The outer lifetime owns the sessions: the Harness keeps a session alive after
+  // the node stops polling, so disposal has to be explicit and last.
+  ctx.effect(() => () => stopCurrent())
 }
 
 /**

@@ -352,6 +352,16 @@ CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）分三层�
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
+**配置有两层，后者覆盖前者：**
+
+1. **profile 的补丁层**（`cordis.patch.yml`）—— 部署期默认值，进程启动时读一次；
+2. **用户设置**（`settings.yaml` 的 `remote-control` 命名空间）—— **改完立即生效，不用重启后端**。
+
+两层都是可选的，字段级覆盖：YAML 里给了 `relayUrl`，设置里只改 `displayName`，
+另一个字段继续从 YAML 继承。少了必填项时插件只报一条错误并停止，**不会弄坏 profile**。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
 | `relayUrl` | 必填 | 中转台地址，含子路径、不带尾斜杠 |
 | `nodeToken` | 必填 | 中转台的 `DSH_REMOTE_AGENT_TOKEN` |
 | `nodeId` | 主机名+家目录的哈希 | 稳定身份；两台机器主机名相同时才需要显式指定 |
@@ -361,6 +371,18 @@ CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）分三层�
 | `permissionPreset` | `workspace-write` | 固定给远程会话的权限预设 |
 | `reconnectMinMs` / `reconnectMaxMs` | `2000` / `60000` | 断线重连退避区间 |
 | `enabled` | `true` | 设 `false` 只校验配置并打日志，不连接 |
+
+改用户设置现在可以直接编辑 `settings.yaml`：
+
+```yaml
+remote-control:
+  displayName: 我的 Windows 本
+  workspaces:
+    - C:/Users/me/projects
+```
+
+保存即生效——插件会拆掉当前节点、用新配置重新登记，无需重启后端
+（`tools/settings-check.mjs` 就是端到端验证这件事的）。
 
 中转台的环境变量：
 
