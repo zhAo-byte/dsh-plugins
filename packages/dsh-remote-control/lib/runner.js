@@ -4,9 +4,10 @@
  * This is the only file that touches the Harness API, and it deliberately does
  * not invent a private execution path: every step mirrors what the official
  * `dsh-webhook` runtime does when it turns an external event into a session
- * (`ctx.agentPresets.resolve` → `ctx.workspaceRegistry.create` →
- * `ctx.agents.create` with `meta.cwd` → `mount` → `attachSession` →
- * `permissionPresets.set` → `followup`). The payoff is that a remotely started
+ * (`ctx.agentDefaultModel.currentSelection` → `ctx.agentPresets.resolve` →
+ * `ctx.workspaceRegistry.create` → `ctx.agents.create` with `agentOptions` and
+ * `meta.cwd` → `mount` → `attachSession` → `permissionPresets.set` →
+ * `followup`). The payoff is that a remotely started
  * conversation is an ordinary session: it appears in the local GUI, in the
  * sidebar, in the workspace grouping, in persistence, and its approvals route
  * through the normal approval service to whoever is sitting at the machine.
@@ -297,8 +298,22 @@ export class RemoteRunner {
     await this.ctx.agentPresets.standingKeyFor(preset.id)
     const workspace = await this.ctx.workspaceRegistry.create(workspacePath)
     const sessionId = brandString(`remote-${randomUUID()}`)
+    // An Agent created without a route cannot assemble its first prompt at all:
+    // the persona prefix every shipped preset carries is
+    // `You are a coding agent powered by the {{model}} model.`, and the prompt
+    // registry resolves `{{model}}` strictly from `agent.options.model`, so an
+    // absent route throws before any request is built ("prompt variable
+    // \"{{model}}\" has no value for this assembly (section
+    // \"deployment:persona-prefix\")"). The GUI never meets this because its own
+    // create path passes `agentDefaultModel.currentSelection()`; the node is the
+    // one entry point that builds an Agent by hand, so it pins the same default
+    // route here. A deployment default is always present (`provider`/`model` are
+    // required by that service), which keeps the first turn working even when the
+    // relay is the only thing driving the session and no GUI has picked a model.
+    const route = this.ctx.agentDefaultModel.currentSelection()
     const handle = await this.ctx.agents.create({
       sessionId,
+      agentOptions: { provider: route.provider, model: route.model },
       meta: { cwd: workspace.path, agentPreset: preset.id },
       setup: async (agentCtx) => {
         await this.ctx.agentPresets.mount(agentCtx, preset.id)

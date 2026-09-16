@@ -35,8 +35,13 @@ export const name = 'dsh-remote-control'
  * These are declared for `ctx.inject` rather than as a plugin-level `inject` on
  * purpose: the plugin should still *load* — and say why it cannot work — in a
  * composition that lacks them, instead of silently vanishing from the tree.
+ *
+ * `agentDefaultModel` is in the list because a remotely created session has no
+ * one else to pick its route: the persona every preset carries renders
+ * `{{model}}` strictly, so an Agent published without a provider/model cannot
+ * assemble its first prompt. See `RemoteRunner.startConversation`.
  */
-export const REQUIRED_SERVICES = ['agents', 'agentPresets', 'permissionPresets', 'workspaceRegistry']
+export const REQUIRED_SERVICES = ['agents', 'agentPresets', 'agentDefaultModel', 'permissionPresets', 'workspaceRegistry']
 
 // There is deliberately no `Config` schema here.
 //

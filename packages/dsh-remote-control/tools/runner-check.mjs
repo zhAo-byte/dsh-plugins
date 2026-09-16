@@ -152,6 +152,9 @@ function fakeHarness(options = {}) {
   }
   const handles = new Map()
   const ctx = {
+    agentDefaultModel: {
+      currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' })
+    },
     agentPresets: {
       resolve: (id) => {
         ledger.resolvedPresets.push(id)
@@ -389,6 +392,15 @@ try {
     check('the session is attached to the workspace', ledger.attached.length === 1)
     check('the agent is created with the workspace as cwd', ledger.creates[0]?.meta?.cwd === '/workspace/proj')
     check('the session records the agent preset', ledger.creates[0]?.meta?.agentPreset === 'standard')
+    // A route on the created Agent is what makes the preset persona's
+    // `{{model}}` resolvable, so a relay-only session's first turn can assemble
+    // a prompt at all.
+    check(
+      'the agent is created with the deployment default route',
+      ledger.creates[0]?.agentOptions?.provider === 'deepseek-official' &&
+        ledger.creates[0]?.agentOptions?.model === 'deepseek-flash',
+      JSON.stringify(ledger.creates[0]?.agentOptions)
+    )
     check('the preset is mounted on the agent scope before publication', ledger.mountedPresets[0]?.id === 'standard')
     check(
       'the configured permission preset is pinned onto the session',

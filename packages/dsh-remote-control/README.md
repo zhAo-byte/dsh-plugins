@@ -213,7 +213,9 @@ workspaces: registry
    → RemoteRunner 在本地：
         ctx.agentPresets.resolve('standard')       取预设
         ctx.workspaceRegistry.create(path)         确保工作台已登记
-        ctx.agents.create({ meta: { cwd, agentPreset } })
+        ctx.agentDefaultModel.currentSelection()   取默认模型（会话必须有路由）
+        ctx.agents.create({ agentOptions: { provider, model },
+                            meta: { cwd, agentPreset } })
         agentPresets.mount(agentCtx, preset)       把工具挂到会话作用域
         workspace.attachSession(sessionId)         归入工作区分组
         permissionPresets.set(session, 'workspace-write')
