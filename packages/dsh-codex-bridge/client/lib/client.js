@@ -25,6 +25,9 @@ window.__ModuleLoader__.load({
 		 * nothing in a future shell build.
 		 */
 		const CSS = [
+			".cxb-section { display: flex; flex-direction: column; gap: 10px; }",
+			".cxb-section-title { margin: 0; font-size: 15px; font-weight: 600; }",
+			".cxb-section-lede { margin: 0 0 4px; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-text-secondary, #9aa3b2); }",
 			".cxb-card{box-sizing:border-box;display:flex;flex-direction:column;overflow:hidden;border:0;border-radius:14px;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.06));box-shadow:0 0 0 .5px var(--dsw-alias-border-l2,rgba(127,127,127,.3))}",
 			".cxb-summary{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;list-style:none}",
 			".cxb-summary::-webkit-details-marker{display:none}",
@@ -332,8 +335,44 @@ window.__ModuleLoader__.load({
 		//#endregion
 
 		//#region dsh-codex-bridge-client: apply
+		/** The settings section's nav key and order. */
+		const SECTION_ID = "codex-bridge";
+		/** Right after the shipped sections (general 0, models 10, plugins 15, agent-presets 20). */
+		const SECTION_ORDER = 26;
+
 		/**
-		 * Mount the card.
+		 * The card's injected face over the panel namespace.
+		 *
+		 * One factory, used by both mount points, so the tab and the Plugins-tab card
+		 * can never drift into reading different state.
+		 *
+		 * @param scope - the bound settings scope.
+		 * @returns the injected props.
+		 */
+		function scopeProps(scope) {
+			return {
+				readSnapshot: () => scope.getSnapshot(),
+				subscribe: (listener) => scope.subscribe(listener)
+			};
+		}
+
+		/**
+		 * Mount the panel.
+		 *
+		 * Registered twice, on purpose:
+		 *
+		 * - `settings.section` gives it a **top-level settings page of its own**. The
+		 *   settings shell is data-driven — the slot contract states that a feature
+		 *   owns its own settings pages and that adding a setting never means editing
+		 *   the shell — so this is the supported way to get a page rather than a copy
+		 *   of one.
+		 * - `settings.plugin.item` keeps the Plugins → Plugin configuration card, so
+		 *   that tab stays an index of configurable plugins.
+		 *
+		 * The page renders the same component: this bridge has no settings of its own
+		 * to edit, it reports what it found, and splitting the read-only panel into a
+		 * second component would only duplicate it.
+		 *
 		 * @param ctx - the browser plugin context.
 		 */
 		function apply(ctx) {
@@ -342,17 +381,44 @@ window.__ModuleLoader__.load({
 			ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
 				name: "settings.plugin.item",
 				key: PANEL_NAMESPACE,
-				inject: () => ({
-					readSnapshot: () => scope.getSnapshot(),
-					subscribe: (listener) => scope.subscribe(listener)
-				})
+				inject: () => scopeProps(scope)
 			}, CodexPanelCard));
+			ctx.slots.inject("settings.section", () => ctx.slots.register({
+				name: "settings.section",
+				id: SECTION_ID,
+				order: SECTION_ORDER,
+				// A function, matching every shipped registrant: the shell resolves the
+				// label through `resolveSlotLabel` and re-reads it on locale change.
+				// Text lives here because this plugin ships no translations.
+				label: () => "Codex 桥",
+				inject: () => scopeProps(scope)
+			}, CodexPanelSection));
+		}
+
+		/**
+		 * The section page: a title, a line of orientation, and the panel.
+		 *
+		 * `props.close` is supplied by the shell and deliberately unused — nothing here
+		 * leaves settings. It is named so the reason is visible.
+		 *
+		 * @param props - the injected props plus the shell's `close`.
+		 * @returns the React element.
+		 */
+		function CodexPanelSection(props) {
+			return react.createElement("div", { className: "cxb-section" }, [
+				react.createElement("h2", { key: "title", className: "cxb-section-title" }, "Codex 桥"),
+				react.createElement("p", { key: "lede", className: "cxb-section-lede" },
+					"这个桥把 Codex 的 skill 与 MCP server 接进 DSH。下面是它读到的东西，对 Codex 侧只读。"),
+				react.createElement(CodexPanelCard, { key: "panel", ...props })
+			]);
 		}
 		//#endregion
 
 		exports.apply = apply;
 		exports.inject = inject;
 		exports.PANEL_NAMESPACE = PANEL_NAMESPACE;
+		exports.SECTION_ID = SECTION_ID;
+		exports.CodexPanelSection = CodexPanelSection;
 		return module.exports;
 	}
 });

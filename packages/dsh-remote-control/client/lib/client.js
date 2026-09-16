@@ -43,6 +43,9 @@ window.__ModuleLoader__.load({
 
     //#region dsh-remote-control-client: styles
     const CSS = `
+.rc-section { display: flex; flex-direction: column; gap: 10px; }
+.rc-section-title { margin: 0; font-size: 15px; font-weight: 600; }
+.rc-section-lede { margin: 0 0 4px; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-text-secondary, #9aa3b2); }
 .rc-card { display: flex; flex-direction: column; gap: 10px; padding: 4px 0 2px; }
 .rc-note { color: var(--dsw-alias-text-secondary, #9aa3b2); font-size: 12px; line-height: 1.5; }
 .rc-warn { color: var(--dsw-alias-text-warning, #d9a441); font-size: 12px; }
@@ -449,42 +452,110 @@ window.__ModuleLoader__.load({
     //#endregion
 
     //#region dsh-remote-control-client: plugin
+    /** The settings section's nav key and order. */
+    const SECTION_ID = 'remote-control'
+    /** Placed after the shipped sections (general 0, models 10, plugins 15, agent-presets 20). */
+    const SECTION_ORDER = 25
+
     /**
-     * Mount the card.
+     * The card's injected face over its settings scope.
      *
-     * The keyed `settings.plugin.item` slot dispatches this card only for the
-     * namespace it names, so the tab renders it exactly when the host serves
-     * `remote-control` — no feature flag, and nothing to see on a deployment
-     * without this plugin installed.
+     * One factory, used by both mount points, so the section and the Plugins-tab
+     * card can never drift into reading or writing differently.
+     *
+     * @param {object} scope - the bound settings scope.
+     * @returns {object} the injected props.
+     */
+    function scopeProps(scope) {
+      return {
+        getSnapshot: () => scope.getSnapshot(),
+        subscribe: (listener) => scope.subscribe(listener),
+        set: (field, next) => scope.set(field, next),
+        unset: (field) => scope.unset(field),
+        namespace: NAMESPACE
+      }
+    }
+
+    /**
+     * Mount the configuration surface.
+     *
+     * Registered twice, on purpose:
+     *
+     * - `settings.section` gives it a **top-level settings page of its own**, which
+     *   is where a person actually looks for it. The settings shell is data-driven:
+     *   the contract states that a feature owns its own settings pages and that
+     *   adding a setting never means editing the shell, and this is that mechanism
+     *   — the same one the shipped sections and the agent-presets roster use.
+     * - `settings.plugin.item` keeps the Plugins → Plugin configuration card, so the
+     *   tab remains an index of configurable plugins rather than something this
+     *   plugin quietly opts out of.
+     *
+     * Both mount points read and write the same namespace through the same props.
      *
      * @param {object} ctx - the browser plugin context.
      */
     function apply(ctx) {
       installStyles()
       const scope = ctx.settingsScope.bind({ namespace: NAMESPACE })
+
       ctx.slots.inject('settings.plugin.item', () =>
         ctx.slots.register(
           {
             name: 'settings.plugin.item',
             key: NAMESPACE,
-            inject: () => ({
-              getSnapshot: () => scope.getSnapshot(),
-              subscribe: (listener) => scope.subscribe(listener),
-              set: (field, next) => scope.set(field, next),
-              unset: (field) => scope.unset(field),
-              namespace: NAMESPACE
-            })
+            inject: () => scopeProps(scope)
           },
           RemoteControlCard
         )
       )
+
+      ctx.slots.inject('settings.section', () =>
+        ctx.slots.register(
+          {
+            name: 'settings.section',
+            id: SECTION_ID,
+            order: SECTION_ORDER,
+            // A function, matching every shipped registrant: the shell resolves the
+            // label through `resolveSlotLabel` and re-reads it on locale change, and
+            // a locale-bound function is the only shape the shipped sections use.
+            // Text lives here rather than in a locale package because this plugin
+            // ships no translations yet.
+            label: () => '远程控制',
+            inject: () => scopeProps(scope)
+          },
+          RemoteControlSection
+        )
+      )
+    }
+
+    /**
+     * The section page: a title, a line of orientation, and the same card.
+     *
+     * `props.close` is supplied by the settings shell and deliberately unused here —
+     * nothing in this page leaves settings. It is named so the reason is visible.
+     *
+     * @param {object} props - the card's injected props plus the shell's `close`.
+     * @returns {object} the React element.
+     */
+    function RemoteControlSection(props) {
+      return react.createElement('div', { className: 'rc-section' }, [
+        react.createElement('h2', { key: 'title', className: 'rc-section-title' }, '远程控制'),
+        react.createElement(
+          'p',
+          { key: 'lede', className: 'rc-section-lede' },
+          '让公网上的中转台认出这台机器，并向它派活。下面的改动保存后立即生效，不用重启后端。'
+        ),
+        react.createElement(RemoteControlCard, { key: 'card', ...props })
+      ])
     }
     //#endregion
 
     exports.apply = apply
     exports.inject = inject
     exports.NAMESPACE = NAMESPACE
+    exports.SECTION_ID = SECTION_ID
     exports.RemoteControlCard = RemoteControlCard
+    exports.RemoteControlSection = RemoteControlSection
     return module.exports
   }
 })

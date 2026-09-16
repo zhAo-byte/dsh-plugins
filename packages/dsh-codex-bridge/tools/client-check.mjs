@@ -218,6 +218,14 @@ async function checkBundle(index, cookies) {
   if (!bundle.includes(`id: "${CLIENT_PACKAGE}"`)) return fail(`served batch does not register ${CLIENT_PACKAGE}`)
   if (!bundle.includes(source.slice(0, 400))) return fail('served batch does not match the bundle on disk')
   ok(`served application batch carries the bundle (${(bundle.length / 1024 / 1024).toFixed(1)} MB composite)`)
+
+  // The panel mounts twice: the Plugins-tab card and a settings page of its own.
+  // The byte comparison above already implies this, but naming the two slot
+  // registrations makes a regression say which one disappeared.
+  const markers = ['settings.plugin.item', 'settings.section', 'CodexPanelSection']
+  const absent = markers.filter((marker) => !bundle.includes(marker))
+  if (absent.length > 0) return fail(`served bundle is missing mount points: ${absent.join(', ')}`)
+  ok('served bundle registers both the Plugins card and the settings section')
 }
 
 /** Assertion 4: the host row published the namespace the card reads. */

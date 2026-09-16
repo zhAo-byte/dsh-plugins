@@ -341,7 +341,8 @@ codex-panel（宿主）──写──▶ ctx.settings['codex-bridge'] ──读
   read 2026-09-16T07:40:27.123Z · Codex files are read-only from here
 ```
 
-挂到 **设置 → 插件** 页（可配置那张卡），按命名空间 key 分发（`settings.plugin.item`）。
+挂到两处：**设置 → 插件 → 插件配置** 里那张卡（按命名空间 key 分发，`settings.plugin.item`），以及**它自己的设置页签**（`settings.section`，导航项「Codex 桥」）。
+设置页签是内容自己注册的——契约里写明「一个 feature 拥有自己的设置页，加一个设置从不需要改 shell」，所以这不是给 shell 打补丁。两处渲染同一个组件、读同一份快照。
 命名空间不可用时卡不渲染——没装这个桥的部署看不到任何痕迹。
 
 ### 严重度分三档，别把「你自己关的」画成错误

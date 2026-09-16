@@ -189,6 +189,21 @@ try {
       `slot=${String(bundle.includes('settings.plugin.item'))} key=${String(bundle.includes(NAMESPACE))}`
     )
     check('the bundle carries the card component itself', bundle.includes('RemoteControlCard'))
+    // Report what the bundle actually contains on failure: the served artifact is
+    // the only authority on this, and a bare false sends you looking in the wrong
+    // file.
+    const absent = ['settings.section', 'settings.plugin.item', 'RemoteControlSection', 'RemoteControlCard', 'SECTION_ORDER']
+      .filter((marker) => !bundle.includes(marker))
+    check(
+      'the bundle registers a settings section of its own',
+      absent.length === 0,
+      `missing from the served bundle: ${absent.join(', ')}`
+    )
+    check(
+      'the settings section carries its order and label',
+      bundle.includes('SECTION_ORDER') && bundle.includes('\u8fdc\u7a0b\u63a7\u5236'),
+      'a section without a label renders an empty nav entry'
+    )
     check(
       'the bundle declares the services the card reads config through',
       bundle.includes('settingsScope') && bundle.includes('slots'),
