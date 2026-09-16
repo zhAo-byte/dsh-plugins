@@ -22,7 +22,7 @@
  * truncate it — same rule as the other self-checks in this package.
  */
 import { spawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -121,7 +121,33 @@ function prepareHome() {
     const link = join(profile, 'node_modules', name)
     if (!existsSync(link)) symlinkSync(target, link)
   }
+  // Pin the bundle list to the packages under test.
+  //
+  // The copied package.json is the operator's, and copying it wholesale made this
+  // check a function of whatever else they had installed: the moment an unrelated
+  // plugin appeared in their `bundles`, the isolated profile tried to resolve it
+  // and the backend exited with "cannot resolve profile bundle" — a red result
+  // that said nothing about this package. A test fixture should be the smallest
+  // environment that exercises the thing under test, so it names its own bundles
+  // and inherits everything else (the user patch layer, the hoisted tree) as-is.
+  pinBundles(join(profile, 'package.json'))
   notes.push(`isolated DSH_HOME: ${home}`)
+}
+
+/**
+ * Rewrite one profile manifest so its bundle list contains only this package.
+ *
+ * @param {string} manifestPath - the copied profile `package.json`.
+ */
+function pinBundles(manifestPath) {
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const shipped = (manifest.dsh?.profile?.bundles ?? []).filter((entry) => entry.startsWith('@deepseek-ai/'))
+  manifest.dsh.profile.bundles = [...shipped, HOST_PACKAGE]
+  if (!manifest.dependencies?.[HOST_PACKAGE]) manifest.dependencies = { ...manifest.dependencies, [HOST_PACKAGE]: `link:${PACKAGE_ROOT}` }
+  if (!manifest.dependencies?.[CLIENT_PACKAGE]) {
+    manifest.dependencies = { ...manifest.dependencies, [CLIENT_PACKAGE]: `link:${join(PACKAGE_ROOT, 'client')}` }
+  }
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2))
 }
 
 /** Start the web profile and wait for its URL line. */
