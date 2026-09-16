@@ -24,6 +24,7 @@
 import { hostname, platform, release } from 'node:os'
 import { RelayAuthError, RelayClient, RelayUnreachableError } from './client.js'
 import { deriveNodeId, resolveConfig } from './config.js'
+import { RemoteQuestionBridge } from './questions.js'
 import { RemoteRunner, normalizeWorkspaces } from './runner.js'
 
 /** Cordis plugin name; also the id used in a profile patch. */
@@ -101,6 +102,18 @@ export async function apply(ctx, config) {
   let currentSource = () => config
   /** A prepared configuration waiting for the Harness services to come up. */
   let pending
+
+  /**
+   * Every question bridge that currently owns a running node.
+   *
+   * A set rather than a single value because [`applyConfig`] builds the
+   * replacement before the predecessor has finished stopping, and a question
+   * arriving in that window has to be answerable by whichever node owns the
+   * session that asked it.
+   *
+   * @type {Set<RemoteQuestionBridge>}
+   */
+  const liveQuestions = new Set()
 
   /**
    * Turn one raw configuration object into everything a node needs, or an error.
@@ -197,12 +210,20 @@ export async function apply(ctx, config) {
     const workspaces = workspaceProvider === undefined ? prepared.workspaces : workspaceProvider()
     const controller = new AbortController()
     const client = new RelayClient({ relayUrl: resolved.relayUrl, nodeToken: resolved.nodeToken, logger })
+    const questions = new RemoteQuestionBridge({
+      client,
+      nodeId: identity.nodeId,
+      logger,
+      timeoutMs: resolved.questionTimeoutMs
+    })
     const runner = new RemoteRunner({
       ctx: scoped,
       config: { ...resolved, ...identity, workspaces },
       logger,
+      questions,
       ...(workspaceProvider === undefined ? {} : { workspaceProvider })
     })
+    liveQuestions.add(questions)
 
     /**
      * Execute one command and report its outcome.
@@ -308,6 +329,10 @@ export async function apply(ctx, config) {
         'info',
         `disabled (node "${identity.nodeId}", ${String(workspaces.length)} workspace(s), relay ${client.baseUrl})`
       )
+      // Nothing will run, so nothing may answer: leaving the bridge live would
+      // make a disabled node claim every question of every session it ever
+      // created — and it creates none.
+      liveQuestions.delete(questions)
       stopCurrent = async () => {}
       return
     }
@@ -321,6 +346,10 @@ export async function apply(ctx, config) {
 
     stopCurrent = async () => {
       controller.abort()
+      // Retire the bridge before disposing sessions: a question arriving during
+      // teardown must fall through to the local GUI, not wait for a page whose
+      // node is gone.
+      liveQuestions.delete(questions)
       await runner.dispose()
     }
   }
@@ -402,6 +431,30 @@ export async function apply(ctx, config) {
       }
     })
   }
+
+  // ── the question answerer, installed before any node starts ───────────────
+  //
+  // `prepend` is not an optimisation, it is the whole mechanism. Waterfall
+  // listeners run in registration order, and `@deepseek-ai/dsh-api-remotes`
+  // registers its forwarding listener while the backend composes — before this
+  // plugin can possibly have run. Without `prepend`, the local GUI would take
+  // over the composer and block, and the relay page would never see the
+  // question; with it, the relay answers first and returns `next()` for every
+  // question that is not one of ours, leaving local sessions untouched.
+  //
+  // The listener is registered from the plugin root rather than from a session's
+  // own scope because it has to exist before the first session does. Ownership is
+  // decided per event by the bridge instead, which is also what keeps a question
+  // asked in the local GUI on the local GUI.
+  ctx.on('user-questions/request', async (request, next) => {
+    for (const bridge of liveQuestions) {
+      if (!bridge.owns(request?.agent)) continue
+      const answer = await bridge.answer(request)
+      if (answer !== undefined) return answer
+      break
+    }
+    return await next()
+  }, { prepend: true })
 
   // Start from the composed configuration first, so a deployment that configures
   // the node in `cordis.patch.yml` behaves exactly as before and does not depend on

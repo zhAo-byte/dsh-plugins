@@ -222,12 +222,16 @@ function fakeHarness(options = {}) {
  *
  * @param {object} [overrides] - config overrides.
  * @param {object} [harnessOptions] - fake Harness options.
- * @returns {Promise<{ runner: object, ledger: object, handles: Map<string, object>, warnings: string[] }>} the wired runner.
+ * @returns {Promise<{ runner: object, ledger: object, handles: Map<string, object>, warnings: string[], tracked: string[], released: string[] }>} the wired runner.
  */
 async function makeRunner(overrides = {}, harnessOptions = {}) {
   const { RemoteRunner } = await import('../lib/runner.js')
   const { ctx, ledger, handles } = fakeHarness(harnessOptions)
   const warnings = []
+  /** Session ids the runner handed to the question bridge. */
+  const tracked = []
+  /** Session ids the runner retired from it. */
+  const released = []
   const config = {
     nodeId: 'node-test',
     workspaces: [{ name: 'proj', path: '/workspace/proj' }],
@@ -235,8 +239,19 @@ async function makeRunner(overrides = {}, harnessOptions = {}) {
     permissionPreset: 'workspace-write',
     ...overrides
   }
-  const runner = new RemoteRunner({ ctx, config, logger: { warn: (line) => warnings.push(line) } })
-  return { runner, ledger, handles, warnings }
+  const runner = new RemoteRunner({
+    ctx,
+    config,
+    logger: { warn: (line) => warnings.push(line) },
+    // The bridge is recorded rather than imported: what this file has to prove is
+    // that the runner hands over the exact session id it created and retires it on
+    // disposal. The bridge's own behaviour is `node-check`'s subject.
+    questions: {
+      track: (sessionId) => tracked.push(sessionId),
+      release: (sessionId) => released.push(sessionId)
+    }
+  })
+  return { runner, ledger, handles, warnings, tracked, released }
 }
 
 const command = (overrides = {}) => ({
@@ -378,7 +393,7 @@ try {
 
   // ── a first turn ─────────────────────────────────────────────────────────
   {
-    const { runner, ledger } = await makeRunner()
+    const { runner, ledger, tracked, released } = await makeRunner()
     const result = await runner.run(command())
     check('the first question succeeds', result.ok === true, JSON.stringify(result))
     check('the answer is the committed assistant text', result.text === 'answer')
@@ -408,6 +423,17 @@ try {
       JSON.stringify(ledger.permissions)
     )
     check('the session is titled from the question', ledger.titles[0]?.title === 'what changed today?', JSON.stringify(ledger.titles))
+    check(
+      'the created session is handed to the question bridge',
+      tracked.includes(String(result.sessionId)),
+      `tracked ${JSON.stringify(tracked)} for ${String(result.sessionId)} — without this the relay cannot answer its questions`
+    )
+    await runner.dispose()
+    check(
+      'disposing the session also retires it from the bridge',
+      released.includes(String(result.sessionId)),
+      `released ${JSON.stringify(released)}`
+    )
     check('the session is flushed before the reply is read', ledger.flushed.length === 1)
     check('the prompt is admitted as a user message', ledger.followups[0]?.message?.source?.kind === 'user')
     check(

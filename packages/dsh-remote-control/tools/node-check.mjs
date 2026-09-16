@@ -64,11 +64,13 @@ async function rejects(what, run, expected) {
 /** Recorded requests from the fake relay. */
 const seen = []
 let responder = () => ({ status: 200, body: {} })
+/** Extra time this fake relay holds a response, to stand in for a long-poll. */
+let responseDelayMs = 0
 
 const relay = createServer((req, res) => {
   const chunks = []
   req.on('data', (chunk) => chunks.push(chunk))
-  req.on('end', () => {
+  req.on('end', async () => {
     const raw = Buffer.concat(chunks).toString('utf8')
     let body
     try {
@@ -77,7 +79,12 @@ const relay = createServer((req, res) => {
       body = raw
     }
     seen.push({ path: req.url, method: req.method, auth: req.headers.authorization, body })
+    // The real relay holds `/api/agent/ask` open until a person answers; without a
+    // delay here the fake answers in a millisecond and a cancellation test would
+    // race its own abort.
+    if (responseDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, responseDelayMs))
     const { status, body: responseBody } = responder(req.url, body)
+    if (res.writableEnded) return
     const payload = JSON.stringify(responseBody)
     res.writeHead(status, { 'content-type': 'application/json' })
     res.end(payload)
@@ -259,6 +266,19 @@ try {
       resolveConfig({ relayUrl: 'http://h', nodeToken: 't', reconnectMinMs: 0 }).reconnectMinMs === DEFAULT_CONFIG.reconnectMinMs
     )
     check(
+      'an absent question timeout falls back to the documented wait',
+      resolved.questionTimeoutMs === DEFAULT_CONFIG.questionTimeoutMs,
+      String(resolved.questionTimeoutMs)
+    )
+    check(
+      'a zero question timeout falls back rather than giving up instantly',
+      resolveConfig({ relayUrl: 'http://h', nodeToken: 't', questionTimeoutMs: 0 }).questionTimeoutMs === DEFAULT_CONFIG.questionTimeoutMs
+    )
+    check(
+      'an explicit question timeout is honoured',
+      resolveConfig({ relayUrl: 'http://h', nodeToken: 't', questionTimeoutMs: 12_345 }).questionTimeoutMs === 12_345
+    )
+    check(
       'a non-list workspaces value falls back instead of throwing later',
       resolveConfig({ relayUrl: 'http://h', nodeToken: 't', workspaces: 'nope' }).workspaces.length === 0
     )
@@ -331,6 +351,121 @@ try {
   // An unreachable host must be a RelayUnreachableError, not a raw fetch error.
   const dead = new RelayClient({ relayUrl: 'http://127.0.0.1:1/', nodeToken: 'x' })
   await rejects('a refused connection is classified as unreachable', () => dead.hello({ nodeId: 'n1' }), RelayUnreachableError)
+
+  // ── the question long-poll ───────────────────────────────────────────────
+  // `ask` is the blocking half of the interaction protocol, so the two things it
+  // has to get right are the wire shape and the timeout arithmetic: the node's
+  // own wait must expire before the relay's, or the fallback to the local GUI
+  // would be reported as a dead relay instead.
+  responder = () => ({ status: 200, body: { questionId: 'q1', answers: [{ id: 'scope', selected: [] }] } })
+  const asked = await client.ask({ nodeId: 'n1', questions: [{ id: 'scope', question: 'which part?' }] }, { timeoutMs: 200 })
+  check('ask returns the page answer', asked?.answers?.[0]?.id === 'scope', JSON.stringify(asked))
+  const askCall = seen.at(-1)
+  check('ask posts to the question route', askCall.path === '/harness/api/agent/ask', askCall.path)
+  check('ask sends the questions verbatim', askCall.body?.questions?.[0]?.id === 'scope', JSON.stringify(askCall.body))
+
+  responder = () => ({ status: 200, body: { questionId: 'q1', settled: true, reason: 'timeout' } })
+  const settled = await client.ask({ nodeId: 'n1', questions: [{ id: 'scope', question: 'which part?' }] })
+  check('a settled ask is returned without answers so the node can fall back', settled?.settled === true && settled.answers === undefined)
+
+  await client.settleQuestion({ nodeId: 'n1', questionId: 'q1' })
+  check('settleQuestion posts to the settled route', seen.at(-1).path === '/harness/api/agent/question/settled', seen.at(-1).path)
+  check('settleQuestion names the question', seen.at(-1).body?.questionId === 'q1')
+
+  // A cancelled turn is not an unreachable relay: the bridge has to be able to
+  // tell them apart to know whether falling back is appropriate.
+  responder = () => ({ status: 200, body: { questionId: 'q1', answers: [] } })
+  responseDelayMs = 400
+  const aborted = new AbortController()
+  const cancelled = client.ask({ nodeId: 'n1', questions: [{ id: 'scope', question: 'x' }] }, { signal: aborted.signal })
+  setTimeout(() => aborted.abort(new Error('turn cancelled')), 40)
+  let cancelError
+  try {
+    await cancelled
+  } catch (error) {
+    cancelError = error
+  }
+  responseDelayMs = 0
+  check('a cancelled ask rejects instead of resolving', cancelError !== undefined)
+  check(
+    'a cancellation is not reported as an unreachable relay',
+    cancelError?.name !== 'RelayUnreachableError',
+    `got ${cancelError?.name}: ${cancelError?.message}`
+  )
+  check('the cancellation keeps its own reason', cancelError?.message === 'turn cancelled', cancelError?.message)
+
+  responder = () => ({ status: 401, body: { error: 'unauthorized' } })
+  await rejects('ask classifies a rejected token as an auth failure', () => client.ask({ nodeId: 'n1', questions: [] }), RelayAuthError)
+
+  // ── the question bridge: who may answer for whom ─────────────────────────
+  // The bridge is what routes a remote session's question to the page, and the
+  // ownership test is the safety property that keeps a local user's question on
+  // the local GUI. Getting it wrong in either direction is bad: too narrow and
+  // the page never sees the question, too wide and every question in the Harness
+  // is shipped to a public web page.
+  const { RemoteQuestionBridge } = await import('../lib/questions.js')
+  const calls = []
+  const fakeClient = {
+    ask: async (body, options) => {
+      calls.push({ path: 'ask', body, options })
+      return { questionId: 'q1', answers: [{ id: 'scope', selected: ['全部'] }] }
+    },
+    settleQuestion: async (body) => {
+      calls.push({ path: 'settle', body })
+      return { ok: true }
+    }
+  }
+  const warnings = []
+  const bridge = new RemoteQuestionBridge({
+    client: fakeClient,
+    nodeId: 'n1',
+    logger: { info: () => {}, warn: (line) => warnings.push(line) },
+    timeoutMs: 300_000
+  })
+  bridge.track('remote-1')
+  check('a tracked session is owned', bridge.owns({ session: { id: 'remote-1' } }) === true)
+  check('an untracked session is not owned', bridge.owns({ session: { id: 'remote-2' } }) === false)
+  check('an agent with no readable identity is not owned', bridge.owns({}) === false)
+  bridge.release('remote-1')
+  check('a released session stops being owned', bridge.owns({ session: { id: 'remote-1' } }) === false)
+
+  bridge.track('remote-1')
+  const answered = await bridge.answer({
+    questions: [{ id: 'scope', question: 'range?', options: [{ label: '全部' }, { label: '仅改动' }] }],
+    agent: { session: { id: 'remote-1' } }
+  })
+  check('an owned question is answered from the relay', answered?.answers?.[0]?.selected?.[0] === '全部', JSON.stringify(answered))
+  check('the bridge forwarded the questions verbatim', calls.at(-1)?.body?.questions?.[0]?.id === 'scope')
+  check('the bridge forwarded its own timeout', calls.at(-1)?.options?.timeoutMs === 300_000)
+
+  // A request with nothing askable is not forwarded; delegating is what keeps the
+  // local GUI's behaviour for it.
+  const nothing = await bridge.answer({ questions: [], agent: { session: { id: 'remote-1' } } })
+  check('a question list with nothing askable is delegated, not relayed', nothing === undefined)
+
+  // An answer the node cannot admit must fall back rather than reach the model.
+  fakeClient.ask = async () => ({ questionId: 'q2', answers: [{ id: 'scope', selected: ['invented'] }] })
+  const inadmissible = await bridge.answer({
+    questions: [{ id: 'scope', question: 'range?', options: [{ label: '全部' }] }],
+    agent: { session: { id: 'remote-1' } }
+  })
+  check('an answer naming an option the model never offered is refused', inadmissible === undefined)
+  check('the refusal is reported rather than silent', warnings.some((line) => line.includes('inadmissible')), warnings.join(' | '))
+
+  // A dead relay is the ordinary case for a laptop on a train: it must fall back
+  // on the first attempt, not hold the question for the full window.
+  fakeClient.ask = async (body, options) => {
+    throw new Error('relay is down')
+  }
+  const unreachable = await bridge.answer({
+    questions: [{ id: 'scope', question: 'range?' }],
+    agent: { session: { id: 'remote-1' } }
+  })
+  check('an unreachable relay delegates instead of hanging the turn', unreachable === undefined)
+  check('the relay failure is reported', warnings.some((line) => line.includes('relaying the question failed')), warnings.join(' | '))
+  bridge.client = undefined
+  const stopped = await bridge.answer({ questions: [{ id: 's', question: 'q' }] })
+  check('a stopped node relays nothing', stopped === undefined)
 
   // ── the harness-package resolver ─────────────────────────────────────────
   // The runner resolves `@deepseek-ai/*` out of the profile, because a plugin

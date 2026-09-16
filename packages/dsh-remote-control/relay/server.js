@@ -24,6 +24,7 @@ import { timingSafeEqual, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { admitAnswers, admitQuestions } from '../lib/answers.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -48,6 +49,20 @@ function requiredSecret(key) {
   return value.trim()
 }
 
+/**
+ * Read one positive number from the environment.
+ *
+ * @param {string} key - environment variable name.
+ * @param {number} fallback - value to use when unset or unusable.
+ * @returns {number} the resolved number.
+ */
+function numberFromEnv(key, fallback) {
+  const raw = process.env[key]
+  if (raw === undefined || raw.trim() === '') return fallback
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
 const config = {
   host: process.env.DSH_REMOTE_RELAY_HOST ?? '127.0.0.1',
   port: Number(process.env.DSH_REMOTE_RELAY_PORT ?? 8787),
@@ -61,6 +76,13 @@ const config = {
   pollHoldMs: Number(process.env.DSH_REMOTE_POLL_HOLD_MS ?? 25_000),
   /** Transcript lines retained per node, oldest dropped first. */
   transcriptLimit: Number(process.env.DSH_REMOTE_TRANSCRIPT_LIMIT ?? 200),
+  /**
+   * How long a held question may wait for an answer before the node is told the
+   * wait is over. Deliberately longer than a node's own `questionTimeoutMs` so
+   * the node's local fallback (the GUI) always fires first and this is only a
+   * backstop against a connection that died without a FIN.
+   */
+  questionTimeoutMs: numberFromEnv('DSH_REMOTE_QUESTION_TIMEOUT_MS', 330_000),
   /** Set when a TLS-terminating proxy supplies the public origin, for logs. */
   publicOrigin: process.env.DSH_REMOTE_PUBLIC_ORIGIN ?? ''
 }
@@ -104,6 +126,18 @@ class NodeRecord {
 const nodes = new Map()
 /** @type {Map<string, {nodeId: string, commandId: string}>} */
 const inFlight = new Map()
+/**
+ * Questions a node is holding open, keyed by `nodeId` then `questionId`.
+ *
+ * A question is relay-local state, not a transcript line: it exists only while
+ * the node is blocked on it, and the entry carries the parked HTTP response that
+ * the answer has to reach. Nothing here is persisted, for the same reason the
+ * roster is not — the relay is a rendezvous point, and a restart simply means
+ * the node's own wait times out and falls back to its local GUI.
+ *
+ * @type {Map<string, Map<string, {questionId: string, nodeId: string, questions: Array<object>, commandId: string, workspace: string, at: number, deliver: (outcome: object) => void, res: import('node:http').ServerResponse, timer: NodeJS.Timeout, settled: boolean, ended: boolean}>>}
+ */
+const openQuestions = new Map()
 /** @type {Set<import('node:http').ServerResponse>} browser event-stream subscribers */
 const subscribers = new Set()
 
@@ -204,10 +238,45 @@ function publicNode(node) {
     online,
     lastSeenAt: node.lastSeenAt,
     connectedAt: node.connectedAt,
-    queued: node.queue.length
+    queued: node.queue.length,
+    // Pending questions ride the roster rather than the transcript because they
+    // are live state: a page that loads mid-turn has to see the open card, and a
+    // transcript is a record of what already happened.
+    questions: pendingQuestionsOf(node.nodeId)
   }
 }
 
+/**
+ * The public projection of one node's pending questions.
+ *
+ * @param {string} nodeId - owning node.
+ * @returns {Array<object>} questions the page may render and answer.
+ */
+function pendingQuestionsOf(nodeId) {
+  const held = openQuestions.get(nodeId)
+  if (held === undefined) return []
+  return [...held.values()].map((entry) => ({
+    questionId: entry.questionId,
+    commandId: entry.commandId,
+    workspace: entry.workspace,
+    at: entry.at,
+    questions: entry.questions
+  }))
+}
+
+/**
+ * Fan one question state change out to the browsers.
+ *
+ * The roster carries the full list, so this is a nudge to re-read it rather than
+ * a delta: the page already treats a roster push as authoritative.
+ *
+ * @param {string} nodeId - owning node.
+ */
+function broadcastQuestions(nodeId) {
+  const payload = JSON.stringify({ type: 'questions', nodeId, questions: pendingQuestionsOf(nodeId) })
+  for (const res of subscribers) res.write(`data: ${payload}\n\n`)
+  broadcastRoster()
+}
 /** Notify every browser subscriber with the current roster. */
 function broadcastRoster() {
   const payload = JSON.stringify({ type: 'roster', nodes: [...nodes.values()].map(publicNode) })
@@ -359,6 +428,144 @@ function agentReport(body) {
 }
 
 /**
+ * `POST /api/agent/ask` — hold a node's question open until the page answers it.
+ *
+ * This is the second long-poll of the protocol, and it exists because the node's
+ * own `ask_user_question` is a blocking call: the agent is suspended on it, so
+ * the question cannot be smuggled through `report`/`poll` without inventing a
+ * state machine. Parking here mirrors `agentPoll` exactly — same hold, same
+ * "answer later" response.
+ *
+ * The node is told the outcome, never asked to wait forever: the entry expires
+ * after `questionTimeoutMs`, and the page is told either way so no card is left
+ * offering an answer that would go nowhere.
+ *
+ * @param {object} body - `{ nodeId, questions }`.
+ * @param {import('node:http').ServerResponse} res - response to answer later.
+ * @returns {Promise<void>} resolves once the response is written.
+ */
+async function agentAsk(body, res) {
+  const node = requireNode(body)
+  node.lastSeenAt = Date.now()
+  const questions = admitQuestions(body.questions)
+  if (questions === undefined) throw new HttpError(400, 'questions must be a non-empty list of { id, question }')
+  const nodeId = node.nodeId
+  // Check before touching the map. An earlier draft deleted the node's entry
+  // first and re-inserted it after the check, which meant a *refused* duplicate
+  // dropped the live question on the floor — the card vanished and the agent
+  // stayed blocked. A rejection must leave everything exactly as it was.
+  const held = openQuestions.get(nodeId)
+  if (held !== undefined && held.size > 0) {
+    throw new HttpError(409, `node ${nodeId} already has ${String(held.size)} question(s) waiting for an answer`)
+  }
+  // One open question per node is the contract, not a limitation: a node runs one
+  // remote turn at a time, and the agent is blocked on this call, so a second
+  // question can only be a duplicate or a bug. Refusing is what keeps the page's
+  // "which question is this answer for" unambiguous.
+  const open = held ?? new Map()
+  if (held === undefined) openQuestions.set(nodeId, open)
+
+  const questionId = randomUUID()
+  const commandId = commandFor(nodeId)
+  const workspace = workspaceFor(commandId)
+  const entry = {
+    questionId,
+    commandId,
+    workspace,
+    questions,
+    at: Date.now(),
+    res,
+    timer: undefined,
+    settled: false,
+    ended: false,
+    deliver: () => {}
+  }
+  const settle = (outcome) => {
+    if (entry.settled) return
+    entry.settled = true
+    clearTimeout(entry.timer)
+    if (!entry.ended) {
+      entry.ended = true
+      openQuestions.get(nodeId)?.delete(questionId)
+      broadcastQuestions(nodeId)
+    }
+    if (!res.writableEnded) sendJson(res, 200, outcome)
+  }
+  entry.deliver = settle
+  entry.timer = setTimeout(() => {
+    settle({ questionId, settled: true, reason: 'timeout' })
+  }, config.questionTimeoutMs)
+  entry.timer.unref?.()
+  open.set(questionId, entry)
+  // A node that went away without a FIN would otherwise leave the card up until
+  // the expiry; `close` is the only signal that the holder is gone.
+  res.on('close', () => {
+    if (!entry.ended) {
+      entry.ended = true
+      clearTimeout(entry.timer)
+      openQuestions.get(nodeId)?.delete(questionId)
+      broadcastQuestions(nodeId)
+    }
+  })
+  broadcastQuestions(nodeId)
+  // The response is written later by the answer or the expiry; `sendJson` is
+  // reached from `settle`, so nothing is awaited here on purpose.
+}
+
+/**
+ * `POST /api/agent/question/settled` — the node stopped waiting on its own.
+ *
+ * Sent when the node's local timeout, a cancelled turn, or an unusable answer
+ * ends the wait before the page answered. Without it the page would keep
+ * offering a card whose submission resolves nothing.
+ *
+ * @param {object} body - `{ nodeId, questionId }`.
+ * @returns {object} acknowledgement.
+ */
+function agentQuestionSettled(body) {
+  const node = requireNode(body)
+  node.lastSeenAt = Date.now()
+  const questionId = typeof body.questionId === 'string' ? body.questionId : ''
+  const entry = openQuestions.get(node.nodeId)?.get(questionId)
+  if (entry === undefined) return { ok: true, settled: false }
+  clearTimeout(entry.timer)
+  entry.deliver({ questionId, settled: true, reason: 'withdrawn' })
+  return { ok: true, settled: true }
+}
+
+/**
+ * The command a node is currently running, if any.
+ *
+ * A question is always asked inside a turn, so this is what lets the page put
+ * the card in the right transcript position instead of at the end.
+ *
+ * @param {string} nodeId - owning node.
+ * @returns {string} the in-flight command id, or the empty string.
+ */
+function commandFor(nodeId) {
+  for (const [commandId, record] of inFlight) if (record.nodeId === nodeId) return commandId
+  return ''
+}
+
+/**
+ * The workspace a command was issued for.
+ *
+ * Read from the transcript rather than from the node, because the transcript is
+ * where the command's own `workspace` was recorded at submit time.
+ *
+ * @param {string} commandId - in-flight command id.
+ * @returns {string} the workspace path, or the empty string.
+ */
+function workspaceFor(commandId) {
+  if (commandId === '') return ''
+  for (const node of nodes.values()) {
+    const found = node.transcript.find((entry) => entry.commandId === commandId)
+    if (found !== undefined) return found.workspace ?? ''
+  }
+  return ''
+}
+
+/**
  * Resolve the node a request names, refreshing its liveness stamp.
  *
  * @param {object} body - request body carrying `nodeId`.
@@ -419,6 +626,37 @@ function controlCommand(body) {
   appendTranscript(node, { kind: 'question', commandId: command.commandId, prompt, workspace, sessionId: sessionId ?? '' })
   deliverOrQueue(node, command)
   return { commandId: command.commandId, queued: node.queue.length }
+}
+
+/**
+ * `POST /api/answer` — answer one held question.
+ *
+ * Two independent checks, and both are needed. `admitAnswers` enforces the
+ * vocabulary and rejects an option the model never offered, so a compromised
+ * relay cannot get an invented choice into the model's context; this function
+ * enforces that the question is genuinely open and that the batch matches the
+ * questions that were asked. The node re-checks the labels again on arrival —
+ * neither half trusts the other.
+ *
+ * @param {object} body - `{ nodeId, questionId, answers }`.
+ * @returns {object} acknowledgement naming the command the answer settled.
+ */
+function controlAnswer(body) {
+  const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : ''
+  const questionId = typeof body.questionId === 'string' ? body.questionId.trim() : ''
+  if (nodeId === '' || questionId === '') throw new HttpError(400, 'nodeId and questionId are required')
+  // Deliberately resolved through the map rather than `requireNode`: answering an
+  // unregistered node's question has to be a 404 about the question, not a
+  // liveness refresh for a node that is not there.
+  const entry = openQuestions.get(nodeId)?.get(questionId)
+  if (entry === undefined) throw new HttpError(409, 'that question is no longer waiting for an answer')
+  if (entry.settled) throw new HttpError(409, 'that question was already settled')
+  const answers = admitAnswers(body.answers, entry.questions)
+  if (answers === undefined) {
+    throw new HttpError(400, 'answers must match the questions that were asked, using the option labels they offered')
+  }
+  entry.deliver({ questionId, answers })
+  return { ok: true, questionId, commandId: entry.commandId }
 }
 
 /**
@@ -520,7 +758,10 @@ const ROUTE_METHODS = {
   '/api/agent/hello': 'POST',
   '/api/agent/poll': 'POST',
   '/api/agent/report': 'POST',
-  '/api/command': 'POST'
+  '/api/agent/ask': 'POST',
+  '/api/agent/question/settled': 'POST',
+  '/api/command': 'POST',
+  '/api/answer': 'POST'
 }
 
 const server = createServer((req, res) => {
@@ -575,8 +816,17 @@ const server = createServer((req, res) => {
       case '/api/agent/report':
         sendJson(res, 200, agentReport(body))
         return
+      case '/api/agent/ask':
+        await agentAsk(body, res)
+        return
+      case '/api/agent/question/settled':
+        sendJson(res, 200, agentQuestionSettled(body))
+        return
       case '/api/agent/poll':
         await agentPoll(body, res)
+        return
+      case '/api/answer':
+        sendJson(res, 200, controlAnswer(body))
         return
       default:
         sendJson(res, 200, controlCommand(body))
@@ -624,6 +874,12 @@ function shutdown(signal) {
   for (const node of nodes.values()) {
     for (const waiter of node.waiters) waiter(null)
     node.waiters.clear()
+  }
+  // A held question is the one response that is not written by its own handler:
+  // without this the node would sit in the client's read until its own timeout.
+  for (const [nodeId, held] of openQuestions) {
+    for (const entry of held.values()) entry.deliver({ questionId: entry.questionId, settled: true, reason: 'shutdown' })
+    openQuestions.delete(nodeId)
   }
   for (const res of subscribers) res.end()
   subscribers.clear()

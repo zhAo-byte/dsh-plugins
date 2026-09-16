@@ -10,7 +10,7 @@
 
 | 半边 | 跑在哪 | 是什么 |
 | --- | --- | --- |
-| **node 插件** `dsh-remote-control` | 每台装了 DSH 的机器 | 向中转台登记自己（名字、平台、工作台列表），挂一条长轮询等活；拿到问题后在本地开一个**真正的 DSH 会话**跑完，把回答送回去 |
+| **node 插件** `dsh-remote-control` | 每台装了 DSH 的机器 | 向中转台登记自己（名字、平台、工作台列表），挂一条长轮询等活；拿到问题后在本地开一个**真正的 DSH 会话**跑完，把回答送回去。会话中途要是反过来问你，它也把那个提问转给页面等回答 |
 | **relay 中转台** `relay/server.js` | 一台公网可达的机器 | 在线表 + 信箱 + 一个问答页。**零依赖**，只有一个进程 |
 
 ---
@@ -235,6 +235,26 @@ workspaces: registry
    → 页面收到 SSE 推送，渲染回答
 ```
 
+**中途提问走的是另一条长轮询。** agent 调用 `ask_user_question` 时，插件把问题送到
+`/api/agent/ask` 并挂在那里，页面从名册里拿到这张卡、在上面选完答案 POST `/api/answer`，
+挂起的请求才返回——和命令那条路径同构，只是方向相反：
+
+```
+本机 ask_user_question
+   → user-questions/request（本进程内的事件，原本由本机 GUI 的浏览器插件接管）
+   → dsh-remote-control 的 answerer 抢先接管（prepend），判定这是远程会话
+   → POST /api/agent/ask，挂起等待
+   → 页面渲染提问卡 → 用户点选项 / 写自定义答案 → POST /api/answer
+   → 挂起的请求返回答案 → 工具返回给模型，回合继续
+```
+
+三条边界值得先记住：
+
+- **只认自己创建的会话。** 不是远程会话的问题立刻 `next()` 交回本机 GUI，行为一点没变。
+- **答问题 ≠ 批权限。** 中转台能看到并回答模型提出的选项，但审批是另一个事件
+  （`approval/request`），仍然只落在本机。
+- **会放弃。** 页面上没人回答（或中转台够不着）时，本机 GUI 照旧接管，agent 不会被永久挂住。
+
 追问会复用同一个 `sessionId`，所以是**同一场对话的延续**，不是每次开新会话。
 页面上「新对话」按钮清掉 session id，下一条就会开新会话。
 
@@ -254,18 +274,25 @@ workspaces: registry
 | POST | `/api/agent/hello` | 登记/刷新身份与工作台列表，返回 `pollHoldMs` |
 | POST | `/api/agent/poll` | 长轮询领命令；空闲挂起到 `pollHoldMs` 后返回 `{ command: null }` |
 | POST | `/api/agent/report` | 上报状态（`busy`/`idle`）与命令结果 |
+| POST | `/api/agent/ask` | 长轮询挂住一个提问；页面回答后返回 `{ questionId, answers }`，超时返回 `{ questionId, settled: true }` |
+| POST | `/api/agent/question/settled` | 告诉中转台这个问题不用再等了，撤掉页面上的卡 |
 
 ### 页面侧（`Authorization: Bearer <DSH_REMOTE_CONTROL_TOKEN>`）
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/` | 问答页（本身不需要 token，页面自己会让你输入） |
-| GET | `/api/state[?nodeId=]` | 在线表；带 nodeId 时连同该机器的对话记录 |
-| GET | `/api/events?token=` | SSE：在线表变化 + 新消息推送 |
+| GET | `/api/state[?nodeId=]` | 在线表（每台机器附带 `questions`，即它正挂着的提问）；带 nodeId 时连同该机器的对话记录 |
+| GET | `/api/events?token=` | SSE：在线表变化 + 新消息推送 + `{ type: 'questions', nodeId, questions }` |
 | POST | `/api/command` | 提交 `{ nodeId, workspace, prompt, sessionId? }` |
+| POST | `/api/answer` | 回答 `{ nodeId, questionId, answers }`；问题已不在等待时 409 |
 
 `/api/events` 是唯一接受 query token 的路由——`EventSource` 无法设置请求头。
 其余所有路由只认 `Authorization` 头，因此 token 不会出现在日志或 Referer 里。
+
+**没有「正在等什么问题」的持久化查询。** 提问是**活的**状态，跟在线表一样只活在进程内存里：
+中转台重启，挂起的提问就没了，节点那边会等不到回答、按超时兜底回落本机 GUI。
+这跟「不落盘就没有磁盘上的凭据和对话副本」是同一个取舍。
 
 ---
 
@@ -277,6 +304,7 @@ workspaces: registry
 | --- | --- |
 | 问一个问题 | 指定任意目录：只能用它自己报上来的工作台，否则在**碰 DSH 之前**就被拒 |
 | 看到会话的回答 | 批准任何操作：它的协议里**根本没有审批通道** |
+| 回答模型的提问（只能从模型给出的选项里选，或写自定义文字） | 让模型看到一个它没给过的选项：两端都会拿选项表核对，编造的选项被丢掉 |
 | 看到机器名和工作台列表 | 改权限：`permissionPreset` 由本机配置决定，不从线上读 |
 | | 假装成另一台机器：token 是每台机器各自的，且与页面 token 分开 |
 
@@ -289,6 +317,12 @@ workspaces: registry
 弹窗出现在**你本机**的 DSH GUI 里。中转台和页面都没有「同意」按钮可点——
 这是构造上做不到，不是我们忘了做。你选了「审批一律回落 Mac 本机确认」，这就是它的实现方式。
 
+**但「提问」和「审批」不是一回事，所以只有提问被接到了页面上。** 两者的区别不是安全等级，
+而是**被问的是什么**：模型提问只能在它自己给出的选项里选，答案回到模型手里，它拿不到任何
+新权限；审批则是在扩大本机权限。所以协议里加了 `/api/agent/ask` 与 `/api/answer`，
+而没有加任何 `/api/approve`。两条端点都核对选项表，中转台编不出一个模型没给过的选项。
+页面上的提示语也照这个写：「回答提问不等于批准越界操作，审批仍只在本机」。
+
 **中转台本身的暴露面**：它不读写文件、不连数据库、不执行命令。进程只监听一个端口，
 只认那几个路由，其余一律 404。systemd 单元还额外关掉了 `ProtectSystem`、`ProtectHome`、
 `MemoryDenyWriteExecute` 等。
@@ -298,6 +332,13 @@ workspaces: registry
 - **没有持久化**。中转台重启，在线表和对话记录就没了（机器会自动重新登记，几秒内恢复；
   历史消息丢失）。这是有意的：不落盘就没有磁盘上的凭据和对话副本。需要留存的话，
   真正的记录本来就在每台机器的 `~/.dsh/sessions` 里。
+- **提问也有超时，超时就回落本机**。默认 5 分钟（`questionTimeoutMs`），到点后这个
+  提问会交回本机 GUI：你要是正坐在机器前，可以在那里回答；没人回答就是一次普通的
+  「没有 answerer」失败，模型会看到错误并自己继续。**没有超时 = 永久 busy**，所以这条
+  兜底不是可选项。注意它必须小于反代的读超时，否则连接会先被 nginx 切断。
+- **计划审批（`exit_plan_mode`）只有选项，没有计划正文**。模型发起的那种提问会带一份
+  `detail`（计划全文），页面只渲染问题和选项，正文不转发——卡上看到的是三个选项，
+  看不到计划内容。要在页面上读计划，得先把 `detail` 纳入协议。
 - **每台机器同时只跑一个远程回合**。轮询是单条的，第二个问题会排到队列里等前一个跑完。
   多标签让你同时**盯**多台，但派给同一台机器的多条指令仍然排队依次跑；队列深度会显示在
   标签和节点上。
@@ -369,6 +410,17 @@ sudo nginx -t && sudo systemctl reload nginx
 于是它无从知道自己在公网上挂在哪儿。页面里的接口调用是相对自己所在目录解析的，
 没有这个前缀，浏览器就会把 `/api/state` 发到域名根路径——**被那个域名上别的站点接走**，
 relay 根本收不到。relay 拿到这个头之后只给 HTML 注入一个 `<base>`，数据响应一律不动。
+
+**装了这个插件之后，读超时还要再放宽一次。** `/api/agent/ask` 是挂在同一个 location 下的
+长轮询，长度由节点的 `questionTimeoutMs`（默认 300 秒）决定，而上面的 `120s` 会先把它切断——
+症状是「一问就掉线」，节点按兜底回落本机 GUI，中转台页面上那张卡一直转。两条路选一条：
+
+```nginx
+proxy_read_timeout 660s;   # 覆盖 300s 的提问等待 + 余量（长轮询也一起吃这个值）
+```
+
+或者把节点侧的 `questionTimeoutMs` 调到 90 秒以内、接受更短的作答窗口。
+改完 `nginx -t && sudo systemctl reload nginx`。
 
 这个 bug 是真的踩过：全套测试当时都是挂在根路径上跑的，全部通过，
 而生产环境挂在 `/harness/` 下会彻底不可用。现在 `ui-check` 会起一个**和 nginx 行为一致的代理**
@@ -464,17 +516,29 @@ TLS         证书链可信（ssl_verify_result=0）
 
 ## 七、自检
 
-四个脚本，零依赖。前三个不需要任何运行中的东西：
+零依赖。前几个不需要任何运行中的东西：
 
 ```sh
-npm test              # = 下面三个
-node tools/relay-check.mjs    # 真起 relay/server.js，用真 HTTP 打它
-node tools/node-check.mjs     # 真 RelayClient 打假中转台
-node tools/runner-check.mjs   # 真 RemoteRunner 打假 Harness
+npm test                       # = 下面三个
+node tools/relay-check.mjs     # 真起 relay/server.js，用真 HTTP 打它
+node tools/node-check.mjs      # 真 RelayClient 打假中转台
+node tools/questions-check.mjs # 真 Cordis + 真 user-questions seam，验提问接管顺序
 
-npm run test:live             # 隔离 DSH_HOME 里真启动 web profile
-npm run test:ui               # 真 Chromium 里把问答页跑一遍
+node tools/runner-check.mjs    # 真 RemoteRunner 打假 Harness（需要磁盘上有 @deepseek-ai/*）
+npm run test:live              # 隔离 DSH_HOME 里真启动 web profile
+npm run test:ui                # 真 Chromium 里把问答页跑一遍
 ```
+
+`questions-check` 是**提问功能唯一一个能证明「接管生效」的检查**。桥接本身好不好测，
+但它**必须排在前面**才起作用——Cordis 的 waterfall 按注册顺序跑，而转发到本机浏览器
+的那个监听在进程组合阶段就注册了。少了 `prepend`，本机 GUI 会先接管并阻塞，页面上永远
+不会出现那张卡，而其它所有检查都照样通过。所以这个文件不自己实现 waterfall，而是加载
+Harness 自己的 `@deepseek-ai/cordis` 和 `@deepseek-ai/dsh-user-questions`，按进程的真实
+顺序注册一个「本机 GUI」监听，再断言：远程会话的问题**没被它看到**、本机会话的问题
+照旧归它、中转台挂掉时它接管、以及没人接受时仍然是 `NO_PROVIDER`。
+
+`runner-check` 和 `questions-check` 都需要磁盘上能解析到 `@deepseek-ai/*`（它们要真调
+Harness 的代码），解析不到时报告**跳过**而不是失败，所以 `npm test` 在裸检出上照样能跑。
 
 `live-check` 是最关键的一个：它建一个临时 `DSH_HOME`、把插件按用户的方式装进去、
 用 `--dump-config` 确认行被组合出来、真启动 web profile、然后断言插件出现在后端日志里、
@@ -490,13 +554,15 @@ npm run test:ui               # 真 Chromium 里把问答页跑一遍
 
 `ui-check` 用 DevTools 协议驱动真 Chromium：注入 token、加载真页面、**在页面上打字并点
 页面自己的发送按钮**，然后自己扮演节点把命令领走回答，断言回答不刷新就出现在页面上；
+也会扮演 agent 反过来提问：等卡片出现、点选项、点提交，断言答案真的到达挂起的那次请求，
+而卡片落在了**发起它的那个回合**里；
 再从侧边栏开第二个工作台，断言两个标签的历史**互不串台**、第二次提问落在它自己的工作台上、
 而且**没有继承**第一个工作台的 session。
 它已经抓到过几个只有真浏览器才看得见的问题：首次打开时节点列表渲染出来却**没有自动选中**
 （于是工作台、历史、发送按钮全是空的），乐观插入的问句和 SSE 推来的问句重复渲染成两条、
 其中一条永远停在「等待中」，以及一个 `position: absolute` 少了定位祖先的提示条——它在 DOM 里，
 却被甩到屏幕上方几百像素，肉眼完全看不见。都修了，见 [`relay/public/index.html`](relay/public/index.html)。
-它还会把五张截图落到临时目录，给人眼看。
+它还会把六张截图落到临时目录，给人眼看。
 
 > 多标签那部分还有个教训值得留着：为了看清 ui-check 覆盖不到的状态（执行中、离线、报错、
 > 空态、窄屏抽屉），另外写了个一次性的截图脚本，它当场抓到两个真问题——提示条跑到屏幕外，
@@ -509,12 +575,20 @@ npm run test:ui               # 真 Chromium 里把问答页跑一遍
 当前实况：
 
 ```
-relay-check   41/41
-node-check    56/56
-runner-check  62/62
-live-check    21/21
-ui-check      31/31
+relay-check     62/62
+node-check      82/82
+questions-check 12/12
+runner-check    64/64
+live-check      21/21
+ui-check        40/40
 ```
+
+提问转发这一层在三个检查里各自被钉住一角，因为它们能看见的东西不同：
+`relay-check` 用真 HTTP 跑到「挂起 → 推送 → 回答 → 撤销」的完整状态机（包括
+「编造的选项被拒」和「重复提问不会踢掉正在等的那一个」）；`node-check` 验插件的
+认领判定与回落（不是自己的会话、中转台挂了、答案不合规，都必须交回本机）；
+`ui-check` 在真 Chromium 里点页面自己的选项按钮，断言卡落在**发起它的那个回合**里、
+在视口内、选完才可提交、提交后消失。
 
 CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）分三层：
 
@@ -550,6 +624,7 @@ CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）分三层�
 | `agentPreset` | `standard` | 远程会话用哪个 agent 预设 |
 | `permissionPreset` | `workspace-write` | 固定给远程会话的权限预设 |
 | `reconnectMinMs` / `reconnectMaxMs` | `2000` / `60000` | 断线重连退避区间 |
+| `questionTimeoutMs` | `300000` | 模型提问在页面上等多久；到点回落本机 GUI。**必须小于反代的 `proxy_read_timeout`** |
 | `enabled` | `true` | 设 `false` 只校验配置并打日志，不连接 |
 
 改用户设置现在可以直接编辑 `settings.yaml`：
@@ -574,6 +649,7 @@ remote-control:
 | `DSH_REMOTE_POLL_HOLD_MS` | `25000` | 长轮询挂起时长 |
 | `DSH_REMOTE_OFFLINE_AFTER_MS` | `45000` | 多久没轮询算离线（离线节点会被拒绝收新命令） |
 | `DSH_REMOTE_TRANSCRIPT_LIMIT` | `200` | 每台机器保留多少条对话记录 |
+| `DSH_REMOTE_QUESTION_TIMEOUT_MS` | `330000` | 挂起的提问最久等多久；刻意比节点的 `questionTimeoutMs` 长，让节点自己的兜底先触发 |
 
 ---
 

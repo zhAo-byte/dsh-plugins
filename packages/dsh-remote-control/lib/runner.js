@@ -208,12 +208,21 @@ export class RemoteRunner {
    * created after the backend booted has to become usable without a restart, and
    * re-reading is also what keeps the advertised list honest if one is removed.
    */
-  constructor({ ctx, config, logger, workspaceProvider }) {
+  constructor({ ctx, config, logger, workspaceProvider, questions }) {
     this.ctx = ctx
     this.config = config
     this.logger = logger
     /** Registry mode: returns the live list, or undefined for the configured one. */
     this.workspaceProvider = workspaceProvider
+    /**
+     * The question bridge, when one is installed.
+     *
+     * The runner is where a session's identity becomes known, so it is the only
+     * place that can tell the bridge which sessions the relay may answer for.
+     * Optional because `runner-check` drives this class without a plugin around
+     * it, and a runner that refused to work without a relay would be untestable.
+     */
+    this.questions = questions
     /** @type {Map<string, { handle: object, workspacePath: string }>} */
     this.sessions = new Map()
     this.disposed = false
@@ -330,7 +339,11 @@ export class RemoteRunner {
       attached = true
       this.applyPermission(handle, this.config.permissionPreset)
       this.title(handle, prompt)
-      this.sessions.set(sessionId, { handle, workspacePath: workspace.path })
+      // Only now is the session answerable: the bridge claims a question by
+      // matching the asking agent's session id against this set, so tracking it
+      // before `ask()` is what makes the relay able to answer its questions.
+      this.questions?.track(sessionId)
+      this.sessions.set(sessionId, { handle, workspacePath: workspace.path, sessionId })
     } catch (error) {
       if (attached) await workspace.detachSession(sessionId).catch(() => {})
       await handle.dispose().catch(() => {})
@@ -429,6 +442,11 @@ export class RemoteRunner {
     const entries = [...this.sessions.values()]
     this.sessions.clear()
     for (const entry of entries) {
+      // Stop accepting relay answers before the session goes away, so a question
+      // that arrives during teardown falls through to the local GUI instead of
+      // being held for a page nobody is watching. The stored id is the branded
+      // one this node created, not the agent's own — the bridge tracks the former.
+      this.questions?.release(entry.sessionId)
       await entry.handle.dispose().catch((error) => {
         this.logger?.warn?.(`dsh-remote-control: disposing a session failed: ${error.message}`)
       })

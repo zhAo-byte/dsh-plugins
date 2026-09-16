@@ -74,11 +74,14 @@ export class RelayClient {
    *
    * @param {string} path - relay path starting with `/`.
    * @param {object} body - JSON request body.
-   * @param {object} [options] - `{ timeoutMs }`; omit to wait indefinitely.
+   * @param {object} [options] - `{ timeoutMs?, signal? }`; omit the timeout to wait indefinitely.
    * @returns {Promise<object>} parsed response body.
    */
   async post(path, body, options = {}) {
-    const signal = options.timeoutMs === undefined ? undefined : AbortSignal.timeout(options.timeoutMs)
+    const timeout = options.timeoutMs === undefined ? undefined : AbortSignal.timeout(options.timeoutMs)
+    const signal = options.signal === undefined
+      ? timeout
+      : (timeout === undefined ? options.signal : AbortSignal.any([options.signal, timeout]))
     let response
     try {
       response = await this.fetch(`${this.baseUrl}${path}`, {
@@ -91,6 +94,12 @@ export class RelayClient {
         ...(signal === undefined ? {} : { signal })
       })
     } catch (error) {
+      // A caller-owned abort is not an unreachable relay: the question bridge has
+      // to be able to tell "the turn was cancelled" from "the relay is down". The
+      // signal's own reason is preferred over the thrown error because a composed
+      // signal (`AbortSignal.any`) re-throws the composite's AbortError, which
+      // would lose the caller's reason.
+      if (options.signal?.aborted === true) throw options.signal.reason ?? error
       const reason = error?.name === 'TimeoutError' ? 'timed out' : (error?.message ?? String(error))
       throw new RelayUnreachableError(`${path} failed: ${reason}`)
     }
@@ -170,6 +179,41 @@ export class RelayClient {
    */
   async report(body) {
     await this.post('/api/agent/report', body, { timeoutMs: 20_000 })
+  }
+
+  /**
+   * Ask the control page one of the agent's questions and wait for its answer.
+   *
+   * A long-poll on the same footing as `poll`: the request stays open until a
+   * person answers on the page, the relay gives up, or the node's own caller
+   * goes away. The timeout is deliberately longer than the node's own wait so
+   * that the node's fallback fires first and the relay's expiry is only a
+   * backstop against a half-open connection.
+   *
+   * @param {object} body - `{ nodeId, questions }`.
+   * @param {object} [options] - `{ signal?, timeoutMs? }`.
+   * @returns {Promise<{ questionId: string, answers?: Array<object>, settled?: boolean }>} the outcome.
+   */
+  async ask(body, options = {}) {
+    return await this.post('/api/agent/ask', body, {
+      signal: options.signal,
+      timeoutMs: (options.timeoutMs ?? 300_000) + 30_000
+    })
+  }
+
+  /**
+   * Tell the relay a question is no longer open, so the page stops offering it.
+   *
+   * Sent after the node stops waiting for its own reasons (timeout, cancelled
+   * turn, unusable answer). The relay also drops the question when the held
+   * request goes away, so this is a courtesy that makes the page react sooner
+   * rather than the only cleanup path.
+   *
+   * @param {object} body - `{ nodeId, questionId }`.
+   * @returns {Promise<void>} resolves once the relay acknowledged.
+   */
+  async settleQuestion(body) {
+    await this.post('/api/agent/question/settled', body, { timeoutMs: 15_000 })
   }
 
   /**

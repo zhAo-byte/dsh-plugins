@@ -705,6 +705,137 @@ try {
   const tabsImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
   await writeFile(tabsShot, Buffer.from(tabsImage.data, 'base64'))
 
+  // ── the agent's question, answered from the page ─────────────────────────
+  // This is the flow the whole feature exists for, driven the way a person does
+  // it: the node parks a question, the card appears without a reload, an option is
+  // clicked on the page's own control, and the parked request receives the answer.
+  // A unit check cannot cover it, because the pieces that can break are the DOM
+  // and the push that fills it.
+  const pageCommand = await control('/api/command', {
+    nodeId: 'mac-1',
+    workspace: '/Users/dev/deepseek',
+    prompt: '帮我回顾一下这次的改动'
+  })
+  let reviewCommand
+  const reviewDeadline = Date.now() + 20_000
+  while (Date.now() < reviewDeadline) {
+    const polled = await asNode('/api/agent/poll', { nodeId: 'mac-1' })
+    if (polled.command === null || polled.command === undefined) continue
+    if (polled.command.commandId === pageCommand.commandId) {
+      reviewCommand = polled.command
+      break
+    }
+    // Anything else queued on this node is history from an earlier section.
+    await asNode('/api/agent/report', {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: polled.command.commandId,
+      result: { ok: true, prompt: polled.command.prompt, workspace: polled.command.workspace, text: '（历史命令）', durationMs: 10 }
+    })
+  }
+  check('the turn that will ask the question is running', reviewCommand !== undefined, JSON.stringify(pageCommand))
+
+  const askPromise = fetch(`${relayUrl}/api/agent/ask`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${AGENT_TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      nodeId: 'mac-1',
+      questions: [
+        {
+          id: 'scope',
+          header: '范围',
+          question: '这次回顾要覆盖哪一部分？',
+          options: [
+            { label: '全部改动 (Recommended)', description: '从上一个版本开始算。' },
+            { label: '仅这个工作台' }
+          ]
+        }
+      ]
+    })
+  }).then((response) => response.json())
+
+  // The card has to land in the turn that asked it, not at the end of the
+  // transcript: with several targets and a queued turn, "somewhere in the log" is
+  // how a card ends up looking like it belongs to a different question.
+  const cardInTurn = await waitFor(
+    () => devtools.evaluate(sessionId, `(() => {
+      const card = document.querySelector('.ask');
+      if (card === null) return 'missing';
+      const turn = card.closest('.turn');
+      return JSON.stringify({
+        turnText: turn === null ? '' : turn.textContent,
+        options: card.querySelectorAll('.ask-opt').length,
+        submitDisabled: card.querySelector('.ask-foot .btn').disabled,
+        inViewport: (() => { const r = card.getBoundingClientRect(); return r.width > 0 && r.top >= 0 && r.bottom <= window.innerHeight + 1 })()
+      });
+    })()`),
+    (value) => String(value) !== 'missing' && String(value).includes('这次回顾要覆盖哪一部分？'),
+    15_000
+  )
+  check('the agent question reaches the page without a reload', cardInTurn, 'the question push never rendered a card')
+  const cardState = JSON.parse(String(await devtools.evaluate(sessionId, `(() => {
+    const card = document.querySelector('.ask');
+    if (card === null) return '{}';
+    const turn = card.closest('.turn');
+    return JSON.stringify({
+      turnText: turn === null ? '' : turn.textContent,
+      options: card.querySelectorAll('.ask-opt').length,
+      submitDisabled: card.querySelector('.ask-foot .btn').disabled,
+      inViewport: (() => { const r = card.getBoundingClientRect(); return r.width > 0 && r.top >= 0 && r.bottom <= window.innerHeight + 1 })()
+    });
+  })()`)))
+  check(
+    'the card is rendered in the turn that asked it',
+    String(cardState.turnText).includes('帮我回顾一下这次的改动'),
+    JSON.stringify(cardState.turnText)
+  )
+  check('the card offers every option the model sent', cardState.options === 2, JSON.stringify(cardState))
+  // Submitting before choosing would answer nothing, so the button has to start
+  // disabled rather than let the page post an empty batch.
+  check('the card refuses to submit an unanswered question', cardState.submitDisabled === true, JSON.stringify(cardState))
+  // The card lives in the transcript, so it is subject to its scroll container: a
+  // card rendered outside the viewport is the same failure as one never rendered.
+  check('the card is inside the viewport when it appears', cardState.inViewport === true, JSON.stringify(cardState))
+  const cardShot = join(workdir, '06-agent-question.png')
+  const cardImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
+  await writeFile(cardShot, Buffer.from(cardImage.data, 'base64'))
+
+  await devtools.evaluate(sessionId, `document.querySelectorAll('.ask-opt')[0].click(); 'ok'`)
+  const readyToSubmit = await waitFor(
+    () => devtools.evaluate(sessionId, `document.querySelector('.ask-foot .btn').disabled`),
+    (disabled) => disabled === false,
+    3_000
+  )
+  check('choosing an option enables submission', readyToSubmit === true)
+  await devtools.evaluate(sessionId, `document.querySelector('.ask-foot .btn').click(); 'ok'`)
+  const asked = await Promise.race([askPromise, sleep(10_000).then(() => undefined)])
+  check(
+    'the page’s answer reaches the parked question',
+    asked?.answers?.[0]?.selected?.[0] === '全部改动 (Recommended)',
+    JSON.stringify(asked)
+  )
+  const cardRetired = await waitFor(
+    () => devtools.evaluate(sessionId, `document.querySelector('.ask') === null`),
+    (gone) => gone === true,
+    8_000
+  )
+  check('the answered card is retired from the page', cardRetired === true)
+  if (reviewCommand !== undefined) {
+    await asNode('/api/agent/report', {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: reviewCommand.commandId,
+      result: {
+        ok: true,
+        prompt: reviewCommand.prompt,
+        workspace: reviewCommand.workspace,
+        sessionId: 'remote-seeded',
+        text: '按你选的「全部改动」回顾了一遍。',
+        durationMs: 900
+      }
+    })
+  }
+
   // ── a transient message has to be somewhere a person can see it ──────────
   // The toast is `position: absolute` against the composer, so a missing
   // `position: relative` on that ancestor silently resolves it against the
@@ -805,7 +936,7 @@ try {
   proxy.closeAllConnections?.()
 
   process.stdout.write(`\nui-check: ${String(checks - failures)}/${String(checks)} passed\n`)
-  process.stdout.write(`ui-check: screenshots ${workdir}/0{1,2,3,4,5}-*.png\n`)
+  process.stdout.write(`ui-check: screenshots ${workdir}/0{1,2,3,4,5,6}-*.png\n`)
 } catch (error) {
   failures += 1
   process.stdout.write(`\nui-check: harness error — ${error?.stack ?? error}\n`)

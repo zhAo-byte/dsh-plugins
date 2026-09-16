@@ -34,6 +34,7 @@
  * | `agentPreset` | `standard` | agent preset remote sessions compose from |
  * | `permissionPreset` | `workspace-write` | pinned onto every remote session |
  * | `reconnectMinMs` / `reconnectMaxMs` | `2000` / `60000` | reconnect backoff bounds |
+ * | `questionTimeoutMs` | `300000` | how long a remote question waits for the page before falling back to the local GUI |
  * | `enabled` | `true` | `false` validates and logs without connecting |
  *
  * @module dsh-remote-control/config
@@ -54,6 +55,11 @@ export const DEFAULT_CONFIG = Object.freeze({
   permissionPreset: 'workspace-write',
   reconnectMinMs: 2_000,
   reconnectMaxMs: 60_000,
+  // Five minutes is chosen to sit under the common reverse-proxy read timeout
+  // (nginx defaults to 60s, the deployment sets 120s): a longer wait than the
+  // proxy allows would be cut off there, and the node would report a relay
+  // failure instead of the fallback this timeout exists to provide.
+  questionTimeoutMs: 300_000,
   enabled: true
 })
 
@@ -125,6 +131,7 @@ export function resolveConfig(raw = {}) {
     permissionPreset: stringOr(source.permissionPreset, DEFAULT_CONFIG.permissionPreset),
     reconnectMinMs: numberOr(source.reconnectMinMs, DEFAULT_CONFIG.reconnectMinMs),
     reconnectMaxMs: numberOr(source.reconnectMaxMs, DEFAULT_CONFIG.reconnectMaxMs),
+    questionTimeoutMs: numberOr(source.questionTimeoutMs, DEFAULT_CONFIG.questionTimeoutMs),
     // Absent means enabled: a row that ships disabled unless you opt in would be
     // the more surprising default for a plugin you installed on purpose.
     enabled: source.enabled !== false

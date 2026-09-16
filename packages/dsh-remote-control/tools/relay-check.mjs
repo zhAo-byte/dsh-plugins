@@ -263,6 +263,173 @@ try {
   })
   const followed = await followUp
   check('a follow-up carries the session id through', followed.body?.command?.sessionId === 'remote-abc')
+  // Close the follow-up before the question exercise: a question is attributed to
+  // the turn that is running *now*, and leaving the previous turn in flight would
+  // make that attribution ambiguous rather than wrong.
+  await call('/api/agent/report', {
+    token: AGENT_TOKEN,
+    body: {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: followed.body.command.commandId,
+      result: { ok: true, prompt: 'and then?', workspace: '/Users/dev/deepseek', text: 'done', durationMs: 1 }
+    }
+  })
+
+  // ── the agent's own question, held open for the page ─────────────────────
+  // This is the second long-poll of the protocol: the node's `ask_user_question`
+  // is a blocking call, so the question has to be parked the same way a command
+  // is. The checks below are written in the order the two halves experience it —
+  // park, render, answer, settle — because every failure mode here is a hang on
+  // one side or the other.
+  const asExercise = '/Users/dev/deepseek'
+  // The order matters and mirrors the real thing: the command is submitted first,
+  // which is what puts it in flight, and only then does the agent ask. Asking
+  // first would make the question unattributable — the `commandId` is what tells
+  // the page which tab the card belongs to.
+  const exerciseCommand = call('/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+  await sleep(150)
+  const askedCommand = await call('/api/command', {
+    token: CONTROL_TOKEN,
+    body: { nodeId: 'mac-1', workspace: asExercise, prompt: 'review my change' }
+  })
+  const deliveredExercise = await exerciseCommand
+  check('the turn that will ask the question was delivered', deliveredExercise.body?.command?.commandId === askedCommand.body?.commandId)
+  const parkedAsk = call('/api/agent/ask', {
+    token: AGENT_TOKEN,
+    body: {
+      nodeId: 'mac-1',
+      questions: [
+        { id: 'scope', header: '范围', question: '要包含哪一部分？', options: [{ label: '全部' }, { label: '仅改动' }] }
+      ]
+    }
+  })
+  await sleep(150)
+
+  // Subscribe after the park so the push below is unambiguous, but the state
+  // snapshot is checked first: a page that loads mid-question must see the card
+  // from `/api/state` alone, since it missed every push that came before it.
+  const askedState = await call('/api/state', { token: CONTROL_TOKEN })
+  const pending = askedState.body?.nodes?.[0]?.questions ?? []
+  check('the roster carries the pending question', pending.length === 1, JSON.stringify(pending))
+  check('the pending question names the command it belongs to', pending[0]?.commandId === askedCommand.body?.commandId, JSON.stringify(pending[0]))
+  check(
+    'the pending question is attributed to the workspace of that command',
+    pending[0]?.workspace === asExercise,
+    `got ${JSON.stringify(pending[0]?.workspace)} — without it the page renders the card in the wrong tab`
+  )
+  check('the pending question never carries the calling agent', pending[0]?.agent === undefined && pending[0]?.signal === undefined)
+  check('the page sees the options the model offered', pending[0]?.questions?.[0]?.options?.length === 2, JSON.stringify(pending[0]?.questions))
+
+  const questionId = pending[0]?.questionId
+  check('the question has an id to answer against', typeof questionId === 'string' && questionId.length > 0)
+
+  // A second question on the same node is a bug, not a queue: the node runs one
+  // turn at a time and its agent is blocked on the first one. The refusal must
+  // also leave the first question untouched — a rejected duplicate that dropped
+  // the live card would be worse than accepting it.
+  const stacked = await call('/api/agent/ask', {
+    token: AGENT_TOKEN,
+    body: { nodeId: 'mac-1', questions: [{ id: 'other', question: 'second?' }] }
+  })
+  check('a second open question on one node is refused', stacked.status === 409, `got ${String(stacked.status)}`)
+  const afterStacked = await call('/api/state', { token: CONTROL_TOKEN })
+  check(
+    'the refused duplicate left the first question open',
+    afterStacked.body?.nodes?.[0]?.questions?.[0]?.questionId === questionId,
+    JSON.stringify(afterStacked.body?.nodes?.[0]?.questions)
+  )
+
+  const badQuestions = await call('/api/agent/ask', { token: AGENT_TOKEN, body: { nodeId: 'mac-1', questions: [] } })
+  check('a question list with nothing askable is refused', badQuestions.status === 400, `got ${String(badQuestions.status)}`)
+
+  // The relay is a separate trust domain: an option it invents must not reach the
+  // model, because the model would read it as a choice it had offered.
+  const invented = await call('/api/answer', {
+    token: CONTROL_TOKEN,
+    body: { nodeId: 'mac-1', questionId, answers: [{ id: 'scope', selected: ['delete everything'] }] }
+  })
+  check('an answer using an option that was never offered is refused', invented.status === 400, `got ${String(invented.status)}`)
+
+  const unanswered = await call('/api/answer', {
+    token: CONTROL_TOKEN,
+    body: { nodeId: 'mac-1', questionId, answers: [{ id: 'scope', selected: [] }] }
+  })
+  check('skipping every question is accepted as a blank answer', unanswered.status === 200, JSON.stringify(unanswered.body))
+
+  const parkedQuestion = await parkedAsk
+  check('the parked ask returned the page answer', parkedQuestion.body?.answers?.[0]?.id === 'scope', JSON.stringify(parkedQuestion.body))
+  check('the blank answer carries an empty selection', Array.isArray(parkedQuestion.body?.answers?.[0]?.selected) && parkedQuestion.body.answers[0].selected.length === 0)
+
+  const settledAfterAnswer = await call('/api/agent/question/settled', {
+    token: AGENT_TOKEN,
+    body: { nodeId: 'mac-1', questionId }
+  })
+  check('settling an already answered question is a no-op', settledAfterAnswer.body?.settled === false, JSON.stringify(settledAfterAnswer.body))
+
+  const answeredState = await call('/api/state', { token: CONTROL_TOKEN })
+  check('the answered question is gone from the roster', (answeredState.body?.nodes?.[0]?.questions ?? []).length === 0, JSON.stringify(answeredState.body?.nodes?.[0]?.questions))
+
+  const doubleAnswer = await call('/api/answer', {
+    token: CONTROL_TOKEN,
+    body: { nodeId: 'mac-1', questionId, answers: [{ id: 'scope', selected: ['全部'] }] }
+  })
+  check('a question cannot be answered twice', doubleAnswer.status === 409, `got ${String(doubleAnswer.status)}`)
+
+  const unknownQuestion = await call('/api/answer', {
+    token: CONTROL_TOKEN,
+    body: { nodeId: 'mac-1', questionId: 'not-a-question', answers: [] }
+  })
+  check('an answer to a question nobody asked is refused', unknownQuestion.status === 409, `got ${String(unknownQuestion.status)}`)
+
+  // Nothing is left holding the turn, so the node can report and go idle.
+  await call('/api/agent/report', {
+    token: AGENT_TOKEN,
+    body: {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: askedCommand.body.commandId,
+      result: { ok: true, prompt: 'review my change', workspace: asExercise, text: 'No findings.', durationMs: 42 }
+    }
+  })
+
+  // ── the page is told over SSE, which is how a card ever appears ──────────
+  // Every path above is also exercised by the browser check, but only where
+  // Chromium exists; this one runs everywhere and fails loudly if the push stops
+  // being emitted, which would leave the card invisible on a page that is healthy
+  // in every other respect.
+  const controller = new AbortController()
+  const stream = await fetch(`${baseUrlFrom(child, port)}/api/events?token=${encodeURIComponent(CONTROL_TOKEN)}`, { signal: controller.signal })
+  const reader = stream.body.getReader()
+  const decoder = new TextDecoder()
+  let seen = ''
+  // The relay writes its headers and its first frame before registering the
+  // subscriber, so a fetch that has resolved is not yet a subscribed stream.
+  await sleep(150)
+  const readFor = async (needle, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (seen.includes(needle)) return true
+      const chunk = await Promise.race([reader.read(), sleep(deadline - Date.now()).then(() => ({ done: false, value: undefined }))])
+      if (chunk.value !== undefined) seen += decoder.decode(chunk.value, { stream: true })
+    }
+    return seen.includes(needle)
+  }
+
+  const parkedAgain = call('/api/agent/ask', {
+    token: AGENT_TOKEN,
+    body: { nodeId: 'mac-1', questions: [{ id: 'push', question: 'does the card reach the page?' }] }
+  })
+  const pushed = await readFor('"type":"questions"', 3000)
+  check('a new question is pushed to the page over SSE', pushed, seen.slice(-300))
+  controller.abort()
+
+  const withdrawn = await call('/api/agent/question/settled', {
+    token: AGENT_TOKEN,
+    body: { nodeId: 'mac-1', questionId: (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.[0]?.questions?.[0]?.questionId }
+  })
+  check('a node that stopped waiting can withdraw its question', withdrawn.body?.settled === true, JSON.stringify(withdrawn.body))
+  check('the withdrawn ask is released instead of hanging', (await parkedAgain).body?.settled === true)
 
   // ── the empty long-poll must answer, not hang ────────────────────────────
   const started = Date.now()

@@ -69,6 +69,14 @@ export async function loadSchema() {
     /** Reconnect backoff bounds, in milliseconds. */
     reconnectMinMs: Schema.number().default(2_000),
     reconnectMaxMs: Schema.number().default(60_000),
+    /**
+     * How long a remote question waits for an answer on the relay page.
+     *
+     * It has to sit under the reverse proxy's read timeout: a longer wait than
+     * the proxy allows is cut at the proxy, and the node sees a dead connection
+     * rather than the clean fallback this timeout exists to provide.
+     */
+    questionTimeoutMs: Schema.number().default(300_000),
     /** Turn the node off without uninstalling it. */
     enabled: Schema.boolean().default(true)
   })

@@ -346,6 +346,51 @@
     30% { opacity: .95; transform: translateY(-2px); }
   }
 
+  /* ── the agent's own question ──────────────────────────────────────── */
+  /* A question is not a transcript line: it is an open decision the agent is
+     *blocked* on, which is why it gets the accent border and a live control
+     instead of the muted styling every recorded row uses. */
+  .ask {
+    border: 1px solid var(--accent-line); border-radius: var(--radius);
+    background: linear-gradient(180deg, rgba(91, 140, 255, .07), rgba(91, 140, 255, .02));
+    overflow: hidden;
+  }
+  .ask-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 14px; border-bottom: 1px solid var(--line);
+    background: var(--accent-soft); font-size: 11.5px; letter-spacing: .01em;
+    color: var(--accent-2); font-weight: 650;
+  }
+  .ask-head .ico { width: 15px; height: 15px; flex: none; }
+  .ask-note { margin-left: auto; font-weight: 400; color: var(--fg-faint); }
+  .ask-body { display: flex; flex-direction: column; gap: 14px; padding: 14px; }
+  .ask-q { display: flex; flex-direction: column; gap: 8px; }
+  .ask-kicker { font-size: 11px; color: var(--fg-faint); letter-spacing: .04em; }
+  .ask-text { font-size: 13.5px; line-height: 1.65; }
+  .ask-opts { display: flex; flex-direction: column; gap: 7px; }
+  .ask-opt {
+    display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+    width: 100%; padding: 9px 12px; text-align: left; cursor: pointer;
+    border-radius: var(--radius-sm); border: 1px solid var(--line-2);
+    background: var(--surface-2); transition: border-color .15s, background .15s;
+  }
+  .ask-opt:hover { border-color: var(--accent-line); background: var(--surface-3); }
+  .ask-opt[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+  /* A button is a flex container, so a long label with no break opportunity
+     becomes an anonymous flex item that shrinks character by character and stacks
+     vertically. `flex: none` stops the shrink; `white-space: normal` gives the
+     label somewhere to wrap instead. */
+  .ask-opt-label { font-size: 13px; flex: none; white-space: normal; word-break: break-word; }
+  .ask-opt-desc { font-size: 11.5px; color: var(--fg-faint); white-space: normal; word-break: break-word; }
+  .ask-custom {
+    width: 100%; padding: 9px 12px; border-radius: var(--radius-sm);
+    border: 1px solid var(--line-2); background: var(--surface); color: var(--fg);
+  }
+  .ask-custom:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(91, 140, 255, .12); }
+  .ask-foot { display: flex; align-items: center; gap: 10px; padding: 0 14px 14px; }
+  .ask-err { font-size: 12px; color: var(--err); min-height: 16px; }
+  .ask-done { padding: 11px 14px; font-size: 12.5px; color: var(--fg-dim); }
+
   /* ── composer ─────────────────────────────────────────────────────── */
   footer {
     flex: none; padding: 12px 20px 16px; border-top: 1px solid var(--line);
@@ -640,6 +685,7 @@ const ICON_OPEN = '<svg class="ico" viewBox="0 0 24 24"><circle cx="12" cy="12" 
 const ICON_X = '<svg class="ico" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>'
 const ICON_SEND = '<svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M5 12h13M12 5l7 7-7 7"/></svg>'
 const ICON_MEGAPHONE = '<svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M3 11v2a1 1 0 0 0 1 1h2l6 4V6L6 10H4a1 1 0 0 0-1 1Z"/><path d="M16 9a4 4 0 0 1 0 6"/></svg>'
+const ICON_ASK = '<svg class="ico" viewBox="0 0 24 24" style="width:15px;height:15px"><path d="M9.1 9a3 3 0 1 1 4.2 2.7c-.8.4-1.3 1.1-1.3 1.9v.6"/><path d="M12 17.5h.01"/><circle cx="12" cy="12" r="9.2"/></svg>'
 
 /**
  * The page's whole state.
@@ -675,6 +721,16 @@ const state = {
    * multi-target view needs no protocol change.
    */
   transcript: new Map(),
+  /**
+   * nodeId -> the questions that node is currently blocked on.
+   *
+   * Live state, not history: an open question is a decision the agent is waiting
+   * for, so it rides the roster (and a dedicated push) rather than the
+   * transcript, which only records what already happened. At most one entry per
+   * node, because a node runs one remote turn at a time — the relay enforces the
+   * same limit and answers a second question with 409.
+   */
+  pendingQuestions: new Map(),
   /** Nodes whose history has already been fetched once. */
   loadedNodes: new Set(),
   source: null,
@@ -1069,6 +1125,7 @@ function renderNodes() {
     meta.className = 'meta'
     const bits = []
     if (!node.online) bits.push('离线')
+    else if (awaitingAnswer(node.nodeId)) bits.push('等你回答')
     else if (node.status === 'busy') bits.push(node.detail || '执行中')
     else bits.push('空闲')
     if (node.platform) bits.push(node.platform)
@@ -1252,25 +1309,218 @@ function answerNode(answer) {
 /**
  * Render the "waiting for the node" row.
  * @param {boolean} online - whether the target's node is online.
+ * @param {boolean} asked - whether this turn is waiting on the page instead.
  * @returns {HTMLElement} the row.
  */
-function pendingNode(online) {
+function pendingNode(online, asked = false) {
   const wrap = document.createElement('div')
   wrap.className = 'a pending'
   const avatar = document.createElement('span')
   avatar.className = 'avatar'
-  avatar.innerHTML = ICON_CAST
+  avatar.innerHTML = asked ? ICON_ASK : ICON_CAST
   const body = document.createElement('div')
   body.className = 'a-body'
   const text = document.createElement('div')
   text.className = 'pending-text'
-  text.textContent = online ? '已下发，等待 DSH 跑完这一轮…' : '节点离线，命令在队列里等它回来…'
+  text.textContent = asked
+    ? '已向本页提问，等待你在下面回答…'
+    : (online ? '已下发，等待 DSH 跑完这一轮…' : '节点离线，命令在队列里等它回来…')
   const typing = document.createElement('div')
   typing.className = 'typing'
   typing.innerHTML = '<i></i><i></i><i></i>'
   body.append(text, typing)
   wrap.append(avatar, body)
   return wrap
+}
+
+/**
+ * The questions a node is holding open for one workspace.
+ *
+ * Filtered by workspace because the relay is node-scoped while the page is
+ * target-scoped: without this filter a question asked in `notes` would render a
+ * card in the `deepseek` tab, and answering it there would look like it worked.
+ *
+ * @param {string} nodeId - owning node.
+ * @param {string} workspace - the target's workspace path.
+ * @returns {object|null} the open question for that target, if any.
+ */
+function questionFor(nodeId, workspace) {
+  const held = state.pendingQuestions.get(nodeId)
+  if (!Array.isArray(held)) return null
+  return held.find((entry) => entry.workspace === workspace) ?? null
+}
+
+/** Whether a node is currently blocked on a question for anywhere. */
+function awaitingAnswer(nodeId) {
+  const held = state.pendingQuestions.get(nodeId)
+  return Array.isArray(held) && held.length > 0
+}
+
+/**
+ * Build the interactive card for one held question.
+ *
+ * The composer is deliberately left alone and the card lives in the transcript
+ * at the turn the agent stopped in. Taking the composer over — as the local GUI
+ * does — would break the one thing this page is for: driving several machines at
+ * once, where a question on one target must not block sending to another.
+ *
+ * @param {object} entry - a relay pending-question entry.
+ * @returns {HTMLElement} the card.
+ */
+function questionCard(entry) {
+  const card = document.createElement('div')
+  card.className = 'ask'
+
+  const head = document.createElement('div')
+  head.className = 'ask-head'
+  const icon = document.createElement('span')
+  icon.innerHTML = ICON_ASK
+  const title = document.createElement('span')
+  title.textContent = 'DSH 在等你回答'
+  const note = document.createElement('span')
+  note.className = 'ask-note'
+  note.textContent = '答案只会作为这一次提问的结果送回'
+  head.append(icon, title, note)
+
+  const body = document.createElement('div')
+  body.className = 'ask-body'
+  // One draft per question id. `selected` holds the labels for a multi-select
+  // and the single label for a single-select, so the two share one shape and the
+  // submitted item is built from it in one place.
+  const drafts = entry.questions.map(() => ({ selected: [], custom: '' }))
+  const refs = []
+
+  entry.questions.forEach((question, index) => {
+    const group = document.createElement('div')
+    group.className = 'ask-q'
+    if (question.header) {
+      const kicker = document.createElement('div')
+      kicker.className = 'ask-kicker'
+      kicker.textContent = question.header
+      group.append(kicker)
+    }
+    const text = document.createElement('div')
+    text.className = 'ask-text'
+    text.textContent = question.question
+    group.append(text)
+
+    const options = Array.isArray(question.options) ? question.options : []
+    /** @type {HTMLButtonElement[]} */
+    const buttons = []
+    if (options.length > 0) {
+      const list = document.createElement('div')
+      list.className = 'ask-opts'
+      options.forEach((option) => {
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'ask-opt'
+        button.setAttribute('aria-pressed', 'false')
+        const label = document.createElement('span')
+        label.className = 'ask-opt-label'
+        label.textContent = option.label
+        button.append(label)
+        if (option.description) {
+          const desc = document.createElement('span')
+          desc.className = 'ask-opt-desc'
+          desc.textContent = option.description
+          button.append(desc)
+        }
+        button.addEventListener('click', () => {
+          const draft = drafts[index]
+          if (question.multiSelect) {
+            draft.selected = draft.selected.includes(option.label)
+              ? draft.selected.filter((label) => label !== option.label)
+              : [...draft.selected, option.label]
+          } else {
+            draft.selected = draft.selected.includes(option.label) ? [] : [option.label]
+          }
+          syncPressed()
+          validate()
+        })
+        buttons.push(button)
+        list.append(button)
+      })
+      group.append(list)
+    }
+
+    const custom = document.createElement('input')
+    custom.type = 'text'
+    custom.className = 'ask-custom'
+    custom.placeholder = options.length > 0 ? '或者自己写一个答案' : '输入答案'
+    custom.addEventListener('input', () => {
+      drafts[index].custom = custom.value
+      if (!question.multiSelect && custom.value.trim() !== '' && drafts[index].selected.length > 0) {
+        drafts[index].selected = []
+        syncPressed()
+      }
+      validate()
+    })
+    group.append(custom)
+    refs.push({ question, buttons, custom })
+    body.append(group)
+  })
+
+  /** Repaint the pressed state from the drafts (single-select excludes text). */
+  function syncPressed() {
+    refs.forEach((ref, index) => {
+      ref.buttons.forEach((button, buttonIndex) => {
+        const label = ref.question.options[buttonIndex].label
+        button.setAttribute('aria-pressed', drafts[index].selected.includes(label) ? 'true' : 'false')
+      })
+    })
+  }
+
+  const foot = document.createElement('div')
+  foot.className = 'ask-foot'
+  const submit = document.createElement('button')
+  submit.type = 'button'
+  submit.className = 'btn btn-primary'
+  submit.textContent = '提交答案'
+  const err = document.createElement('div')
+  err.className = 'ask-err'
+  foot.append(submit, err)
+
+  /** A question counts as answered with a choice or with text. */
+  const validate = () => {
+    const ready = drafts.every((draft) => draft.selected.length > 0 || draft.custom.trim() !== '')
+    submit.disabled = !ready
+    return ready
+  }
+
+  submit.addEventListener('click', async () => {
+    if (!validate()) return
+    submit.disabled = true
+    const label = submit.textContent
+    submit.textContent = '提交中…'
+    err.textContent = ''
+    const answers = drafts.map((draft, index) => {
+      const custom = draft.custom.trim()
+      const question = entry.questions[index]
+      // A single-select answer is one thing, never both: sending a choice and
+      // text together would be rejected by the node, and the local composer
+      // cannot produce that shape either.
+      if (custom !== '' && !question.multiSelect) return { id: question.id, selected: [], custom }
+      return {
+        id: question.id,
+        selected: draft.selected,
+        ...(custom === '' ? {} : { custom })
+      }
+    })
+    try {
+      await api('/api/answer', { body: { nodeId: entry.nodeId, questionId: entry.questionId, answers } })
+      // The card is retired by the push that follows, not by a local guess: this
+      // is the same rule the composer follows, and it is what keeps a second
+      // browser answering the same question from rendering two states.
+    } catch (error) {
+      err.textContent = error.message
+      submit.textContent = label
+      submit.disabled = false
+    }
+  })
+
+  card.append(head, body, foot)
+  validate()
+  return card
 }
 
 /** Render the active target's transcript. */
@@ -1291,8 +1541,19 @@ function renderLog() {
     return
   }
   const node = nodeOf(target.nodeId)
+  const asked = questionFor(target.nodeId, target.workspace)
   const entries = entriesFor(target)
   if (entries.length === 0) {
+    // A question can arrive before any transcript line is visible — a page that
+    // was reloaded while the agent was blocked has the roster but not the history
+    // yet — and showing the empty state then hides the one control that matters.
+    if (asked !== null) {
+      const turn = document.createElement('div')
+      turn.className = 'turn'
+      turn.append(questionCard({ ...asked, nodeId: target.nodeId }))
+      log.append(turn)
+      return
+    }
     log.append(emptyState('这个标签还没有对话', `${workspaceLabel(target)} 上还没有问过。在下面输入第一条指令，它会在工作台里开一个新会话。`))
     return
   }
@@ -1309,6 +1570,7 @@ function renderLog() {
     else last.answers.push(entry)
   }
 
+  let rendered = false
   for (const group of groups) {
     const turn = document.createElement('div')
     turn.className = 'turn'
@@ -1319,9 +1581,23 @@ function renderLog() {
       turn.append(q)
     }
     for (const answer of group.answers) turn.append(answerNode(answer))
-    if (group.q && pending.has(group.q.commandId)) {
-      turn.append(pendingNode(node !== null && node.online === true))
+    const ownsQuestion = group.q !== null && asked !== null && asked.commandId === group.q.commandId
+    if (ownsQuestion) {
+      turn.append(questionCard({ ...asked, nodeId: target.nodeId }))
+      rendered = true
+    } else if (group.q && pending.has(group.q.commandId)) {
+      turn.append(pendingNode(node !== null && node.online === true, asked !== null))
     }
+    log.append(turn)
+  }
+  // The card's command is no longer in the visible window, or the transcript has
+  // not caught up with the roster. Either way the question is unanswered, so it
+  // is appended rather than dropped: a control that exists and cannot be seen is
+  // the failure this whole feature removes.
+  if (asked !== null && !rendered) {
+    const turn = document.createElement('div')
+    turn.className = 'turn'
+    turn.append(questionCard({ ...asked, nodeId: target.nodeId }))
     log.append(turn)
   }
   if (pinned) log.scrollTop = log.scrollHeight
@@ -1342,7 +1618,13 @@ function renderHint() {
     else parts.push({ html: '将开一个新会话' })
   }
   if (state.targets.length > 1) parts.push({ html: `共 <code>${state.targets.length}</code> 个标签` })
-  parts.push({ html: '权限 <code>workspace-write + ask</code>；越界操作会弹在你本机 DSH 里等确认' })
+  // A pending question changes what the composer is for, so the hint says which
+  // of the two things the reader is looking at.
+  parts.push(
+    target !== null && questionFor(target.nodeId, target.workspace) !== null
+      ? { html: '这个目标正在等你回答上面的问题 · 也可以继续输入下一条指令' }
+      : { html: '权限 <code>workspace-write + ask</code>；回答提问不等于批准越界操作，审批仍只在本机' }
+  )
   parts.push({ html: 'Enter 发送 · ⇧Enter 换行 · ⌘/Ctrl+Enter 广播', cls: 'hint-kbd' })
   $('hint').innerHTML = parts
     .map((part) => `<span class="hint-item${part.cls === undefined ? '' : ` ${part.cls}`}">${part.html}</span>`)
@@ -1374,6 +1656,10 @@ function renderHeader() {
   }
   $('title').textContent = node === null ? nodeId : (node.name || node.nodeId)
   if (node === null) { sub.textContent = '离线'; sub.className = 's off'; return }
+  // "Waiting on you" outranks "busy": the node is busy *because* it is blocked on
+  // this page, and a header that only said 执行中 is what made the old behaviour
+  // look like a hang rather than a request for input.
+  if (awaitingAnswer(nodeId)) { sub.textContent = '等你回答'; sub.className = 's busy'; return }
   if (!node.online) { sub.textContent = '离线'; sub.className = 's off' }
   else if (node.status === 'busy') { sub.textContent = node.detail || '执行中'; sub.className = 's busy' }
   else { sub.textContent = '空闲'; sub.className = 's ok' }
@@ -1423,6 +1709,13 @@ async function loadTranscript(nodeId) {
 /** Apply a roster push from the relay. */
 function applyRoster(nodes) {
   state.nodes = Array.isArray(nodes) ? nodes : []
+  // The roster is the authoritative carrier of pending questions, so a push also
+  // repairs this cache. Without that, a page that missed the dedicated push (a
+  // reconnect, or a load that raced the request) would keep an answered card on
+  // screen and offer an answer the relay has already settled.
+  for (const node of state.nodes) applyQuestions(node.nodeId, node.questions ?? [], false)
+  const known = new Set(state.nodes.map((node) => node.nodeId))
+  for (const nodeId of [...state.pendingQuestions.keys()]) if (!known.has(nodeId)) state.pendingQuestions.delete(nodeId)
   reconcileTargets()
 
   // Pick a target for a first-time visitor. Without this the roster renders and
@@ -1443,6 +1736,42 @@ function applyRoster(nodes) {
   // Restored tabs have no history yet: the relay push only carries changes.
   for (const target of state.targets) void loadTranscript(target.nodeId)
   renderAll()
+}
+
+/**
+ * Apply one pending-question push from the relay.
+ *
+ * The push carries the node's whole list rather than a delta, so it is applied
+ * wholesale: an answered question disappears, a new one appears, and a stale
+ * cache cannot survive a reconnect.
+ *
+ * @param {string} nodeId - owning node.
+ * @param {Array<object>} questions - the node's open questions.
+ * @param {boolean} [rerender] - whether to repaint now; false when the caller repaints.
+ */
+function applyQuestions(nodeId, questions, rerender = true) {
+  if (typeof nodeId !== 'string') return
+  // Identity, not just emptiness: one question being replaced by another is a
+  // real change that "is anything pending?" cannot see, and the card is the whole
+  // point of this state.
+  const before = questionSignature(nodeId)
+  if (Array.isArray(questions) && questions.length > 0) state.pendingQuestions.set(nodeId, questions)
+  else state.pendingQuestions.delete(nodeId)
+  if (!rerender || questionSignature(nodeId) === before) return
+  if (nodeId === (activeTarget()?.nodeId ?? null) || state.targets.some((target) => target.nodeId === nodeId)) renderAll()
+  else { renderNodes(); renderTabs() }
+}
+
+/**
+ * A comparable identity for whatever a node is currently waiting on.
+ *
+ * @param {string} nodeId - node to describe.
+ * @returns {string} empty when nothing is pending, else the open question ids.
+ */
+function questionSignature(nodeId) {
+  const held = state.pendingQuestions.get(nodeId)
+  if (!Array.isArray(held)) return ''
+  return held.map((entry) => entry.questionId).join(',')
 }
 
 /** Apply one transcript push from the relay. */
@@ -1480,6 +1809,7 @@ function connect() {
     try { payload = JSON.parse(event.data) } catch { return }
     if (payload.type === 'roster') applyRoster(payload.nodes)
     else if (payload.type === 'transcript') applyTranscript(payload.entry)
+    else if (payload.type === 'questions') applyQuestions(payload.nodeId, payload.questions)
   }
   source.onerror = () => {
     // EventSource retries on its own; the roster refresh below covers the gap.
