@@ -103,6 +103,55 @@ dsh-remote-control: node "node-3f9a1c2b7d4e" (Studio Mac) → https://icyu.onlin
 
 ---
 
+## 二·五、在另一台机器上安装（Windows 也一样）
+
+### 1. 装
+
+```sh
+npm i -g pnpm
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-remote-control"
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-remote-control/client"
+```
+
+**两条都要。** 第一条装的是节点本体（宿主行），第二条装的是配置卡片（浏览器半边）。
+它们的包名不同是刻意的：`dsh-client-modules` 拒绝「两个活跃行解析到同一个客户端包名」，
+所以卡片不能挂在宿主那个包上。第二条报的
+`declares no dsh.bundle — installed as a plain dependency` 是**正确提示不是错误**——
+带 `dsh.client` 的包只进 `dependencies`，不进 `bundles`。
+
+Windows 上就是同一个命令，Path 换成 Windows 风格即可；不需要额外装什么。
+
+### 2. 更新
+
+git 源的安装会**锁定 revision**，改完代码不会自动生效。拉最新版要显式跑：
+
+```sh
+dsh plugin --profile web update
+```
+
+不跑这一条，你会一直用着装的那一刻的代码——这个坑我踩过：卡片代码推上去了，
+profile 里的包内补丁却还是旧的，表现为「装了但没有那张卡」。
+
+### 3. 配
+
+重启一次后端，然后打开 **设置 → 插件 → 插件配置**，里面会多出一张
+**Remote control** 卡片，直接填：
+
+| 字段 | 填什么 |
+| --- | --- |
+| 中转台地址 | `https://icyu.online/harness` |
+| 节点令牌 | 中转台 `/etc/dsh-remote-relay.env` 里的 `DSH_REMOTE_AGENT_TOKEN` |
+| 显示名称 | 给它起个名，例如 `我的 Windows 本`（留空会用主机名） |
+| 工作台 | **每行一个绝对路径**，例如 `C:/Users/me/projects` |
+
+保存后节点会用新配置重新连上中转台，**不用再重启**。改完刷新
+<https://icyu.online/harness/> 就能看到这台机器。
+
+> 令牌字段是密码框，**留空 = 保持原值不变**。它的值存在 `~/.dsh/settings.yaml`（`0600`），
+> 也可以直接编辑那个文件，现在这样改同样是立即生效的。
+
+---
+
 ## 三、命令跑起来之后会发生什么
 
 一次远程提问的完整路径：
