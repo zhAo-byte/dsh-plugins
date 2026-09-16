@@ -80,6 +80,16 @@ function numberOr(value, fallback) {
 }
 
 /**
+ * The value that switches `workspaces` from an explicit list to the live registry.
+ *
+ * A sentinel rather than a boolean beside the list, because the two are mutually
+ * exclusive: either you name the directories, or the node mirrors the ones this
+ * machine has actually used. One key means there is no state where both are set
+ * and the answer depends on which wins.
+ */
+export const REGISTRY_WORKSPACES = 'registry'
+
+/**
  * Resolve a raw plugin configuration into a complete, validated shape.
  *
  * @param {object} [raw] - configuration as handed to `apply()`.
@@ -92,12 +102,25 @@ export function resolveConfig(raw = {}) {
   if (relayUrl === '') throw new TypeError('relayUrl is required, e.g. https://icyu.online/harness')
   const nodeToken = stringOr(source.nodeToken, '')
   if (nodeToken === '') throw new TypeError("nodeToken is required; use the relay's DSH_REMOTE_AGENT_TOKEN")
+
+  // `workspaces: registry` mirrors the DSH workspace registry; anything else must be
+  // a list. The mode is carried as its own field so no caller has to re-sniff the
+  // sentinel after resolution.
+  const rawWorkspaces = source.workspaces
+  const registryMode =
+    typeof rawWorkspaces === 'string' && rawWorkspaces.trim().toLowerCase() === REGISTRY_WORKSPACES
+
   return {
     relayUrl,
     nodeToken,
+    registryMode,
     nodeId: stringOr(source.nodeId, DEFAULT_CONFIG.nodeId),
     displayName: stringOr(source.displayName, DEFAULT_CONFIG.displayName),
-    workspaces: Array.isArray(source.workspaces) ? source.workspaces : [...DEFAULT_CONFIG.workspaces],
+    workspaces: registryMode
+      ? []
+      : Array.isArray(rawWorkspaces)
+        ? rawWorkspaces
+        : [...DEFAULT_CONFIG.workspaces],
     agentPreset: stringOr(source.agentPreset, DEFAULT_CONFIG.agentPreset),
     permissionPreset: stringOr(source.permissionPreset, DEFAULT_CONFIG.permissionPreset),
     reconnectMinMs: numberOr(source.reconnectMinMs, DEFAULT_CONFIG.reconnectMinMs),

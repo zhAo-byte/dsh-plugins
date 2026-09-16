@@ -264,6 +264,28 @@ try {
     )
   }
 
+  // ── registry mode ────────────────────────────────────────────────────────
+  {
+    const { resolveConfig, REGISTRY_WORKSPACES } = await import('../lib/config.js')
+    const base = { relayUrl: 'https://relay.example/harness', nodeToken: 't' }
+    const reg = resolveConfig({ ...base, workspaces: REGISTRY_WORKSPACES })
+    check('the registry sentinel is recognised', reg.registryMode === true)
+    check('registry mode carries no configured list', Array.isArray(reg.workspaces) && reg.workspaces.length === 0)
+    check(
+      'the sentinel is accepted case-insensitively and trimmed',
+      resolveConfig({ ...base, workspaces: '  Registry ' }).registryMode === true
+    )
+    check('a list stays a list', resolveConfig({ ...base, workspaces: ['/tmp'] }).registryMode === false)
+    check(
+      'an absent workspaces value is not registry mode',
+      resolveConfig(base).registryMode === false && resolveConfig(base).workspaces.length === 0
+    )
+    check(
+      'an unrelated string is not a sentinel, and does not silently become one',
+      resolveConfig({ ...base, workspaces: 'nonsense' }).registryMode === false
+    )
+  }
+
   // ── the client against the fake relay ────────────────────────────────────
   const client = new RelayClient({ relayUrl: `${base}/harness/`, nodeToken: 'node-secret' })
   responder = () => ({ status: 200, body: { nodeId: 'n1', pollHoldMs: 1500 } })

@@ -328,6 +328,51 @@ try {
     check('the refusal lists what is available', String(refused?.message).includes('/workspace/proj'))
   }
 
+  // ── registry mode: the advertised set is read live, not frozen at startup ─
+  // This is what makes "new workspace, no backend restart" true. If the provider
+  // were consulted once, a directory created after boot would be rejected forever,
+  // and the relay page would keep showing a stale list with nothing explaining why.
+  {
+    const { RemoteRunner } = await import('../lib/runner.js')
+    const { ctx } = fakeHarness()
+    const live = [{ name: 'one', path: '/workspace/one' }]
+    const runner = new RemoteRunner({
+      ctx,
+      config: { nodeId: 'n', workspaces: [], agentPreset: 'standard', permissionPreset: 'workspace-write' },
+      logger: {},
+      workspaceProvider: () => live
+    })
+    check('registry mode advertises what the provider returns', runner.workspaces()[0]?.path === '/workspace/one')
+    check('registry mode accepts a path the provider offers', runner.resolveWorkspace('/workspace/one') === '/workspace/one')
+
+    // A workspace created after the node started, with no reconfiguration.
+    live.push({ name: 'two', path: '/workspace/two' })
+    check(
+      'a workspace added at runtime is advertised without a restart',
+      runner.workspaces().some((entry) => entry.path === '/workspace/two')
+    )
+    check(
+      'a workspace added at runtime is accepted without a restart',
+      runner.resolveWorkspace('/workspace/two') === '/workspace/two'
+    )
+
+    // And one that goes away stops being offered, so the advertised list cannot
+    // drift from what the node would actually accept.
+    live.splice(live.findIndex((entry) => entry.path === '/workspace/one'), 1)
+    check('a removed workspace stops being advertised', !runner.workspaces().some((e) => e.path === '/workspace/one'))
+    let refused
+    try {
+      runner.resolveWorkspace('/workspace/one')
+    } catch (error) {
+      refused = error
+    }
+    check('a removed workspace is refused', refused instanceof Error && refused.message.includes('not advertised'))
+    check(
+      'the refusal lists the current set, not the startup one',
+      String(refused?.message).includes('/workspace/two') && !String(refused?.message).includes('/workspace/one,')
+    )
+  }
+
   // ── a first turn ─────────────────────────────────────────────────────────
   {
     const { runner, ledger } = await makeRunner()

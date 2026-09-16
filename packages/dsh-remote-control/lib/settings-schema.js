@@ -47,19 +47,21 @@ export async function loadSchema() {
     /** Label on the control page. Empty means the machine's host name. */
     displayName: Schema.string().default(''),
     /**
-     * Workbenches this node offers, as an allow-list.
+     * Which workbenches this node offers. Two forms, and the schema accepts both
+     * plus the registry sentinel, because the settings service validates the
+     * *composed* configuration against this schema: a form the schema omits is a
+     * form whose whole namespace gets rejected.
      *
-     * Both shapes the rest of the plugin accepts are declared here: a bare path
-     * string, and `{ name, path }` for a custom label. Declaring only the string
-     * form was a real defect rather than a simplification — the settings service
-     * validates the composed configuration against this schema, so a deployment
-     * that used the documented mapping form had its whole namespace rejected and
-     * silently lost GUI configuration. The schema must describe what the code
-     * accepts, not the subset the card happens to render.
+     * - the array of bare path strings, or `{ name, path }` for custom labels;
+     * - the literal string `'registry'`, which mirrors the DSH workspace registry
+     *   instead of naming directories. In that mode the set the relay may name is
+     *   decided by which sessions this machine has, not by an explicit grant — so
+     *   anything opened locally becomes remotely reachable. Opt-in for that reason.
      */
-    workspaces: Schema.array(
-      Schema.union([Schema.string(), Schema.object({ name: Schema.string(), path: Schema.string() })])
-    ).default([]),
+    workspaces: Schema.union([
+      Schema.string(),
+      Schema.array(Schema.union([Schema.string(), Schema.object({ name: Schema.string(), path: Schema.string() })]))
+    ]).default([]),
     /** Agent preset remote sessions are composed from. */
     agentPreset: Schema.string().default('standard'),
     /** Permission preset pinned onto every remote session. */

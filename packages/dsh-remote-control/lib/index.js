@@ -133,6 +133,40 @@ export async function apply(ctx, config) {
   }
 
   /**
+   * Read this machine's workspaces out of the DSH registry, in registry mode.
+   *
+   * `registry` mode exists because the explicit list has to be maintained by hand,
+   * and the failure mode of forgetting is invisible: a directory the relay cannot
+   * name simply never appears on the page, with nothing saying why. Mirroring the
+   * registry means the page shows exactly the workspaces this machine has actually
+   * used.
+   *
+   * The trade is deliberate and worth stating where it is implemented: the set the
+   * relay may name is then decided by *which sessions exist*, not by an explicit
+   * grant. Anything opened in the local GUI becomes remotely reachable. That is why
+   * it is opt-in, and why the node logs the mode it is in on every connection.
+   *
+   * Read fresh on every call rather than cached: `workspaces()` is consulted for
+   * each advertisement and each command, so a workspace created after boot becomes
+   * usable immediately, and one deleted locally stops being offered.
+   *
+   * @param {object} scoped - context carrying `workspaceRegistry`.
+   * @returns {() => Array<{ name: string, path: string }>} the provider.
+   */
+  const registryWorkspaceProvider = (scoped) => () => {
+    const registry = scoped.get('workspaceRegistry')
+    if (registry === undefined || typeof registry.list !== 'function') return []
+    return registry
+      .list()
+      .map((entity) => ({
+        // The GUI's own title, so the page and the sidebar agree on names.
+        name: typeof entity.title === 'string' && entity.title.trim() !== '' ? entity.title : entity.path,
+        path: entity.path
+      }))
+      .filter((entry) => typeof entry.path === 'string' && entry.path !== '')
+  }
+
+  /**
    * Stop the running node, if any.
    *
    * Awaitable so a rebuild cannot race its predecessor: the old poll loop is
@@ -150,13 +184,19 @@ export async function apply(ctx, config) {
    * @param {object} scoped - context carrying the Harness services the runner needs.
    */
   const start = (prepared, scoped) => {
-    const { resolved, workspaces, identity } = prepared
+    const { resolved, identity } = prepared
+    // In registry mode the configured list is ignored and the live registry is the
+    // authority. `identity.workspaces` is only ever the startup snapshot used for
+    // the announcement; the runner re-reads so the advertised set stays current.
+    const workspaceProvider = resolved.registryMode ? registryWorkspaceProvider(scoped) : undefined
+    const workspaces = workspaceProvider === undefined ? prepared.workspaces : workspaceProvider()
     const controller = new AbortController()
     const client = new RelayClient({ relayUrl: resolved.relayUrl, nodeToken: resolved.nodeToken, logger })
     const runner = new RemoteRunner({
       ctx: scoped,
       config: { ...resolved, ...identity, workspaces },
-      logger
+      logger,
+      ...(workspaceProvider === undefined ? {} : { workspaceProvider })
     })
 
     /**
@@ -206,13 +246,26 @@ export async function apply(ctx, config) {
           const ack = await client.hello({ ...identity, workspaces: runner.workspaces() })
           if (typeof ack.pollHoldMs === 'number' && ack.pollHoldMs > 0) pollHoldMs = ack.pollHoldMs
           if (!announced) {
+            const advertised = runner.workspaces()
             report(
               logger,
               'info',
               `node "${identity.nodeId}" (${identity.name}) → ${client.baseUrl}, ` +
-                `${String(runner.workspaces().length)} workspace(s), preset ${resolved.agentPreset}, ` +
-                `permission ${resolved.permissionPreset}`
+                `${String(advertised.length)} workspace(s), preset ${resolved.agentPreset}, ` +
+                `permission ${resolved.permissionPreset}, ` +
+                `workspaces from ${resolved.registryMode ? 'the DSH registry' : 'the configured list'}`
             )
+            if (resolved.registryMode) {
+              // The mode decides what the relay is allowed to name, so it is stated
+              // rather than left to be inferred from a config file.
+              report(
+                logger,
+                'warn',
+                `registry mode: any directory this machine opens a session in becomes remotely reachable — ${advertised
+                  .map((entry) => entry.path)
+                  .join(', ')}`
+              )
+            }
             announced = true
           } else {
             report(logger, 'info', `reconnected to ${client.baseUrl} as "${identity.nodeId}"`)

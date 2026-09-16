@@ -199,12 +199,20 @@ export function turnFailure(reason) {
  */
 export class RemoteRunner {
   /**
-   * @param {object} options - `{ ctx, config, logger }`.
+   * @param {object} options - `{ ctx, config, logger, workspaceProvider? }`.
+   *
+   * `workspaceProvider` is the registry mode: a synchronous callback that returns
+   * the current list, consulted on every advertisement and every command instead
+   * of a list fixed at startup. That timing is the whole point — a workspace
+   * created after the backend booted has to become usable without a restart, and
+   * re-reading is also what keeps the advertised list honest if one is removed.
    */
-  constructor({ ctx, config, logger }) {
+  constructor({ ctx, config, logger, workspaceProvider }) {
     this.ctx = ctx
     this.config = config
     this.logger = logger
+    /** Registry mode: returns the live list, or undefined for the configured one. */
+    this.workspaceProvider = workspaceProvider
     /** @type {Map<string, { handle: object, workspacePath: string }>} */
     this.sessions = new Map()
     this.disposed = false
@@ -218,24 +226,26 @@ export class RemoteRunner {
    * @returns {Array<{ name: string, path: string }>} advertised workspaces.
    */
   workspaces() {
-    return this.config.workspaces.map((entry) => ({ name: entry.name, path: entry.path }))
+    const source = this.workspaceProvider === undefined ? this.config.workspaces : this.workspaceProvider()
+    return source.map((entry) => ({ name: entry.name, path: entry.path }))
   }
 
   /**
    * Resolve a relay-supplied workspace path against what this node advertises.
    *
    * Refusing anything not advertised is the whole point of the allow-list: the
-   * relay is a separate trust domain, so a compromised or buggy relay must not
-   * be able to name `/etc` as a workspace and have the node comply.
+   * relay is a separate trust domain, so a compromised or buggy relay must not be
+   * able to name `/etc` as a workspace and have the node comply.
    *
    * @param {string} requested - path from the command.
    * @returns {string} the advertised absolute path.
    * @throws {Error} when the path is not advertised.
    */
   resolveWorkspace(requested) {
-    const match = this.config.workspaces.find((entry) => entry.path === requested)
+    const advertised = this.workspaces()
+    const match = advertised.find((entry) => entry.path === requested)
     if (match === undefined) {
-      const known = this.config.workspaces.map((entry) => entry.path).join(', ') || '(none configured)'
+      const known = advertised.map((entry) => entry.path).join(', ') || '(none configured)'
       throw new Error(`workspace ${JSON.stringify(requested)} is not advertised by this node; known: ${known}`)
     }
     return match.path
