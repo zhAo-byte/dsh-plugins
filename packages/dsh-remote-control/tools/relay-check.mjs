@@ -15,7 +15,7 @@
  * @module dsh-remote-control/tools/relay-check
  */
 
-import { spawn } from 'node:child_process'
+import { spawnGuarded, stopGuarded, trackedCount } from './spawn-guard.mjs'
 import { once } from 'node:events'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -86,7 +86,7 @@ function baseUrlFrom(child, port) {
 }
 
 const port = 18_000 + Math.floor(Math.random() * 2_000)
-const child = spawn(process.execPath, [SERVER], {
+const child = spawnGuarded(process.execPath, [SERVER], {
   env: {
     ...process.env,
     DSH_REMOTE_RELAY_HOST: '127.0.0.1',
@@ -319,9 +319,11 @@ try {
   failures += 1
   process.stdout.write(`\nrelay-check: harness error — ${error?.stack ?? error}\n`)
 } finally {
-  child.kill('SIGTERM')
-  await Promise.race([once(child, 'exit'), sleep(2000)])
-  if (child.exitCode === null) child.kill('SIGKILL')
+  await stopGuarded(child)
+  if (trackedCount() > 0) {
+    failures += 1
+    process.stdout.write(`relay-check: leaked ${String(trackedCount())} child process(es)\n`)
+  }
 }
 
 if (failures > 0) process.exitCode = 1

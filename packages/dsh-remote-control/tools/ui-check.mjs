@@ -23,7 +23,7 @@
  * @module dsh-remote-control/tools/ui-check
  */
 
-import { spawn } from 'node:child_process'
+import { spawnGuarded, stopGuarded, trackedCount } from './spawn-guard.mjs'
 import { createServer } from 'node:http'
 import { readdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
@@ -316,7 +316,7 @@ try {
   // ── a real relay, and a real node identity registered into it ────────────
   const relayPort = 19_000 + Math.floor(Math.random() * 1_000)
   const relayUrl = `http://127.0.0.1:${String(relayPort)}`
-  relay = spawn(process.execPath, [SERVER], {
+  relay = spawnGuarded(process.execPath, [SERVER], {
     env: {
       ...process.env,
       DSH_REMOTE_RELAY_HOST: '127.0.0.1',
@@ -417,7 +417,7 @@ try {
 
   // ── the browser ──────────────────────────────────────────────────────────
   const debuggingPort = 9_000 + Math.floor(Math.random() * 900)
-  browser = spawn(
+  browser = spawnGuarded(
     binary,
     [
       '--headless=new',
@@ -663,8 +663,12 @@ try {
 } finally {
   clearInterval(keepAlive)
   devtools?.close()
-  browser?.kill('SIGKILL')
-  relay?.kill('SIGTERM')
+  await stopGuarded(browser)
+  await stopGuarded(relay)
+  if (trackedCount() > 0) {
+    failures += 1
+    process.stdout.write(`ui-check: leaked ${String(trackedCount())} child process(es)\n`)
+  }
   if (failures > 0) process.stdout.write(`ui-check: kept ${workdir}\n`)
 }
 

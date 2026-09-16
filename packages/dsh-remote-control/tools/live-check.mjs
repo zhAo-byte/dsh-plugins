@@ -16,7 +16,7 @@
  * @module dsh-remote-control/tools/live-check
  */
 
-import { spawn } from 'node:child_process'
+import { spawnGuarded, stopGuarded, trackedCount } from './spawn-guard.mjs'
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
@@ -139,7 +139,7 @@ try {
   check('a dsh launcher was found', existsSync(dsh), dsh)
 
   await mkdir(workdir, { recursive: true })
-  const init = spawn(dsh, ['--profile', 'web', '--dump-default-config'], {
+  const init = spawnGuarded(dsh, ['--profile', 'web', '--dump-default-config'], {
     cwd: workdir,
     env: { ...process.env, DSH_HOME: dshHome },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -179,7 +179,7 @@ try {
   )
 
   // ── the composed tree must carry the row and its config ──────────────────
-  const dump = spawn(dsh, ['--profile', 'web', '--dump-config'], {
+  const dump = spawnGuarded(dsh, ['--profile', 'web', '--dump-config'], {
     cwd: workdir,
     env: { ...process.env, DSH_HOME: dshHome },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -194,7 +194,7 @@ try {
   check('the row resolves to this package', /name:\s*dsh-remote-control/.test(composed))
 
   // ── boot for real ────────────────────────────────────────────────────────
-  backend = spawn(dsh, ['--profile', 'web', '--port', '0', '--no-open'], {
+  backend = spawnGuarded(dsh, ['--profile', 'web', '--port', '0', '--no-open'], {
     cwd: workdir,
     env: { ...process.env, DSH_HOME: dshHome },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -283,11 +283,16 @@ try {
   failures += 1
   process.stdout.write(`\nlive-check: harness error — ${error?.stack ?? error}\n`)
 } finally {
-  backend?.kill('SIGTERM')
-  if (backend !== undefined) await Promise.race([new Promise((resolve) => backend.once('exit', resolve)), sleep(3000)])
-  backend?.kill('SIGKILL')
+  // Stopping the backend means stopping its group: `dsh` is a launcher, so the
+  // process holding the port may be a descendant. A plain kill here is what left
+  // orphaned backends behind in the first place.
+  await stopGuarded(backend)
   relay?.close()
   relay?.closeAllConnections?.()
+  if (trackedCount() > 0) {
+    failures += 1
+    process.stdout.write(`live-check: leaked ${String(trackedCount())} child process(es)\n`)
+  }
   if (keep) process.stdout.write(`live-check: kept ${workdir}\n`)
   else await rm(workdir, { recursive: true, force: true })
 }
