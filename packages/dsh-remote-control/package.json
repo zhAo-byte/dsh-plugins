@@ -41,9 +41,9 @@
   },
   "scripts": {
     "check": "node --check lib/index.js && node --check lib/config.js && node --check lib/client.js && node --check lib/runner.js && node --check relay/server.js",
-    "test": "node tools/relay-check.mjs && node tools/node-check.mjs && node tools/runner-check.mjs",
-    "test:live": "node tools/live-check.mjs",
-    "test:ui": "node tools/ui-check.mjs"
+    "test": "node tools/relay-check.mjs && node tools/node-check.mjs",
+    "test:ui": "node tools/ui-check.mjs",
+    "test:harness": "node tools/runner-check.mjs && node tools/live-check.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",

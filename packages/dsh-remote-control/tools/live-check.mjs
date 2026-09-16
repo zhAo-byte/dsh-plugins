@@ -110,6 +110,27 @@ const keep = process.env.DSH_REMOTE_CONTROL_CHECK_KEEP === '1'
 let relay
 let backend
 
+// This check is the one that needs a real Harness *launcher*, so it reports a
+// skip where there is none instead of failing. The distinction matters: a missing
+// launcher is an environment fact, not a defect in this package, and a check that
+// cannot tell those apart trains people to ignore red output.
+{
+  let launcher
+  try {
+    launcher = findDsh()
+  } catch {
+    launcher = undefined
+  }
+  if (launcher === undefined) {
+    process.stdout.write('live-check\n')
+    process.stdout.write('  \u25CB no dsh launcher found; skipping.\n')
+    process.stdout.write('     Set DSH_BIN to the launcher, or install @deepseek-ai/dsh, then run `npm run test:harness`.\n')
+    process.stdout.write('live-check: skipped\n')
+    await rm(workdir, { recursive: true, force: true })
+    process.exit(0)
+  }
+}
+
 try {
   process.stdout.write('live-check\n')
 

@@ -243,6 +243,35 @@ const command = (overrides = {}) => ({
   ...overrides
 })
 
+// This check drives the real runner, and the runner's reply extraction calls into
+// the Harness (`createUserMessage`, `SessionSeq`). The Harness facade below is
+// fake, but those value helpers are not — so this file needs a real Harness
+// installation to be reachable, exactly like `live-check` does.
+//
+// That requirement used to be implicit. It held on a developer machine because
+// the `node_modules/@deepseek-ai` symlink made the packages visible, and it broke
+// the moment the same command ran anywhere else. So it is now stated: absent a
+// Harness the check reports a skip, and `npm test` no longer depends on it.
+{
+  const reachable = await (async () => {
+    const { probePackageResolution } = await import('../lib/runner.js')
+    try {
+      await probePackageResolution()
+      return true
+    } catch {
+      return false
+    }
+  })()
+  if (!reachable) {
+    process.stdout.write('runner-check\n')
+    process.stdout.write('  \u25CB no Harness installation reachable; skipping.\n')
+    process.stdout.write('     This check needs @deepseek-ai/* on disk, because the runner calls into it.\n')
+    process.stdout.write('     Install the plugin into a profile (or link the packages) and run `npm run test:harness`.\n')
+    process.stdout.write('runner-check: skipped\n')
+    process.exit(0)
+  }
+}
+
 try {
   process.stdout.write('runner-check\n')
 

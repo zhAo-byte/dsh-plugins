@@ -59,26 +59,42 @@ dsh plugin --profile web add ./packages/dsh-remote-control
 
 ## 自检
 
-每个包都自带零依赖的自检，且都能在**本仓原地**跑通。
+`dsh-remote-control` 的自检按**真实前提**分成两个入口，而不是按文件名分组：
+
+| 入口 | 需要什么 | 内容 |
+| --- | --- | --- |
+| `npm test` | **只要 Node** | relay 41 · node 50 |
+| `npm run test:harness` | 磁盘上有真 Harness | runner 51 · live 21 |
+| `npm run test:ui` | 一个 Chromium | 问答页 21 |
 
 ```sh
-# 远程控制：5 套，共 184 项
 cd packages/dsh-remote-control
-npm test                 # relay 41 / node 50 / runner 51
-npm run test:live        # 隔离 DSH_HOME 里真启动一次 web profile（21）
-npm run test:ui          # 真 Chromium 驱动问答页（21，需要浏览器）
+npm test                 # 任何环境都能跑，CI 三平台跑的就是这条
+npm run test:harness     # 驱动真 runner + 隔离 DSH_HOME 里真启动一次 web profile
+npm run test:ui          # 真 Chromium 驱动问答页
+```
 
-# Codex 桥
+**为什么要按前提拆而不是按名字拆。** `runner-check` 名字上像是个纯单元测试
+（它对着假 Harness 驱动 runner），但 `runner` 抽取回复时会调进 Harness
+（`createUserMessage` / `SessionSeq`），所以它**必须在有真 Harness 的机器上跑**。
+这个前提以前是隐含的：开发机上 `node_modules/@deepseek-ai` 软链让它成立，
+一换到 CI 就整片崩红。现在前提被写进了脚本划分里——缺 Harness 时
+`runner-check` 和 `live-check` **报告 skip 并干净退出**，而不是假装通过，也不是报错。
+
+CI 见 [`.github/workflows/`](.github/workflows/)：跨 macOS / Windows / Linux 跑 `npm test`，
+另有两个 Ubuntu job 分别跑真浏览器和真 Harness。Windows 那一档不是凑数——
+`dsh-remote-control` 明确要支持 Windows，而它第一次跑就抓到了一个真实的加载期 bug。
+
+Codex 桥的自检需要真的 `~/.codex`，所以 CI 里只守语法，原因写在 workflow 里：
+
+```sh
 cd packages/dsh-codex-bridge
 node tools/panel-check.mjs .        # 宿主侧数据层，不需要 GUI
 node tools/client-check.mjs         # 端到端：隔离 DSH_HOME 真启动并断言卡片装上了
 ```
 
-`npm run test:live` 和 `test:ui` 都不碰你正在跑的后端，也不碰 `~/.dsh`：
-它们建临时 `DSH_HOME`、退出即删（`*_CHECK_KEEP=1` 可留下排查）。
-
-CI 见 [`.github/workflows/`](.github/workflows/)：跨 macOS / Windows / Linux 跑两个包的自检。
-Windows 那一档不是凑数——`dsh-remote-control` 明确要支持 Windows。
+`test:harness` 和 `test:ui` 都不碰你正在跑的后端，也不碰 `~/.dsh`：
+它们建临时 `DSH_HOME`、退出即删（`DSH_REMOTE_CONTROL_CHECK_KEEP=1` 可留下排查）。
 
 ## 开发环境
 

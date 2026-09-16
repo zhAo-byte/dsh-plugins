@@ -96,12 +96,14 @@ jobs:
         env:
           DSH_BIN: ${{ runner.temp }}/dsh-runtime/node_modules/.bin/dsh
         run: |
-          # The runner resolves `@deepseek-ai/*` by walking up from its own file,
-          # so linking the freshly installed packages into the package directory
-          # is enough; no extra environment variable is needed.
+          # Both remaining checks need a real Harness on disk: `runner-check` drives
+          # the real runner, whose reply extraction calls into @deepseek-ai/*, and
+          # `live-check` boots a profile. The runner resolves those packages by
+          # walking up from its own file, so linking them into the package
+          # directory is enough; no extra environment variable is needed.
           mkdir -p node_modules
           ln -sfn "$RUNNER_TEMP/dsh-runtime/node_modules/@deepseek-ai" node_modules/@deepseek-ai
-          npm run test:live
+          npm run test:harness
 
   codex-bridge:
     name: dsh-codex-bridge syntax
