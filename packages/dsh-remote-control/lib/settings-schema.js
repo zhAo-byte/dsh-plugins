@@ -47,14 +47,19 @@ export async function loadSchema() {
     /** Label on the control page. Empty means the machine's host name. */
     displayName: Schema.string().default(''),
     /**
-     * Workbenches this node offers, as an allow-list of absolute paths.
+     * Workbenches this node offers, as an allow-list.
      *
-     * A plain list of strings rather than objects: it keeps the schema a form the
-     * card can render without a nested repeater, and a path is already a usable
-     * label. Entries may start with `~`. The YAML configuration still accepts
-     * `{ name, path }` for anyone who wants custom labels.
+     * Both shapes the rest of the plugin accepts are declared here: a bare path
+     * string, and `{ name, path }` for a custom label. Declaring only the string
+     * form was a real defect rather than a simplification — the settings service
+     * validates the composed configuration against this schema, so a deployment
+     * that used the documented mapping form had its whole namespace rejected and
+     * silently lost GUI configuration. The schema must describe what the code
+     * accepts, not the subset the card happens to render.
      */
-    workspaces: Schema.array(Schema.string()).default([]),
+    workspaces: Schema.array(
+      Schema.union([Schema.string(), Schema.object({ name: Schema.string(), path: Schema.string() })])
+    ).default([]),
     /** Agent preset remote sessions are composed from. */
     agentPreset: Schema.string().default('standard'),
     /** Permission preset pinned onto every remote session. */

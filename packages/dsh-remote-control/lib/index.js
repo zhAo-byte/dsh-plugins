@@ -59,8 +59,29 @@ export const REQUIRED_SERVICES = ['agents', 'agentPresets', 'permissionPresets',
  * @param {object} ctx - Cordis context.
  * @param {object} config - validated plugin configuration.
  */
-export function apply(ctx, config) {
+export async function apply(ctx, config) {
   const logger = ctx.logger
+
+  /**
+   * The settings schema, resolved before anything installs it.
+   *
+   * `installSection` registers a namespace as an *effect on the calling fiber*, so
+   * it has to run synchronously inside the injection callback. Reaching it through
+   * an `await import()` in that callback failed with "cannot create effect on
+   * inactive context" — the fiber had already settled. Loading the schema here,
+   * once, keeps the module top level free of the peer dependency while still
+   * letting the registration happen where it must.
+   *
+   * @type {object|undefined}
+   */
+  let settingsSchema
+  try {
+    const { loadSchema } = await import('./settings-schema.js')
+    settingsSchema = await loadSchema()
+  } catch (error) {
+    settingsSchema = undefined
+    report(logger, 'warn', `settings are not editable from the GUI (${error?.message ?? error}); the YAML configuration still applies`)
+  }
 
   /**
    * Where the live configuration comes from.
@@ -297,12 +318,12 @@ export function apply(ctx, config) {
     scopedContext = scoped
     // Re-apply now that the services exist, then follow the settings namespace so
     // an edit in the GUI takes effect without restarting the backend.
-    ctx.inject(['settings'], (settingsCtx) => {
-      const namespace = 'remote-control'
-      void (async () => {
+    if (settingsSchema !== undefined) {
+      ctx.inject(['settings'], (settingsCtx) => {
+        // Synchronous on purpose: registration is a fiber effect, and creating one
+        // from a later microtask is what produced "inactive context".
         try {
-          const { loadSchema } = await import('./settings-schema.js')
-          settingsCtx.settings.installSection(ctx, namespace, await loadSchema(), config, {
+          settingsCtx.settings.installSection(ctx, 'remote-control', settingsSchema, config, {
             setSource: (source) => {
               currentSource = source
             },
@@ -311,16 +332,10 @@ export function apply(ctx, config) {
             }
           })
         } catch (error) {
-          // Settings are a convenience, not a requirement: without schemastery or a
-          // provider the node still runs from YAML. Saying so beats a silent no-op.
-          report(
-            logger,
-            'warn',
-            `settings are not editable from the GUI (${error?.message ?? error}); the YAML configuration still applies`
-          )
+          report(logger, 'warn', `settings are not editable from the GUI (${error?.message ?? error}); the YAML configuration still applies`)
         }
-      })()
-    })
+      })
+    }
     if (pending !== undefined) {
       const prepared = pending
       start(prepared, scoped)

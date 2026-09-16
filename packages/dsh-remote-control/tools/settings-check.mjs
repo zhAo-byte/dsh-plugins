@@ -71,6 +71,34 @@ const seen = []
 try {
   process.stdout.write('settings-check\n')
 
+  // ── the schema must accept every documented configuration shape ──────────
+  // This is where a real defect lived: the schema declared `workspaces` as an
+  // array of strings while the plugin and its docs also accept `{ name, path }`.
+  // The settings service validates the composed configuration against the schema,
+  // so a deployment using the mapping form had its whole namespace rejected and
+  // silently lost GUI configuration. Asserted here rather than in node-check
+  // because building the schema needs schemastery, which only a Harness provides.
+  {
+    const { loadSchema } = await import('../lib/settings-schema.js')
+    const schema = await loadSchema()
+    const accepted = (workspaces) => {
+      try {
+        const resolved = schema({ relayUrl: 'https://relay.example/harness', nodeToken: 't', workspaces })
+        return JSON.stringify(resolved.workspaces)
+      } catch {
+        return undefined
+      }
+    }
+    check('the schema accepts bare path strings', accepted(['/tmp']) === JSON.stringify(['/tmp']))
+    check(
+      'the schema accepts the documented { name, path } form',
+      accepted([{ name: 'proj', path: '/tmp' }]) === JSON.stringify([{ name: 'proj', path: '/tmp' }]),
+      'a deployment using mapped workspaces would lose its whole settings namespace'
+    )
+    check('the schema still rejects nonsense entries', accepted([123]) === undefined)
+    check('the schema defaults the optional fields', schema({ relayUrl: 'https://x/y', nodeToken: 't' }).agentPreset === 'standard')
+  }
+
   // ── the stub relay the node will register with ───────────────────────────
   relay = createServer((req, res) => {
     const chunks = []
@@ -115,6 +143,9 @@ try {
   })
   await mkdir(join(profileDir, 'node_modules'), { recursive: true })
   await symlink(PACKAGE_ROOT, join(profileDir, 'node_modules', 'dsh-remote-control'), 'dir')
+  // The client half as well: the bundle patch declares its row, and a profile that
+  // cannot resolve it fails the whole plugin tree with ERR_MODULE_NOT_FOUND.
+  await symlink(join(PACKAGE_ROOT, 'client'), join(profileDir, 'node_modules', 'dsh-remote-control-client'), 'dir')
   await symlink(join(RUNTIME_NODE_MODULES, '@deepseek-ai'), join(profileDir, 'node_modules', '@deepseek-ai'), 'dir')
   const manifestPath = join(profileDir, 'package.json')
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))

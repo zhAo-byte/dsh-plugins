@@ -19,5 +19,17 @@
 #       enabled: false
 
 - insert:
+    # The node: advertises this machine, polls, runs what arrives.
     - id: remote-control
       name: 'dsh-remote-control'
+
+    # The browser half: the configuration card in
+    # Settings → Plugins → Plugin configuration.
+    #
+    # A separate package name on purpose. `dsh-client-modules` composes one browser
+    # bundle per Loader row that resolves to a client package, and it rejects two
+    # active rows resolving to the same package name — so the card cannot live on
+    # the package the host rows already use. Same reason, same shape as the sibling
+    # `dsh-codex-bridge-client`.
+    - id: remote-control-client
+      name: 'dsh-remote-control-client'

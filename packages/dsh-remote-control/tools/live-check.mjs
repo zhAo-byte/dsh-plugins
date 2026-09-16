@@ -154,6 +154,11 @@ try {
 
   await mkdir(join(profileDir, 'node_modules'), { recursive: true })
   await symlink(PACKAGE_ROOT, join(profileDir, 'node_modules', 'dsh-remote-control'), 'dir')
+  // The client half too: the bundle patch declares its row, and a profile that
+  // cannot resolve it fails the whole tree with ERR_MODULE_NOT_FOUND — which is
+  // exactly what happened when the card was added and this check still installed
+  // only the host package.
+  await symlink(join(PACKAGE_ROOT, 'client'), join(profileDir, 'node_modules', 'dsh-remote-control-client'), 'dir')
   await symlink(join(RUNTIME_NODE_MODULES, '@deepseek-ai'), join(profileDir, 'node_modules', '@deepseek-ai'), 'dir')
 
   const manifestPath = join(profileDir, 'package.json')
