@@ -40,7 +40,14 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
 **仓库列表**（顶部，可折叠）
 
 - 扫描当前会话工作目录下的所有仓库（含子目录里的嵌套仓库、submodule），
-  深度与数量有预算（默认 4 层 / 60 个），每次都带时间戳。
+  深度与数量有预算（默认 8 层 / 60 个 / 40000 个目录），每次都带时间戳。
+  预算**从不静默生效**，但两种预算的报法不同，因为它们性质不同：
+  深度是策略边界（深目录树上出现很正常），只在列表下方给一行浅色说明；
+  目录数上限是保护阀被顶开（扫描可能停在半路），给黄色警示条。
+  两者都说清该调哪个配置项。
+  8 层覆盖的是各类常见容器布局：Unity 工程的同级 checkout 在
+  `Assets/<Group>/<Module>`（第 5 层，旧默认值 4 层正好把整层藏掉），
+  monorepo 的 `packages/<group>/<pkg>` 是第 3 层，其余多在 2–4 层。
 - 每行：脏/干净圆点、相对路径、当前分支、`↑ahead ↓behind`、变更数、`GL` 标记。
 - 悬停即出快捷动作：抓取 / 拉取 / 推送。
 - 顶部工具栏：工作台切换（跟随 DSH 工作区注册表）、刷新、**全部抓取**、设置。
@@ -67,12 +74,30 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
 ```yaml
 - id: git-repos
   config:
-    discover: { maxDepth: 4, limit: 60 }
+    discover:
+      maxDepth: 8            # 1–24；每多一层，多 readdir 一层目录
+      limit: 60              # 1–400；列出的仓库个数上限
+      maxEntries: 40000      # 1000–2000000；访问目录数上限，防病态目录树
     extraRoots: []            # 工作区注册表之外还允许碰的目录
     allowHome: true           # 允许 $HOME 下的任何仓库
     gitlabHosts: []           # 自建 GitLab 主机名（含 "gitlab" 的自动识别）
     timeouts: { read: 20000, network: 180000 }
 ```
+
+三个预算各自的失效方式不同，因此面板分开报告：`limit` 用仓库计数上的 `+`
+表示（`truncated`）；`maxEntries` 顶开时是黄色条
+（`discovery.entryLimited`）；`maxDepth` 触边时是列表下方一行浅色说明
+（`discovery.depthLimited`）。三者都带本次访问目录数 `discovery.visited`
+（在提示的悬停 title 里），并写明该改哪个字段。
+
+**为什么不把深度默认值取得更大以求「一次扫完」**：实测这个 200 GB 的 Unity
+工作台（22 个嵌套仓库）在 8 层时访问约 6.5k 个目录、耗时 0.64 秒，就已经把
+22 个仓库全部列出；继续加深到 24 层要访问约 13.9 万个目录、耗时 2.9 秒，
+而 `depthLimited` 依然为真——这棵树本身就比 24 层更深。既然任何可承受的固定
+深度都扫不完，默认值就该取「覆盖所有常见容器布局」的那一档，把边界如实说出来，
+而不是假装扫完了。`maxDepth` 的成本是每层一次 `readdir`，`Library`、
+`node_modules`、`build`、`dist`、`Pods` 等重型目录已被剪掉；`limit` 的成本高
+得多——每个仓库都要跑一次 `git status`——所以它保持 60，仓库特别多时再调大。
 
 GitLab 令牌（只读即可，`read_api`）按优先级取：
 

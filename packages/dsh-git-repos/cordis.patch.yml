@@ -11,9 +11,16 @@
       name: 'dsh-git-repos'
       config:
         # Directory scan budget when the panel enumerates repositories.
+        # 8 levels covers every ordinary container layout — a Unity project
+        # keeps sibling checkouts at `Assets/<Group>/<Module>`, i.e. depth 5,
+        # and the old default of 4 hid that whole layer silently.
+        # `maxEntries` is the safety valve for pathological trees.
+        # Neither budget is applied quietly: when one bites, the panel says
+        # which, above the repository list.
         discover:
-          maxDepth: 4
+          maxDepth: 8
           limit: 60
+          maxEntries: 40000
         # Extra roots the API may touch, beyond the DSH workspace registry.
         # extraRoots:
         #   - /Users/me/work

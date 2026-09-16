@@ -68,6 +68,8 @@ window.__ModuleLoader__.load({
 .gr-scan{flex:none;max-height:44%;min-height:78px;overflow:auto;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.22))}
 .gr-scan--collapsed{max-height:none;overflow:visible}
 .gr-scanHead{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:6px;padding:5px 9px;background:var(--dsw-alias-bg-base,#fff);border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.14))}
+.gr-scanHint{display:flex;align-items:center;gap:5px;padding:4px 9px;font-size:11px;color:var(--dsw-alias-state-warning-primary,#b7791f);background:rgba(183,121,31,.1);border-bottom:1px solid rgba(183,121,31,.22)}
+.gr-scanNote{display:flex;align-items:center;padding:3px 9px;font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
 .gr-repo{display:flex;align-items:center;gap:6px;padding:5px 9px 5px 9px;cursor:pointer;border-left:2px solid transparent}
 .gr-repo:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.1))}
 .gr-repo[data-active="true"]{background:var(--dsw-alias-interactive-bg-selected,rgba(59,110,245,.12));border-left-color:var(--dsw-alias-state-business-primary,#3b6ef5)}
@@ -707,7 +709,30 @@ window.__ModuleLoader__.load({
           ])
         })
 
-      const scan = h('div', { className: `gr-scan${scanCollapsed ? ' gr-scan--collapsed' : ''}` }, [scanHead, ...scanList])
+      // Two different kinds of "short", told apart on purpose:
+      // - the depth boundary is policy, and normal on a deep tree → a caption;
+      // - an exhausted directory budget is the safety valve tripping, which
+      //   can stop the scan mid-tree → a warning.
+      // Either way the list never just looks empty for no stated reason.
+      const discovery = list?.discovery
+      const scanHint = discovery?.entryLimited
+        ? h('div', {
+          className: 'gr-scanHint',
+          key: 'budget',
+          title: `本次扫描访问了 ${discovery.visited} 个目录`,
+        }, [
+          h(Glyph, { path: P.warn, size: 12, key: 'i' }),
+          h('span', { key: 't' }, `扫描提前结束：目录数达到 ${discovery.maxEntries} 上限，可能有仓库未列出（可调大插件配置 discover.maxEntries）`),
+        ])
+        : discovery?.depthLimited
+          ? h('div', {
+            className: 'gr-scanNote',
+            key: 'depth',
+            title: `本次扫描访问了 ${discovery.visited} 个目录；调大插件配置 discover.maxDepth 可继续下钻`,
+          }, `已扫描 ${discovery.maxDepth} 层，更深的目录未展开`)
+          : null
+
+      const scan = h('div', { className: `gr-scan${scanCollapsed ? ' gr-scan--collapsed' : ''}` }, [scanHead, scanHint, ...scanList])
 
       /* detail */
       const detailHeader = activeRepo ? h('div', { className: 'gr-detailHead' }, [

@@ -3,7 +3,9 @@
  * Engine self-check for `dsh-git-repos`.
  *
  * Runs the host git engine against real repositories on this machine — no DSH,
- * no browser. Usage:
+ * no browser — plus one synthetic tree for the discovery budgets, which need a
+ * shape (a repo below `Assets/<Group>/<Module>`) no handy repo provides.
+ * Usage:
  *
  *     node tools/check.mjs [root]
  *
@@ -11,9 +13,11 @@
  * assertion so it can gate a change to `lib/git.js`.
  */
 
-import { discoverRepositories, findRepoRoot, status, branches, log, remotes, worktrees, stashes, summary, parseRemoteUrl } from '../lib/git.js'
+import { DEFAULT_MAX_DEPTH, discoverRepositories, discoverRepositoriesDetailed, findRepoRoot, status, branches, log, remotes, worktrees, stashes, summary, parseRemoteUrl } from '../lib/git.js'
 import { describeRemote, webUrl } from '../lib/gitlab.js'
-import { resolve } from 'node:path'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 // Default to the repository that contains the current directory, so a bare
 // `npm run check` always has real git data to exercise. Several assertions
@@ -69,9 +73,43 @@ check('new MR carries source branch',
 check('commit link', webUrl(remote, { kind: 'commit', sha: 'abc123' }) === 'https://gitlab.com/group/proj/-/commit/abc123')
 
 console.log(`\n# discovery under ${root}`)
-const repos = await discoverRepositories(root, { maxDepth: 4, limit: 60 })
+const repos = await discoverRepositories(root)
 check('found at least one repository', repos.length > 0, `found ${repos.length}`)
 for (const repo of repos) console.log(`     ${repo}`)
+
+console.log(`\n# discovery budgets (synthetic tree)`)
+// A shallow repo plus one at `Assets/<Group>/<Module>` — depth 5, the shape a
+// Unity workbench uses for its sibling checkouts. Only a `.git` entry is
+// needed: discovery classifies by name and never asks git.
+const fixture = await mkdtemp(join(tmpdir(), 'dsh-git-repos-check-'))
+try {
+  const shallow = join(fixture, 'flat-repo')
+  const deep = join(fixture, 'unity', 'uframework', 'Assets', 'JJGame', 'chinachess')
+  for (const dir of [shallow, deep]) {
+    await mkdir(join(dir, '.git'), { recursive: true })
+    await mkdir(join(dir, 'sub'), { recursive: true })
+  }
+  await mkdir(join(fixture, 'unity', 'uframework', 'Library', 'nested-repo', '.git'), { recursive: true })
+
+  const byDefault = await discoverRepositoriesDetailed(fixture)
+  check('default depth reaches Assets/<Group>/<Module>', byDefault.roots.includes(deep), `roots=${byDefault.roots.length}`)
+  check('default depth covers a deep workbench',
+    byDefault.maxDepth === DEFAULT_MAX_DEPTH && DEFAULT_MAX_DEPTH >= 5, String(byDefault.maxDepth))
+  check('deep-but-pruned directories are still skipped',
+    !byDefault.roots.some((entry) => entry.includes('Library')), byDefault.roots.join(', '))
+  check('a complete scan reports no budget truncation',
+    byDefault.depthLimited === false && byDefault.entryLimited === false)
+
+  const shallowOnly = await discoverRepositoriesDetailed(fixture, { maxDepth: 4 })
+  check('maxDepth 4 misses the deep repo', !shallowOnly.roots.includes(deep))
+  check('maxDepth 4 admits it hid something', shallowOnly.depthLimited === true)
+  check('maxDepth 5 reaches it', (await discoverRepositoriesDetailed(fixture, { maxDepth: 5 })).roots.includes(deep))
+
+  const squeezed = await discoverRepositoriesDetailed(fixture, { maxEntries: 1 })
+  check('an exhausted directory budget is reported', squeezed.entryLimited === true)
+} finally {
+  await rm(fixture, { recursive: true, force: true })
+}
 
 if (repos.length > 0) {
   const target = repos[0]

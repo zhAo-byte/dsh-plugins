@@ -232,34 +232,103 @@ export async function findRepoRoot(dir) {
 }
 
 /**
+ * Default walk depth.
+ *
+ * Four levels is enough for a flat multi-repo workbench, but not for layouts
+ * where a checkout lives under a group directory: a Unity project keeps its
+ * sibling repositories at `Assets/<Group>/<Module>`, which is depth 5. At the
+ * old default of 4 that whole layer was invisible, and nothing in the result
+ * said the list had been cut — the bug this constant exists to prevent.
+ *
+ * Eight is a *policy* boundary, not a claim of completeness, and the caller is
+ * told when it bites so the panel can say so. That distinction is deliberate:
+ * a 200 GB Unity workbench measures deeper than 24 levels and ~139k
+ * directories, so no affordable fixed depth finishes it, and pretending
+ * otherwise would only hide the boundary again. Eight instead covers every
+ * ordinary container layout (Unity 5, monorepo `packages/<group>/<pkg>` 3,
+ * most others 2–4) for ~0.6s, and anything past it is reported.
+ */
+export const DEFAULT_MAX_DEPTH = 8
+
+/**
+ * Directories visited before the walk gives up.
+ *
+ * This is the safety valve for a pathological tree (or a workspace that is
+ * `$HOME`), and tripping it is an anomaly rather than a policy — the panel
+ * shows it as a warning, unlike the depth boundary. Measured: the 200 GB
+ * workbench above needs ~6.5k directories at the default depth.
+ */
+export const DEFAULT_MAX_ENTRIES = 40_000
+
+/**
+ * Whether an entry is a directory the walk would descend into.
+ *
+ * Keeping this in one place is what makes {@link discoverRepositoriesDetailed}
+ * able to say "the depth budget hid something" instead of just stopping: the
+ * same predicate that would have enqueued a child decides whether skipping it
+ * was a real omission.
+ *
+ * @param entry - one `readdir(..., { withFileTypes: true })` entry.
+ * @returns true when the entry should be descended into.
+ */
+function descendable(entry) {
+  if (!entry.isDirectory() && !entry.isSymbolicLink()) return false
+  if (entry.name.startsWith('.') && entry.name !== '.config') return false
+  return !PRUNE.has(entry.name)
+}
+
+/**
  * Enumerate every repository at or under a root, breadth-first and bounded.
  *
- * A repository is recorded but not descended into twice: nested repositories
- * (submodules, vendored checkouts) are still reported, because a Rider-style
- * tool window is expected to show them separately.
+ * A repository is recorded and still descended into: nested repositories
+ * (submodules, vendored checkouts, sibling clones) are reported separately,
+ * because a Rider-style tool window is expected to show each one.
+ *
+ * Two budgets can cut the walk short, and both are reported rather than
+ * silently applied — a list that is quietly incomplete is the failure mode
+ * this exists to avoid:
+ *
+ * - `maxDepth` stops descending below that level, so deeper repositories are
+ *   never seen (`depthLimited`).
+ * - `maxEntries` stops reading directories altogether (`entryLimited`).
  *
  * @param root - absolute directory to scan.
- * @param options - `maxDepth` and `limit` bound the walk; `maxEntries` bounds
- *   the number of directories visited even when neither limit is reached.
- * @returns absolute repo roots, shallowest first.
+ * @param options - `maxDepth`, `limit`, and `maxEntries` bound the walk.
+ * @returns the absolute repo roots (path-ordered) plus the budget facts.
  */
-export async function discoverRepositories(root, options = {}) {
-  const maxDepth = options.maxDepth ?? 4
+export async function discoverRepositoriesDetailed(root, options = {}) {
+  const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH
   const limit = options.limit ?? 60
-  const maxEntries = options.maxEntries ?? 20_000
+  const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES
   const found = []
   const seen = new Set()
   let visited = 0
+  let depthLimited = false
+  let entryLimited = false
 
   /** @type {Array<{ dir: string, depth: number }>} */
   let frontier = [{ dir: root, depth: 0 }]
+
+  const done = () => ({
+    // Order by path so the list is stable across scans.
+    roots: found.sort(),
+    visited,
+    depthLimited,
+    entryLimited,
+    maxDepth,
+    maxEntries,
+    limit,
+  })
 
   while (frontier.length > 0) {
     const next = []
     // One level at a time, entries read in parallel but results applied in order.
     const listings = await Promise.all(frontier.map(async (node) => {
       visited += 1
-      if (visited > maxEntries) return { node, entries: [] }
+      if (visited > maxEntries) {
+        entryLimited = true
+        return { node, entries: [] }
+      }
       try {
         const entries = await readdir(node.dir, { withFileTypes: true })
         return { node, entries }
@@ -273,21 +342,34 @@ export async function discoverRepositories(root, options = {}) {
       if (hasGit && !seen.has(node.dir)) {
         seen.add(node.dir)
         found.push(node.dir)
-        if (found.length >= limit) return found
+        if (found.length >= limit) return done()
       }
-      if (node.depth >= maxDepth) continue
+      if (node.depth >= maxDepth) {
+        // Only children we would really have visited count as hidden.
+        if (entries.some(descendable)) depthLimited = true
+        continue
+      }
       for (const entry of entries) {
-        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
-        if (entry.name.startsWith('.') && entry.name !== '.config') continue
-        if (PRUNE.has(entry.name)) continue
+        if (!descendable(entry)) continue
         next.push({ dir: join(node.dir, entry.name), depth: node.depth + 1 })
       }
     }
     frontier = next
   }
 
-  // Order by path so the list is stable across scans.
-  return found.sort()
+  return done()
+}
+
+/**
+ * Array-only form of {@link discoverRepositoriesDetailed}.
+ *
+ * @param root - absolute directory to scan.
+ * @param options - forwarded to the detailed variant.
+ * @returns absolute repo roots, path-ordered.
+ */
+export async function discoverRepositories(root, options = {}) {
+  const result = await discoverRepositoriesDetailed(root, options)
+  return result.roots
 }
 
 /**

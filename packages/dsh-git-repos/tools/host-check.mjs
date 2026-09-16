@@ -7,14 +7,24 @@
  * the browser half actually talks to, so the guards (cross-site refusal,
  * containment) are asserted here rather than assumed.
  *
- *     node tools/host-check.mjs [root]
+ *     node tools/host-check.mjs [root] [expectedRepos]
+ *
+ * `root` defaults to the current directory. Pass `expectedRepos` to run the
+ * same assertions against a real workbench and require at least that many
+ * repositories — the way to prove that nested checkouts are actually listed:
+ *
+ *     node tools/host-check.mjs ~/Desktop/602 23
  */
 
 import http from 'node:http'
 
 import { apply as applyHost } from '../lib/index.js'
+import { DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTRIES } from '../lib/git.js'
 
 const root = process.argv[2] ?? process.cwd()
+// Optional floor for `repos.list`, so this harness can be pointed at a real
+// workbench and assert how many repositories the panel would show.
+const expectedRepos = process.argv[3] === undefined ? undefined : Number(process.argv[3])
 let failures = 0
 
 /**
@@ -60,7 +70,11 @@ const ctx = {
   },
 }
 
-applyHost(ctx, { discover: { maxDepth: 3, limit: 20 } })
+// A non-default budget proves the echo is the config and not a coincidence;
+// pointed at a real workbench, the shipped defaults are what the panel will
+// really use, so the repository count means something.
+const pluginConfig = expectedRepos === undefined ? { discover: { maxDepth: 3, limit: 20 } } : {}
+applyHost(ctx, pluginConfig)
 
 console.log('\n# registration')
 check('one prefix route registered', routes.length === 1, JSON.stringify(routes.map((r) => r.path)))
@@ -125,6 +139,26 @@ check('each row carries change counts', typeof first?.counts?.changed === 'numbe
 check('remotes are classified', Array.isArray(first?.remotes)
   && first.remotes.every((remote) => ['gitlab', 'local', 'other'].includes(remote.hosting)),
   JSON.stringify(first?.remotes?.map((r) => r.hosting)))
+// The panel reads `discovery` to explain a short list, so the envelope and the
+// config that produced it must survive the route, not just the engine.
+const discovery = listing.body?.value?.discovery
+check('listing carries the discovery envelope',
+  discovery && typeof discovery.visited === 'number'
+  && typeof discovery.depthLimited === 'boolean' && typeof discovery.entryLimited === 'boolean',
+  JSON.stringify(discovery))
+check('discovery echoes the configured budgets',
+  discovery?.maxDepth === (expectedRepos === undefined ? 3 : DEFAULT_MAX_DEPTH)
+  && discovery?.maxEntries === DEFAULT_MAX_ENTRIES, JSON.stringify(discovery))
+// `single` means the root was handed back without a walk (fewer than one row
+// would be wrong; more would mean the fallback overrode the walk).
+check('the envelope is consistent with the rows it describes',
+  discovery?.single === true ? repos.length === 1 : repos.length >= 1, JSON.stringify(discovery))
+if (expectedRepos !== undefined) {
+  check(`listing reaches every repository (>= ${expectedRepos})`,
+    repos.length >= expectedRepos, `found ${repos.length}`)
+  check('the rows carry repo-relative paths',
+    repos.every((row) => typeof row.relPath === 'string'), JSON.stringify(repos.map((row) => row.relPath)))
+}
 
 console.log('\n# repository detail')
 const target = first?.root ?? root

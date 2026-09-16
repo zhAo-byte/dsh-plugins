@@ -108,8 +108,11 @@ function normalizeConfig(raw) {
   const discover = config.discover && typeof config.discover === 'object' ? config.discover : {}
   const timeouts = config.timeouts && typeof config.timeouts === 'object' ? config.timeouts : {}
   return {
-    maxDepth: clamp(Number(discover.maxDepth) || 4, 1, 8),
+    // Covers the ordinary container layouts; the ceiling lets a deeper monorepo
+    // be scanned deliberately, and either budget is reported when it bites.
+    maxDepth: clamp(Number(discover.maxDepth) || gitEngine.DEFAULT_MAX_DEPTH, 1, 24),
     limit: clamp(Number(discover.limit) || 60, 1, 400),
+    maxEntries: clamp(Number(discover.maxEntries) || gitEngine.DEFAULT_MAX_ENTRIES, 1_000, 2_000_000),
     extraRoots: Array.isArray(config.extraRoots) ? config.extraRoots.filter((v) => typeof v === 'string') : [],
     allowHome: config.allowHome !== false,
     gitlabHosts: Array.isArray(config.gitlabHosts) ? config.gitlabHosts.filter((v) => typeof v === 'string') : [],
@@ -221,7 +224,7 @@ function buildMethods(ctx, config) {
         version: 1,
         roots,
         gitlab: { hosts: config.gitlabHosts, tokenConfigured: Boolean(config.token) },
-        discover: { maxDepth: config.maxDepth, limit: config.limit },
+        discover: { maxDepth: config.maxDepth, limit: config.limit, maxEntries: config.maxEntries },
       }
     },
 
@@ -247,15 +250,38 @@ function buildMethods(ctx, config) {
       const info = await stat(root).catch(() => undefined)
       if (!info?.isDirectory()) throw new HttpError(400, `not a directory: ${root}`)
 
-      const bare = await gitEngine.isRepository(root)
-      let roots = []
-      if (bare) {
-        roots = [root]
-      } else {
-        roots = await gitEngine.discoverRepositories(root, {
-          maxDepth: config.maxDepth,
-          limit: config.limit,
-        })
+      // A root that is itself a repository is not a reason to stop looking —
+      // it is exactly where nested ones live: sibling checkouts under a Unity
+      // `Assets/`, vendored clones, submodules. This used to short-circuit on
+      // "the root is a repo" and return the root alone, which is why a
+      // workspace like a game project showed one row and none of its modules.
+      const scan = await gitEngine.discoverRepositoriesDetailed(root, {
+        maxDepth: config.maxDepth,
+        limit: config.limit,
+        maxEntries: config.maxEntries,
+      })
+      let roots = scan.roots
+      // Nothing under the root carries its own `.git`. Then the root is either
+      // a bare repository (no `.git` entry to find) or a directory inside a
+      // working tree; one row is right for both, and git resolves the
+      // enclosing repository itself.
+      let single = false
+      if (roots.length === 0) {
+        const top = await gitEngine.findRepoRoot(root)
+        if (top !== undefined || await gitEngine.isRepository(root)) {
+          roots = [root]
+          single = true
+        }
+      }
+
+      // Carried to the panel so an incomplete list can say why it is short.
+      const discovery = {
+        single,
+        visited: scan.visited,
+        maxDepth: scan.maxDepth,
+        maxEntries: scan.maxEntries,
+        depthLimited: scan.depthLimited,
+        entryLimited: scan.entryLimited,
       }
 
       const repos = await mapLimit(roots, 6, async (repoRoot) => {
@@ -273,6 +299,7 @@ function buildMethods(ctx, config) {
         repos,
         scanned: roots.length,
         truncated: roots.length >= config.limit,
+        discovery,
         generatedAt: new Date().toISOString(),
       }
     },
