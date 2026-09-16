@@ -377,7 +377,12 @@ relay 根本收不到。relay 拿到这个头之后只给 HTML 注入一个 `<ba
 ### 3·5、服务器上的代码在哪（部署后必读）
 
 中转台的代码放在服务器 **`/opt/dsh-remote-control/`**，而且**它现在是一个 git 检出**，
-不是散装上传的文件——这样可以随时确认线上跑的是哪一版，也能直接 `git pull` 更新。
+不是散装上传的文件——这样可以随时确认线上跑的是哪一版，也能直接更新。
+
+> **服务器连不上 GitHub。** 实测 DNS 能解析（`github.com` → `20.205.243.166`），
+> 但 `curl https://github.com` 和 `git ls-remote origin main` 都一路挂到超时（exit 124）。
+> 所以 `git pull` **在服务器上是跑不通的**——不是配置写错，是出站被挡。
+> 更新只能走下面的 `git bundle`，从本机把提交带过去。
 
 ```
 /opt/dsh-remote-control/                                  ← git 检出（完整 monorepo）
@@ -393,12 +398,29 @@ relay 根本收不到。relay 拿到这个头之后只给 HTML 注入一个 `<ba
 > 改单元文件后**必须 `daemon-reload`**，否则 systemd 会继续用缓存里的旧路径去启动，
 > 表现为服务反复 `activating (auto-restart)` + 日志里 `MODULE_NOT_FOUND`。
 
-更新线上代码：
+更新线上代码（服务器拉不到 GitHub，所以由本机把提交带过去）：
 
 ```sh
-cd /opt/dsh-remote-control && sudo -u ubuntu git pull
+# 本机：把 main 打成一个自包含的 bundle
+git bundle create /tmp/rc-deploy.bundle main
+scp -i ~/.codex/keys/minigame-public-server.pem \
+    /tmp/rc-deploy.bundle ubuntu@49.232.148.72:/tmp/
+
+# 服务器：快进到 bundle 里的提交
+cd /opt/dsh-remote-control
+git fetch /tmp/rc-deploy.bundle main
+git merge --ff-only FETCH_HEAD     # 非快进会直接失败，不会悄悄造出一个合并提交
 sudo systemctl restart dsh-remote-relay
+rm -f /tmp/rc-deploy.bundle
 ```
+
+> **为什么用 bundle 而不是 `rsync` 覆盖文件。** 中转台是 git 检出这件事的价值，全在于
+> 「线上跑的是哪一版」有唯一答案。rsync 会把工作区改脏，`git log` 于是开始说谎，
+> 而那恰恰是这个目录当初改成检出的原因。bundle 让服务器的 `HEAD` 真正前进，
+> 以后出站恢复了再 `git pull` 也能正常快进。
+
+`git merge --ff-only` 之后顺手 `git log --oneline -1` 确认 `HEAD` 就是你要的那一版；
+两台机器（本机 / 服务器）版本不一致时，先比这个哈希再排查别的。
 
 改过单元文件的话，restart 之前先 `sudo systemctl daemon-reload`。
 
