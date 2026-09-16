@@ -309,37 +309,52 @@ export async function apply(ctx, config) {
       .then(() => start(prepared, scopedContext))
   }
 
-  // Start from the composed YAML configuration first, so a deployment that
-  // configures the node in `cordis.patch.yml` behaves exactly as before and does
-  // not depend on the settings service being present at all.
+  // ── the settings namespace, registered independently of the node ──────────
+  //
+  // This ordering is load-bearing. Registration used to happen inside the same
+  // injection as starting the node, after `applyConfig(config)` — and because an
+  // incomplete configuration returns early, a node with no token yet never
+  // registered its namespace either. The configuration card therefore could not
+  // appear, and the card is exactly how the operator supplies the missing token.
+  // The deadlock was invisible for as long as the token was written into the YAML.
+  //
+  // So the namespace is installed from its own injection, which waits only on
+  // `settings`. `installSection` packages the optional-service wiring, including
+  // falling back to the composed entry when the service is absent.
+  if (settingsSchema !== undefined) {
+    ctx.inject(['settings'], (settingsCtx) => {
+      // Synchronous on purpose: registration is a fiber effect, and creating one
+      // from a later microtask failed with "cannot create effect on inactive context".
+      try {
+        settingsCtx.settings.installSection(ctx, 'remote-control', settingsSchema, config, {
+          setSource: (source) => {
+            // A GUI edit becomes both the live source and the trigger to reconfigure.
+            currentSource = source
+          },
+          onChange: () => {
+            applyConfig(currentSource())
+          }
+        })
+      } catch (error) {
+        report(
+          logger,
+          'warn',
+          `settings are not editable from the GUI (${error?.message ?? error}); the YAML configuration still applies`
+        )
+      }
+    })
+  }
+
+  // Start from the composed configuration first, so a deployment that configures
+  // the node in `cordis.patch.yml` behaves exactly as before and does not depend on
+  // the settings service being present at all.
   applyConfig(config)
 
   ctx.inject(REQUIRED_SERVICES, (scoped) => {
     scopedContext = scoped
-    // Re-apply now that the services exist, then follow the settings namespace so
-    // an edit in the GUI takes effect without restarting the backend.
-    if (settingsSchema !== undefined) {
-      ctx.inject(['settings'], (settingsCtx) => {
-        // Synchronous on purpose: registration is a fiber effect, and creating one
-        // from a later microtask is what produced "inactive context".
-        try {
-          settingsCtx.settings.installSection(ctx, 'remote-control', settingsSchema, config, {
-            setSource: (source) => {
-              currentSource = source
-            },
-            onChange: () => {
-              applyConfig(currentSource())
-            }
-          })
-        } catch (error) {
-          report(logger, 'warn', `settings are not editable from the GUI (${error?.message ?? error}); the YAML configuration still applies`)
-        }
-      })
-    }
-    if (pending !== undefined) {
-      const prepared = pending
-      start(prepared, scoped)
-    }
+    // Re-apply now that the services exist; the settings watcher above is already
+    // installed, so any later GUI edit reconfigures without a restart.
+    if (pending !== undefined) start(pending, scoped)
   })
 
   // The outer lifetime owns the sessions: the Harness keeps a session alive after

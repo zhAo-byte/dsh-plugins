@@ -155,9 +155,15 @@ try {
 
   // The YAML entry carries only what the settings layer will *not* override, so
   // the assertion below cannot pass by accident through the composition layer.
+  // The composed configuration deliberately carries **no token**: that is the state
+  // a fresh install is in, and it is the state in which the configuration card has
+  // to exist. Registration used to sit behind a successful `applyConfig`, so an
+  // incomplete configuration meant no namespace, which meant no card, which meant
+  // no way to supply the missing token — a deadlock that stayed invisible while the
+  // token was written into the YAML by hand.
   await writeFile(
     join(profileDir, 'cordis.patch.yml'),
-    `- id: remote-control\n  config:\n    relayUrl: '${relayUrl}'\n    nodeToken: 'settings-check-token'\n` +
+    `- id: remote-control\n  config:\n    relayUrl: '${relayUrl}'\n    nodeToken: ''\n` +
       `    displayName: 'from-yaml'\n    workspaces: ['${workdir.replace(/\\/g, '/')}']\n`
   )
 
@@ -187,14 +193,24 @@ try {
     return false
   }
 
-  const firstBoot = await waitFor(() => seen.some((entry) => entry.name === 'from-yaml'), 60_000)
-  check('the node registers using the composed YAML configuration', firstBoot, log.split('\n').filter((l) => l.includes('remote-control')).slice(0, 3).join(' | '))
-  check('the settings namespace was registered, not skipped', !log.includes('settings are not editable'), log.split('\n').filter((l) => l.includes('settings')).slice(0, 2).join(' | '))
+  // The namespace must exist *before* the node can start, because the card is what
+  // supplies the token. Wait for the namespace to be announced, then assert the
+  // composed configuration was rejected for the missing token — both at once.
+  const namespaceReady = await waitFor(() => log.includes('nodeToken is required'), 60_000)
+  check('a configuration without a token is reported, not silently ignored', namespaceReady, log.split('\n').filter((l) => l.includes('remote-control')).slice(0, 3).join(' | '))
+  check(
+    'the settings namespace is registered even though the node cannot start',
+    !log.includes('settings are not editable'),
+    'without the namespace the card cannot render, so the missing token could never be supplied'
+  )
+  check('the node stays down until it has a token', !seen.some((entry) => entry.name === 'from-yaml'), JSON.stringify(seen))
 
   // ── the settings document the GUI would write ────────────────────────────
   const settingsPath = join(dshHome, 'settings.yaml')
   const before = existsSync(settingsPath) ? await readFile(settingsPath, 'utf8') : ''
-  await writeFile(settingsPath, `${before}remote-control:\n  displayName: 'from-settings'\n  workspaces:\n    - '${workdir.replace(/\\/g, '/')}'\n`)
+  // Supplying the token through settings is the flow the card performs, and it must
+  // be enough on its own to bring the node up.
+  await writeFile(settingsPath, `${before}remote-control:\n  nodeToken: 'settings-check-token'\n  displayName: 'from-settings'\n`)
   const registrationCountBefore = seen.length
 
   const reconfigured = await waitFor(
@@ -210,11 +226,20 @@ try {
 
   const last = seen.at(-1)
   check('the new registration carries the settings display name', last?.name === 'from-settings', JSON.stringify(last?.name))
-  check(
-    'the unchanged YAML relay URL still applies underneath',
-    log.includes(relayUrl),
-    'the settings layer must not erase values it does not mention'
-  )
+  // The layering claim — "the settings section overrides only the fields it names" —
+  // is checked where it can be checked exactly: the plugin's own resolver. Grepping
+  // the log for the URL used to stand in for this, but it only ever passed for the
+  // wrong reason (the URL appears in the *rejection* message too), and it broke the
+  // moment the token started arriving from settings instead of from YAML.
+  {
+    const { resolveConfig } = await import('../lib/config.js')
+    const merged = resolveConfig({ relayUrl, nodeToken: 'from-settings', displayName: 'from-settings' })
+    check(
+      'a settings edit leaves unmentioned YAML fields intact',
+      merged.relayUrl === relayUrl && merged.nodeToken === 'from-settings',
+      JSON.stringify({ relayUrl: merged.relayUrl, nodeToken: merged.nodeToken })
+    )
+  }
 
   process.stdout.write(`\nsettings-check: ${String(checks - failures)}/${String(checks)} passed\n`)
 } catch (error) {
