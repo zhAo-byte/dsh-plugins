@@ -1,0 +1,62 @@
+# dsh-remote-control relay — systemd unit
+#
+# Install:
+#   sudo cp deploy/dsh-remote-relay.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now dsh-remote-relay
+#
+# The relay holds both shared secrets, so the unit is written to a file only root
+# can read. The service itself runs unprivileged and binds loopback only: the
+# public listener is nginx's, so TLS and the real certificate stay in one place.
+
+[Unit]
+Description=DeepSeek Harness remote-control relay
+Documentation=https://github.com/OWNER/dsh-remote-control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_SERVICE_USER
+Group=REPLACE_WITH_SERVICE_USER
+WorkingDirectory=/opt/dsh-remote-control
+
+# Secrets live here, mode 0600, owned by the service user. Create it with:
+#   printf 'DSH_REMOTE_AGENT_TOKEN=%s\nDSH_REMOTE_CONTROL_TOKEN=%s\n' \
+#     "$(openssl rand -base64 36 | tr -d '/+=')" \
+#     "$(openssl rand -base64 36 | tr -d '/+=')" \
+#     | sudo tee /etc/dsh-remote-relay.env >/dev/null
+#   sudo chmod 600 /etc/dsh-remote-relay.env
+EnvironmentFile=/etc/dsh-remote-relay.env
+Environment=DSH_REMOTE_RELAY_HOST=127.0.0.1
+Environment=DSH_REMOTE_RELAY_PORT=8787
+
+ExecStart=/usr/bin/node /opt/dsh-remote-control/relay/server.js
+
+Restart=on-failure
+RestartSec=3
+
+# Hardening, kept deliberately conservative. The relay is a plain Node process,
+# and several of the stricter systemd sandbox flags are known to break V8
+# outright rather than to tighten it:
+#
+#   MemoryDenyWriteExecute=true   kills the JIT: V8 needs W+X memory, so node
+#                                 fails to start instead of running sandboxed.
+#   RestrictAddressFamilies=...   dropping AF_UNIX breaks systemd socket
+#                                 activation, journald logging, and DNS on
+#                                 systemd-resolved hosts.
+#   PrivateDevices=true           hides /dev/urandom, which anything doing
+#                                 crypto or UUIDs needs.
+#
+# What is left is the part with no such footguns: no new privileges, a private
+# /tmp, a read-only view of the system, and no visibility into other users'
+# home directories. The relay writes nothing, so nothing is lost.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,130 @@
+name: checks
+
+# One workflow for the whole repo, one job per package. Keeping them separate
+# rather than folding both packages into a single command is deliberate: a
+# failure should name the package that broke, not leave you reading a merged log.
+#
+# `dsh-remote-control` runs on all three platforms because Windows is an explicit
+# target for it, and the core job there refuses to install anything so that
+# "zero runtime dependencies" is proven rather than assumed.
+#
+# `dsh-codex-bridge` reads the operator's own ~/.codex to discover skills and MCP
+# servers, so its checks are only meaningful against a real Codex home. Rather
+# than fabricate one and get a green badge that means nothing, this job stops at
+# the syntax gate and says so. Run its checks locally (see the root README).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remote-control:
+    name: dsh-remote-control (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: packages/dsh-remote-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No `npm install` anywhere in this job. The package must keep working with
+      # nothing but Node, so the check asserts that instead of relying on a
+      # lockfile that quietly supplies something.
+      - name: Verify no runtime dependencies
+        shell: bash
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            const deps = Object.keys(pkg.dependencies ?? {});
+            if (deps.length > 0) {
+              console.error('runtime dependencies are not allowed:', deps.join(', '));
+              process.exit(1);
+            }
+            console.log('no runtime dependencies: ok');
+          "
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Relay, node, and runner checks
+        run: npm test
+
+  remote-control-ui:
+    name: dsh-remote-control control page
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/dsh-remote-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install a browser
+        run: npx --yes playwright@latest install chromium --with-deps
+      - name: Drive the page in a real browser
+        run: npm run test:ui
+
+  remote-control-harness:
+    name: dsh-remote-control real Harness boot
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/dsh-remote-control
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install the Harness launcher
+        run: |
+          mkdir -p "$RUNNER_TEMP/dsh-runtime"
+          npm install --prefix "$RUNNER_TEMP/dsh-runtime" @deepseek-ai/dsh@0.1.5-rc.2
+      - name: Boot an isolated profile with the plugin mounted
+        env:
+          DSH_BIN: ${{ runner.temp }}/dsh-runtime/node_modules/.bin/dsh
+        run: |
+          # The runner resolves `@deepseek-ai/*` by walking up from its own file,
+          # so linking the freshly installed packages into the package directory
+          # is enough; no extra environment variable is needed.
+          mkdir -p node_modules
+          ln -sfn "$RUNNER_TEMP/dsh-runtime/node_modules/@deepseek-ai" node_modules/@deepseek-ai
+          npm run test:live
+
+  codex-bridge:
+    name: dsh-codex-bridge syntax
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/dsh-codex-bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax check every source file
+        run: |
+          status=0
+          for f in lib/*.js client/lib/*.js tools/*.mjs; do
+            node --check "$f" || status=1
+          done
+          exit $status
+      - name: Explain the boundary
+        run: |
+          echo "Full checks are intentionally not run here."
+          echo "tools/*-check.mjs read the operator's ~/.codex (skills, MCP servers,"
+          echo "login state). Against an empty fixture home they would report zero"
+          echo "skills and zero MCP servers, which passes while proving nothing."
+          echo "Run them on a machine with a real Codex home; see the root README."

@@ -1,0 +1,43 @@
+{
+  "name": "dsh-codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek Harness bridge for the Codex ecosystem: one bundle that exposes Codex skills (catalog) and Codex MCP servers (tools) to DSH agents",
+  "type": "module",
+  "main": "lib/skill.js",
+  "exports": {
+    ".": "./lib/skill.js",
+    "./mcp": "./lib/mcp.js",
+    "./auth": "./lib/auth.js",
+    "./panel": "./lib/panel.js",
+    "./status": "./lib/status.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "codex",
+    "skill",
+    "mcp"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-mcp-client": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-skill": "^0.1.5-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "yaml": "^2.4.2"
+  }
+}

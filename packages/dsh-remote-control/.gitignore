@@ -1,0 +1,11 @@
+# The DSH packages are linked in locally for development only; an installed
+# profile supplies them as peer dependencies. See README section 9.
+node_modules/
+
+# Scratch output from the self-check scripts.
+*.log
+
+# A development symlink to the installed Harness packages. It makes the checks
+# runnable in this checkout, but it must never travel: an installed profile
+# supplies these as peer dependencies, and a stale link would shadow them.
+node_modules/@deepseek-ai

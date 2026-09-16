@@ -1,0 +1,29 @@
+# The dsh-codex-bridge bundle patch: one row per concern, one package (plus the
+# browser half in its own package — see below).
+#
+# `skill-codex` publishes Codex skills into `ctx.skills`, `mcp-codex` publishes
+# Codex MCP servers into `ctx.tools`, and `codex-auth` reports the Codex login
+# state once at boot (read-only — it never runs `codex login` and never writes
+# to $CODEX_HOME). `codex-panel` publishes the read-only summary the browser
+# card renders, and `codex-panel-client` is that card. Any row can be overridden
+# or disabled by id from the user patch layer.
+#
+# The browser half is a separate package on purpose: `dsh-client-modules`
+# rejects two active Loader sources resolving to one client package name, and
+# this bundle mounts four rows of `dsh-codex-bridge`.
+
+- insert:
+    - id: skill-codex
+      name: 'dsh-codex-bridge'
+
+    - id: mcp-codex
+      name: 'dsh-codex-bridge/mcp'
+
+    - id: codex-auth
+      name: 'dsh-codex-bridge/auth'
+
+    - id: codex-panel
+      name: 'dsh-codex-bridge/panel'
+
+    - id: codex-panel-client
+      name: 'dsh-codex-bridge-client'

@@ -1,0 +1,13 @@
+# 依赖只存在于本机，用来让自检能在仓内直接跑。
+#
+# `packages/*/node_modules/@deepseek-ai` 是指向正在运行的 Harness 的软链，
+# `yaml` 指向上游安装的一份。装了 profile 之后这些由 profile 作为
+# peerDependency 提供，所以任何一份都不该进版本库——一条指向别人机器
+# 绝对路径的软链，push 上去只会让 clone 下来的人困惑。
+node_modules/
+
+# `dsh plugin add` 在 profile 里产生的 lockfile。
+pnpm-lock.yaml
+
+# 自检的临时输出。
+*.log

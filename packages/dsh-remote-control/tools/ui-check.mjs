@@ -1,0 +1,695 @@
+#!/usr/bin/env node
+/**
+ * `ui-check` — drive the control page in a real browser, through the whole loop.
+ *
+ * The relay and node checks prove the wire works; they say nothing about the
+ * page, and the page is what a person actually uses. A renamed element id, a
+ * typo in the inline script, or an event stream that never renders would leave a
+ * relay that passes every other check next to a page that does nothing.
+ *
+ * So this drives the real `relay/public/index.html` in headless Chromium over the
+ * DevTools protocol: it seeds the token the way the page expects to find it,
+ * loads the real page against a real relay, types a question, clicks the page's
+ * own send button, and then plays the part of a node — picking the command up off
+ * the long-poll, answering it, and asserting the answer renders on the page. That
+ * last step is the point: it is the only check in this project that exercises the
+ * browser's half of the full round trip.
+ *
+ * It needs a Chromium binary. One is looked up in the Playwright cache by
+ * default, or taken from `DSH_REMOTE_CHROMIUM`; with none available the check
+ * reports a skip rather than a failure, because a missing browser is not a defect
+ * in this project.
+ *
+ * @module dsh-remote-control/tools/ui-check
+ */
+
+import { spawn } from 'node:child_process'
+import { createServer } from 'node:http'
+import { readdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const PACKAGE_ROOT = join(HERE, '..')
+const SERVER = join(PACKAGE_ROOT, 'relay', 'server.js')
+
+const AGENT_TOKEN = 'ui-check-agent-token'
+const CONTROL_TOKEN = 'ui-check-control-token'
+
+let failures = 0
+let checks = 0
+
+/**
+ * Record one assertion.
+ *
+ * @param {string} what - what is being asserted.
+ * @param {boolean} ok - whether it held.
+ * @param {string} [detail] - extra context on failure.
+ */
+function check(what, ok, detail = '') {
+  checks += 1
+  if (ok) {
+    process.stdout.write(`  \u2713 ${what}\n`)
+    return
+  }
+  failures += 1
+  process.stdout.write(`  \u2717 ${what}${detail === '' ? '' : ` — ${detail}`}\n`)
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Find a Chromium binary.
+ *
+ * @returns {Promise<string|undefined>} the executable path.
+ */
+async function findChromium() {
+  if (typeof process.env.DSH_REMOTE_CHROMIUM === 'string' && existsSync(process.env.DSH_REMOTE_CHROMIUM)) {
+    return process.env.DSH_REMOTE_CHROMIUM
+  }
+  const roots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    join(homedir(), 'Library', 'Caches', 'ms-playwright'),
+    join(homedir(), '.cache', 'ms-playwright')
+  ].filter((entry) => typeof entry === 'string' && entry !== '')
+  for (const root of roots) {
+    if (!existsSync(root)) continue
+    const entries = (await readdir(root).catch(() => [])).sort().reverse()
+    for (const entry of entries) {
+      if (!entry.startsWith('chromium')) continue
+      for (const relative of [
+        ['chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'],
+        ['chrome-mac-arm64', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'],
+        ['chrome-linux', 'chrome'],
+        ['chrome-win', 'chrome.exe']
+      ]) {
+        const candidate = join(root, entry, ...relative)
+        if (existsSync(candidate)) return candidate
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * Wait for a Chromium DevTools endpoint to answer.
+ *
+ * Reading the WebSocket URL from stderr is how a browser with
+ * `--remote-debugging-port=0` avoids a port race.
+ *
+ * @param {import('node:child_process').ChildProcess} child - browser process.
+ * @returns {Promise<string>} the browser WebSocket URL.
+ */
+function waitForDevTools(child) {
+  return new Promise((resolve, reject) => {
+    let buffered = ''
+    const timer = setTimeout(() => reject(new Error('chromium never announced a DevTools endpoint')), 30_000)
+    const scan = (chunk) => {
+      buffered += chunk
+      const match = /ws:\/\/[^\s]+/.exec(buffered)
+      if (match !== null) {
+        clearTimeout(timer)
+        resolve(match[0])
+      }
+    }
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', scan)
+    child.once('exit', (code) => {
+      clearTimeout(timer)
+      reject(new Error(`chromium exited ${String(code)} before DevTools was ready`))
+    })
+  })
+}
+
+/**
+ * A minimal DevTools-protocol client.
+ *
+ * Only three commands are needed (`Target.*`, `Page.*`, `Runtime.evaluate`), so a
+ * full protocol library would be more surface than value — and this project's
+ * self-checks stay dependency-free on purpose.
+ */
+class DevTools {
+  /**
+   * @param {string} url - browser WebSocket URL.
+   */
+  constructor(url) {
+    this.url = url
+    this.nextId = 1
+    this.pending = new Map()
+    this.sessions = new Map()
+  }
+
+  /** @returns {Promise<void>} resolves once connected. */
+  connect() {
+    return new Promise((resolve, reject) => {
+      this.socket = new WebSocket(this.url)
+      this.socket.addEventListener('open', () => resolve())
+      this.socket.addEventListener('error', (event) => reject(new Error(`devtools socket failed: ${event?.message ?? 'error'}`)))
+      this.socket.addEventListener('message', (event) => this.#dispatch(String(event.data)))
+      this.socket.addEventListener('close', () => {
+        for (const { reject: rejectPending } of this.pending.values()) rejectPending(new Error('devtools socket closed'))
+        this.pending.clear()
+      })
+    })
+  }
+
+  /**
+   * Route one protocol message.
+   *
+   * @param {string} raw - message text.
+   */
+  #dispatch(raw) {
+    let message
+    try {
+      message = JSON.parse(raw)
+    } catch {
+      return
+    }
+    if (message.id !== undefined && this.pending.has(message.id)) {
+      const { resolve, reject } = this.pending.get(message.id)
+      this.pending.delete(message.id)
+      if (message.error !== undefined) reject(new Error(`${message.error.message} (${String(message.error.code)})`))
+      else resolve(message.result ?? {})
+      return
+    }
+    const key = message.sessionId
+    if (key !== undefined && message.method !== undefined) {
+      const waiters = this.sessions.get(key)
+      if (waiters !== undefined) waiters.push(message)
+    }
+  }
+
+  /**
+   * Send one protocol command.
+   *
+   * @param {string} method - protocol method.
+   * @param {object} [params] - parameters.
+   * @param {string} [sessionId] - page session.
+   * @returns {Promise<object>} the result.
+   */
+  send(method, params = {}, sessionId) {
+    const id = this.nextId++
+    const payload = { id, method, params }
+    if (sessionId !== undefined) payload.sessionId = sessionId
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+      this.socket.send(JSON.stringify(payload))
+      setTimeout(() => {
+        if (this.pending.delete(id)) reject(new Error(`${method} timed out`))
+      }, 30_000)
+    })
+  }
+
+  /**
+   * Attach to the first page target, creating one if the browser has none.
+   *
+   * @returns {Promise<string>} the page session id.
+   */
+  async attachToPage() {
+    const { targetInfos } = await this.send('Target.getTargets')
+    const page = targetInfos.find((info) => info.type === 'page')
+    const targetId = page?.targetId ?? (await this.send('Target.createTarget', { url: 'about:blank' })).targetId
+    return this.#attach(targetId)
+  }
+
+  /**
+   * Open an additional page target, for checking a second mount point in the
+   * same browser process.
+   *
+   * @returns {Promise<string>} the page session id.
+   */
+  async createPage() {
+    const { targetId } = await this.send('Target.createTarget', { url: 'about:blank' })
+    return this.#attach(targetId)
+  }
+
+  /**
+   * Attach to one target and enable the domains the checks use.
+   *
+   * @param {string} targetId - browser target id.
+   * @returns {Promise<string>} the page session id.
+   */
+  async #attach(targetId) {
+    const { sessionId } = await this.send('Target.attachToTarget', { targetId, flatten: true })
+    await this.send('Page.enable', {}, sessionId)
+    await this.send('Runtime.enable', {}, sessionId)
+    return sessionId
+  }
+
+  /**
+   * Evaluate an expression in the page and return its value.
+   *
+   * @param {string} sessionId - page session.
+   * @param {string} expression - expression to evaluate.
+   * @returns {Promise<any>} the value.
+   */
+  async evaluate(sessionId, expression) {
+    const result = await this.send(
+      'Runtime.evaluate',
+      { expression, returnByValue: true, awaitPromise: true },
+      sessionId
+    )
+    if (result.exceptionDetails !== undefined) {
+      throw new Error(`page script threw: ${result.exceptionDetails.exception?.description ?? result.exceptionDetails.text}`)
+    }
+    return result.result?.value
+  }
+
+  /**
+   * Navigate and wait for the load event.
+   *
+   * @param {string} sessionId - page session.
+   * @param {string} url - destination.
+   * @returns {Promise<void>} resolves after load.
+   */
+  async navigate(sessionId, url) {
+    const loaded = new Promise((resolve) => {
+      const waiters = this.sessions.get(sessionId) ?? []
+      this.sessions.set(sessionId, waiters)
+      const poll = setInterval(() => {
+        const index = waiters.findIndex((message) => message.method === 'Page.loadEventFired')
+        if (index >= 0) {
+          waiters.splice(index, 1)
+          clearInterval(poll)
+          resolve()
+        }
+      }, 25)
+      setTimeout(() => {
+        clearInterval(poll)
+        resolve()
+      }, 20_000)
+    })
+    await this.send('Page.navigate', { url }, sessionId)
+    await loaded
+  }
+
+  /** @returns {void} */
+  close() {
+    try {
+      this.socket?.close()
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+const workdir = await mkdtemp(join(tmpdir(), 'dsh-remote-ui-check-'))
+let relay
+let browser
+let devtools
+let keepAlive
+
+try {
+  process.stdout.write('ui-check\n')
+
+  const binary = await findChromium()
+  if (binary === undefined) {
+    process.stdout.write('  \u25CB no Chromium binary found; skipping (set DSH_REMOTE_CHROMIUM to run this)\n')
+    process.stdout.write('ui-check: skipped\n')
+    await rm(workdir, { recursive: true, force: true })
+    process.exit(0)
+  }
+  check('a Chromium binary was found', existsSync(binary))
+
+  // ── a real relay, and a real node identity registered into it ────────────
+  const relayPort = 19_000 + Math.floor(Math.random() * 1_000)
+  const relayUrl = `http://127.0.0.1:${String(relayPort)}`
+  relay = spawn(process.execPath, [SERVER], {
+    env: {
+      ...process.env,
+      DSH_REMOTE_RELAY_HOST: '127.0.0.1',
+      DSH_REMOTE_RELAY_PORT: String(relayPort),
+      DSH_REMOTE_AGENT_TOKEN: AGENT_TOKEN,
+      DSH_REMOTE_CONTROL_TOKEN: CONTROL_TOKEN,
+      DSH_REMOTE_POLL_HOLD_MS: '20000',
+      DSH_REMOTE_OFFLINE_AFTER_MS: '60000'
+    },
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('relay did not start')), 15_000)
+    relay.stdout.setEncoding('utf8')
+    relay.stdout.on('data', (chunk) => {
+      if (String(chunk).includes('listening on')) {
+        clearTimeout(timer)
+        resolve()
+      }
+    })
+    relay.once('exit', (code) => reject(new Error(`relay exited ${String(code)}`)))
+  })
+
+  /**
+   * Call the relay as the node.
+   *
+   * @param {string} path - path.
+   * @param {object} [body] - POST body.
+   * @returns {Promise<object>} parsed body.
+   */
+  const asNode = async (path, body) => {
+    const response = await fetch(`${relayUrl}${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: {
+        authorization: `Bearer ${AGENT_TOKEN}`,
+        ...(body === undefined ? {} : { 'content-type': 'application/json' })
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) })
+    })
+    return response.json()
+  }
+
+  await asNode('/api/agent/hello', {
+    nodeId: 'mac-1',
+    name: 'Studio Mac',
+    platform: 'darwin 24.0.0',
+    workspaces: [
+      { name: 'deepseek', path: '/Users/dev/deepseek' },
+      { name: 'notes', path: '/Users/dev/notes' }
+    ]
+  })
+
+  // Seed one answered turn so the page has real history to render on load. The
+  // control route is the only one that mints commands, so the seed goes through
+  // it rather than through a hand-built envelope.
+  const seededAnswer = {
+    ok: true,
+    prompt: '昨天改了什么？',
+    workspace: '/Users/dev/deepseek',
+    sessionId: 'remote-seeded',
+    text: '改了远程控制插件的中转协议。',
+    durationMs: 4200
+  }
+
+  /**
+   * Call the relay as the browser page.
+   *
+   * @param {string} path - path.
+   * @param {object} [body] - POST body.
+   * @returns {Promise<object>} parsed body.
+   */
+  const control = async (path, body) => {
+    const response = await fetch(`${relayUrl}${path}`, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: {
+        authorization: `Bearer ${CONTROL_TOKEN}`,
+        ...(body === undefined ? {} : { 'content-type': 'application/json' })
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) })
+    })
+    return response.json()
+  }
+
+  const seedCommand = await control('/api/command', {
+    nodeId: 'mac-1',
+    workspace: '/Users/dev/deepseek',
+    prompt: seededAnswer.prompt
+  })
+  await asNode('/api/agent/report', {
+    nodeId: 'mac-1',
+    status: 'idle',
+    commandId: seedCommand.commandId,
+    result: seededAnswer
+  })
+  keepAlive = setInterval(() => {
+    void asNode('/api/agent/hello', { nodeId: 'mac-1', name: 'Studio Mac' }).catch(() => {})
+  }, 5_000)
+
+  // ── the browser ──────────────────────────────────────────────────────────
+  const debuggingPort = 9_000 + Math.floor(Math.random() * 900)
+  browser = spawn(
+    binary,
+    [
+      '--headless=new',
+      '--no-sandbox',
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-extensions',
+      '--window-size=1160,820',
+      `--remote-debugging-port=${String(debuggingPort)}`,
+      `--user-data-dir=${join(workdir, 'profile')}`,
+      `http://127.0.0.1:${String(debuggingPort)}/json/version`
+    ],
+    { stdio: ['ignore', 'ignore', 'pipe'] }
+  )
+  const wsUrl = await waitForDevTools(browser).catch(async (error) => {
+    // Some builds print the DevTools line on stdout instead of stderr.
+    const response = await fetch(`http://127.0.0.1:${String(debuggingPort)}/json/version`)
+    if (!response.ok) throw error
+    return (await response.json()).webSocketDebuggerUrl
+  })
+  devtools = new DevTools(wsUrl)
+  await devtools.connect()
+  const sessionId = await devtools.attachToPage()
+
+  // ── first load, fresh profile: the gate ──────────────────────────────────
+  await devtools.navigate(sessionId, `${relayUrl}/`)
+  const gateVisible = await devtools.evaluate(sessionId, `getComputedStyle(document.getElementById('gate')).display !== 'none'`)
+  check('the login gate is shown when no token is stored', gateVisible === true)
+  const gateShot = join(workdir, '01-gate.png')
+  const gateImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
+  await writeFile(gateShot, Buffer.from(gateImage.data, 'base64'))
+
+  // ── reload with the token seeded, exactly where the page looks for it ─────
+  await devtools.send(
+    'Page.addScriptToEvaluateOnNewDocument',
+    { source: `localStorage.setItem('dsh-remote-control-token', ${JSON.stringify(CONTROL_TOKEN)});` },
+    sessionId
+  )
+  await devtools.navigate(sessionId, `${relayUrl}/`)
+  const entered = await devtools.evaluate(
+    sessionId,
+    `document.getElementById('app').classList.contains('on') && getComputedStyle(document.getElementById('gate')).display === 'none'`
+  )
+  check('the gate closes once a token is stored', entered === true)
+
+  // The roster arrives over SSE, and the auto-selection that follows it loads the
+  // workspaces and the transcript asynchronously. Wait for the rendered result
+  // rather than for a fixed delay, so the check tests the page and not the clock.
+  const ready = await waitFor(
+    () =>
+      devtools.evaluate(
+        sessionId,
+        `JSON.stringify({
+           nodes: document.getElementById('nodes').textContent,
+           workspaces: document.getElementById('workspaces').textContent,
+           log: document.getElementById('log').textContent
+         })`
+      ),
+    (text) => {
+      const snapshot = JSON.parse(String(text))
+      return (
+        snapshot.nodes.includes('Studio Mac') &&
+        snapshot.workspaces.includes('notes') &&
+        snapshot.log.includes('改了远程控制插件的中转协议。')
+      )
+    },
+    20_000
+  )
+  check('the roster, workspaces, and history all render after auto-selection', ready, 'the page never reached a usable state')
+
+  const view = await devtools.evaluate(
+    sessionId,
+    `JSON.stringify({
+       nodes: document.getElementById('nodes').textContent,
+       workspaces: document.getElementById('workspaces').textContent,
+       log: document.getElementById('log').textContent,
+       hint: document.getElementById('hint').textContent,
+       sendDisabled: document.getElementById('send').disabled
+     })`
+  )
+  const parsed = JSON.parse(view)
+  check('the node is reported idle', parsed.nodes.includes('空闲'), parsed.nodes)
+  check('the node reports its workspace count', parsed.nodes.includes('2 个工作台'), parsed.nodes)
+  check('both workbenches are listed', parsed.workspaces.includes('deepseek') && parsed.workspaces.includes('notes'))
+  check('the seeded question is rendered', parsed.log.includes('昨天改了什么？'))
+  check('the seeded answer is rendered', parsed.log.includes('改了远程控制插件的中转协议。'))
+  check('the answer carries its duration', parsed.log.includes('4.2s'), parsed.log)
+  check('the composer states the permission posture', parsed.hint.includes('workspace-write + ask'), parsed.hint)
+  check('the composer is enabled with a node and workspace selected', parsed.sendDisabled === false)
+  const appShot = join(workdir, '02-app.png')
+  const appImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
+  await writeFile(appShot, Buffer.from(appImage.data, 'base64'))
+
+  // ── typing a question and pressing the page's own send button ────────────
+  await devtools.evaluate(
+    sessionId,
+    `(() => {
+       const box = document.getElementById('prompt');
+       box.value = '总结一下今天的改动';
+       box.dispatchEvent(new Event('input', { bubbles: true }));
+       document.getElementById('send').click();
+       return box.value;
+     })()`
+  )
+  // The composer must clear immediately: it is the only part of sending a person
+  // waits on, and making it depend on the round trip is the difference between a
+  // responsive page and a laggy one on a slow link.
+  const composerCleared = await devtools.evaluate(sessionId, `document.getElementById('prompt').value === ''`)
+  check('the composer clears immediately after sending', composerCleared === true)
+
+  const submitted = await waitFor(
+    () => control('/api/state?nodeId=mac-1').then((state) => JSON.stringify(state.transcript)),
+    (transcript) => String(transcript).includes('总结一下今天的改动'),
+    15_000
+  )
+  check('the page submitted the question to the relay', submitted, 'the send button never reached /api/command')
+
+  // ── play the node: pick the question up and answer it ────────────────────
+  // The queued seed command comes back first, because this check registered the
+  // node after seeding and never drained it. A real node would have run it, so the
+  // stand-in does the same and then waits for the question the page just sent.
+  let command
+  const commandDeadline = Date.now() + 20_000
+  while (Date.now() < commandDeadline) {
+    const polled = await asNode('/api/agent/poll', { nodeId: 'mac-1' })
+    if (polled.command === null || polled.command === undefined) continue
+    command = polled.command
+    if (command.prompt === '总结一下今天的改动') break
+    await asNode('/api/agent/report', {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: command.commandId,
+      result: { ok: true, prompt: command.prompt, workspace: command.workspace, sessionId: 'remote-seeded', text: '（历史命令）', durationMs: 10 }
+    })
+  }
+  check('the pending question is waiting on the node long-poll', command?.prompt === '总结一下今天的改动', JSON.stringify(command))
+  await asNode('/api/agent/report', {
+    nodeId: 'mac-1',
+    status: 'idle',
+    commandId: command.commandId,
+    result: {
+      ok: true,
+      prompt: command.prompt,
+      workspace: command.workspace,
+      sessionId: 'remote-seeded',
+      text: '今天把中转协议抽成了独立的一层，并补齐了四个自检。',
+      durationMs: 1500
+    }
+  })
+
+  const rendered = await waitFor(
+    () => devtools.evaluate(sessionId, `document.getElementById('log').textContent`),
+    (text) => String(text).includes('今天把中转协议抽成了独立的一层'),
+    15_000
+  )
+  check('the node’s answer appears on the page without a reload', rendered, 'the SSE transcript push never reached the page')
+  const finalShot = join(workdir, '03-answered.png')
+  const finalImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
+  await writeFile(finalShot, Buffer.from(finalImage.data, 'base64'))
+
+  // ── the production mount: the same page behind a stripped prefix ─────────
+  // This is the case that matters in deployment and the one a root-mounted test
+  // cannot see. nginx serves the page at `/harness/` but passes `/` to the relay
+  // (the trailing slash on `proxy_pass` strips the prefix), so a root-absolute
+  // `/api/...` from the page would be answered by whatever else owns the domain
+  // root — and the page would load and then do nothing at all. This proxy copies
+  // that behaviour exactly: strip the prefix on the way in, advertise it on the
+  // way out.
+  const proxy = createServer(async (req, res) => {
+    const raw = req.url ?? '/'
+    const stripped = raw.startsWith('/harness') ? raw.slice('/harness'.length) || '/' : raw
+    let upstream
+    try {
+      upstream = await fetch(`http://127.0.0.1:${String(relayPort)}${stripped}`, {
+        method: req.method,
+        headers: {
+          ...(req.headers.authorization === undefined ? {} : { authorization: req.headers.authorization }),
+          'x-forwarded-prefix': '/harness'
+        }
+      })
+    } catch (error) {
+      res.writeHead(502).end(String(error))
+      return
+    }
+    const buffer = Buffer.from(await upstream.arrayBuffer())
+    res.writeHead(upstream.status, {
+      'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream',
+      'cache-control': 'no-store'
+    })
+    res.end(buffer)
+  })
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+  const proxyOrigin = `http://127.0.0.1:${String(proxy.address().port)}`
+
+  // The data path is untouched by the prefix hint: only HTML carries a `<base>`.
+  const stateThroughProxy = await fetch(`${proxyOrigin}/harness/api/state`, {
+    headers: { authorization: `Bearer ${CONTROL_TOKEN}` }
+  })
+  check('an API call under the prefix reaches the relay', stateThroughProxy.status === 200, `HTTP ${String(stateThroughProxy.status)}`)
+  const stateBody = await stateThroughProxy.json()
+  check('the prefixed API call returns the roster, not a proxy error', Array.isArray(stateBody.nodes) && stateBody.nodes.length > 0)
+
+  const prefixed = await devtools.createPage()
+  await devtools.send(
+    'Page.addScriptToEvaluateOnNewDocument',
+    { source: `localStorage.setItem('dsh-remote-control-token', ${JSON.stringify(CONTROL_TOKEN)});` },
+    prefixed
+  )
+  await devtools.navigate(prefixed, `${proxyOrigin}/harness/`)
+  const prefixedReady = await waitFor(
+    () => devtools.evaluate(prefixed, `document.getElementById('nodes').textContent`),
+    (text) => String(text).includes('Studio Mac'),
+    15_000
+  )
+  check(
+    'the page works when mounted under a stripped sub-path',
+    prefixedReady,
+    'the roster never arrived under /harness/ — the page is calling the origin root instead of its own mount point'
+  )
+  const prefixedBase = await devtools.evaluate(prefixed, `document.baseURI`)
+  check('the relay advertises the public mount prefix in the page base', String(prefixedBase).endsWith('/harness/'), String(prefixedBase))
+  const prefixedShot = join(workdir, '04-prefixed.png')
+  const prefixedImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, prefixed)
+  await writeFile(prefixedShot, Buffer.from(prefixedImage.data, 'base64'))
+
+  // A prefix the relay cannot sanitize must not reach the markup.
+  const hostile = await fetch(`http://127.0.0.1:${String(relayPort)}/`, {
+    headers: { 'x-forwarded-prefix': '/harness"><script>alert(1)</script>' }
+  })
+  const hostileHtml = await hostile.text()
+  check('a markup-bearing prefix is refused rather than injected', !hostileHtml.includes('<script>alert(1)</script>'))
+  proxy.close()
+  proxy.closeAllConnections?.()
+
+  process.stdout.write(`\nui-check: ${String(checks - failures)}/${String(checks)} passed\n`)
+  process.stdout.write(`ui-check: screenshots ${workdir}/0{1,2,3,4}-*.png\n`)
+} catch (error) {
+  failures += 1
+  process.stdout.write(`\nui-check: harness error — ${error?.stack ?? error}\n`)
+  process.stdout.write(`ui-check: workdir kept at ${workdir}\n`)
+} finally {
+  clearInterval(keepAlive)
+  devtools?.close()
+  browser?.kill('SIGKILL')
+  relay?.kill('SIGTERM')
+  if (failures > 0) process.stdout.write(`ui-check: kept ${workdir}\n`)
+}
+
+/**
+ * Poll an async producer until a predicate holds.
+ *
+ * Page state arrives over an event stream and a socket, so a fixed sleep would
+ * either be flaky or slow. This waits for the observable fact instead.
+ *
+ * @param {() => Promise<any>} produce - reads the current value.
+ * @param {(value: any) => boolean} predicate - the condition to wait for.
+ * @param {number} timeoutMs - how long to wait.
+ * @returns {Promise<boolean>} whether the predicate ever held.
+ */
+async function waitFor(produce, predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      if (predicate(await produce())) return true
+    } catch {
+      /* transient: the page may be mid-render */
+    }
+    await sleep(150)
+  }
+  return false
+}
+
+if (failures > 0) process.exitCode = 1

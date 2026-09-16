@@ -1,0 +1,23 @@
+# The dsh-remote-control bundle patch: one row, because the whole node is one
+# concern — advertise, poll, run.
+#
+# The row injects nothing at the plugin level on purpose. Its required services
+# (`agents`, `agentPresets`, `permissionPresets`, `workspaceRegistry`) are
+# resolved with `ctx.inject` inside the plugin, so a composition that lacks them
+# still loads the row and logs why it cannot connect, instead of hiding the
+# misconfiguration behind a row that never appears.
+#
+# Disable it from your own patch layer by id:
+#
+#   - id: remote-control
+#     disabled: true
+#
+# or override any config key:
+#
+#   - id: remote-control
+#     config:
+#       enabled: false
+
+- insert:
+    - id: remote-control
+      name: 'dsh-remote-control'

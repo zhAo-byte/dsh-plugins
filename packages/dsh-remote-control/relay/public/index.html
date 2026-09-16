@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>DSH Remote Control</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --bg-raised: #171a21;
+    --bg-input: #1d212a;
+    --line: #262b36;
+    --fg: #e6e9ef;
+    --fg-dim: #9aa3b2;
+    --fg-faint: #6b7385;
+    --accent: #4c8dff;
+    --ok: #46b96a;
+    --warn: #d9a441;
+    --err: #e0625d;
+    --radius: 10px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  button, input, textarea, select { font: inherit; color: inherit; }
+
+  /* ── gate ─────────────────────────────────────────────────────────── */
+  #gate {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    background: var(--bg); z-index: 20;
+  }
+  #gate form {
+    width: min(360px, calc(100vw - 40px));
+    background: var(--bg-raised); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 24px;
+  }
+  #gate h1 { margin: 0 0 4px; font-size: 17px; }
+  #gate p { margin: 0 0 18px; color: var(--fg-dim); font-size: 13px; }
+  #gate .err { color: var(--err); font-size: 13px; min-height: 18px; margin-top: 10px; }
+
+  /* ── shell ────────────────────────────────────────────────────────── */
+  #app { display: none; height: 100%; }
+  #app.on { display: grid; grid-template-columns: 264px 1fr; }
+
+  aside {
+    border-right: 1px solid var(--line); background: var(--bg-raised);
+    overflow-y: auto; padding: 14px;
+  }
+  aside h2 {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--fg-faint); margin: 18px 0 8px; font-weight: 600;
+  }
+  aside h2:first-child { margin-top: 0; }
+
+  .node {
+    padding: 9px 10px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent; margin-bottom: 4px;
+  }
+  .node:hover { background: var(--bg-input); }
+  .node.sel { background: var(--bg-input); border-color: var(--accent); }
+  .node .row { display: flex; align-items: center; gap: 7px; }
+  .node .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .node .meta { font-size: 12px; color: var(--fg-faint); margin-top: 3px; padding-left: 15px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--fg-faint); }
+  .dot.online { background: var(--ok); }
+  .dot.busy { background: var(--warn); }
+  .dot.offline { background: #4a4f5c; }
+
+  .ws {
+    width: 100%; text-align: left; padding: 8px 10px; border-radius: 8px;
+    background: transparent; border: 1px solid transparent; cursor: pointer;
+    margin-bottom: 3px; color: var(--fg-dim);
+  }
+  .ws:hover { background: var(--bg-input); }
+  .ws.sel { background: var(--bg-input); border-color: var(--accent); color: var(--fg); }
+  .ws .p { display: block; font-size: 11px; color: var(--fg-faint); overflow: hidden;
+           text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+
+  main { display: flex; flex-direction: column; min-width: 0; }
+  header {
+    padding: 12px 18px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 10px; flex: none;
+  }
+  header .t { font-weight: 600; }
+  header .s { color: var(--fg-faint); font-size: 12px; }
+  header .spacer { flex: 1; }
+  header button {
+    background: transparent; border: 1px solid var(--line); border-radius: 7px;
+    padding: 4px 10px; cursor: pointer; color: var(--fg-dim); font-size: 12px;
+  }
+  header button:hover { color: var(--fg); border-color: var(--fg-faint); }
+
+  #log { flex: 1; overflow-y: auto; padding: 18px; }
+  .empty { color: var(--fg-faint); text-align: center; margin-top: 15vh; }
+
+  .turn { margin-bottom: 18px; max-width: 860px; }
+  .q {
+    background: var(--bg-input); border-left: 3px solid var(--accent);
+    padding: 9px 13px; border-radius: 0 8px 8px 0; white-space: pre-wrap; word-break: break-word;
+  }
+  .a {
+    margin-top: 10px; padding: 2px 0 2px 13px; border-left: 3px solid var(--line);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .a.err { border-left-color: var(--err); color: #f0b3b0; }
+  .a .who { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+            color: var(--fg-faint); margin-bottom: 5px; }
+  .pending { color: var(--fg-faint); font-style: italic; }
+  .stamp { font-size: 11px; color: var(--fg-faint); margin-top: 7px; }
+
+  footer { flex: none; border-top: 1px solid var(--line); padding: 12px 18px; }
+  .composer { display: flex; gap: 10px; align-items: flex-end; max-width: 860px; }
+  textarea {
+    flex: 1; background: var(--bg-input); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 12px; resize: none; min-height: 46px;
+    max-height: 200px; outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  .send {
+    background: var(--accent); border: 0; border-radius: 8px; padding: 11px 18px;
+    font-weight: 600; cursor: pointer; color: #fff; flex: none;
+  }
+  .send:disabled { opacity: .4; cursor: not-allowed; }
+  .hint { color: var(--fg-faint); font-size: 12px; margin-top: 8px; max-width: 860px; }
+  .hint code { background: var(--bg-input); padding: 1px 5px; border-radius: 4px; }
+
+  @media (max-width: 760px) {
+    #app.on { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+    aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 42vh; }
+  }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <form id="gate-form">
+    <h1>DSH Remote Control</h1>
+    <p>输入控制令牌（relay 上的 <code>DSH_REMOTE_CONTROL_TOKEN</code>）。</p>
+    <input id="gate-token" type="password" placeholder="control token" autocomplete="current-password"
+           style="width:100%;background:var(--bg-input);border:1px solid var(--line);border-radius:8px;padding:10px 12px;outline:none">
+    <div class="err" id="gate-err"></div>
+    <button class="send" type="submit" style="width:100%;margin-top:6px">进入</button>
+  </form>
+</div>
+
+<div id="app">
+  <aside>
+    <h2>在线的 Harness</h2>
+    <div id="nodes"><div class="empty" style="margin:8px 0;text-align:left">暂无节点</div></div>
+    <h2>工作台</h2>
+    <div id="workspaces"><div class="empty" style="margin:8px 0;text-align:left">先选一个节点</div></div>
+  </aside>
+
+  <main>
+    <header>
+      <span class="t" id="title">未选择</span>
+      <span class="s" id="subtitle"></span>
+      <span class="spacer"></span>
+      <button id="newchat" type="button">新对话</button>
+      <button id="signout" type="button">退出</button>
+    </header>
+    <div id="log"><div class="empty">选一个在线节点和工作台，然后在下面提问。</div></div>
+    <footer>
+      <div class="composer">
+        <textarea id="prompt" rows="1" placeholder="给这台 harness 下达指令…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button class="send" id="send" type="button">发送</button>
+      </div>
+      <div class="hint" id="hint"></div>
+    </footer>
+  </main>
+</div>
+
+<script>
+'use strict'
+
+const TOKEN_KEY = 'dsh-remote-control-token'
+const SESSION_KEY = 'dsh-remote-control-sessions'
+const POLL_FALLBACK_MS = 10000
+
+const state = {
+  token: '',
+  nodes: [],
+  nodeId: null,
+  workspace: null,
+  /** nodeId -> sessionId, so a follow-up continues the same DSH session. */
+  sessions: {},
+  /** nodeId -> transcript entries */
+  transcript: new Map(),
+  source: null,
+  rosterTimer: null
+}
+
+const $ = (id) => document.getElementById(id)
+
+/**
+ * Base the page's own API calls on the directory it was served from.
+ *
+ * This page is deployed under a sub-path (`https://icyu.online/harness/`), where
+ * the reverse proxy strips the prefix before the relay sees it. A root-absolute
+ * `/api/state` would therefore be sent to the origin root and answered by
+ * whatever else lives on that domain — the relay never sees it, and the page
+ * fails completely while working perfectly at `/`. Resolving against the current
+ * directory makes the same file work at `/`, at `/harness/`, and at any deeper
+ * mount point, with no build-time knowledge of the deployment.
+ */
+const API_BASE = new URL('./', document.baseURI).pathname.replace(/\/$/, '')
+
+/**
+ * Build one API URL.
+ * @param {string} path - API path beginning with a slash.
+ * @returns {string} the resolved path.
+ */
+function endpoint(path) {
+  return API_BASE + path
+}
+
+// ── transport ──────────────────────────────────────────────────────────────
+
+/**
+ * Call one relay API with the stored control token.
+ * @param {string} path - API path.
+ * @param {object} [options] - `{ method, body }`.
+ * @returns {Promise<object>} parsed JSON body.
+ */
+async function api(path, options = {}) {
+  const init = { method: options.method ?? 'GET', headers: { authorization: `Bearer ${state.token}` } }
+  if (options.body !== undefined) {
+    init.method = 'POST'
+    init.headers['content-type'] = 'application/json'
+    init.body = JSON.stringify(options.body)
+  }
+  const res = await fetch(endpoint(path), init)
+  const text = await res.text()
+  if (res.status === 401) throw new Error('令牌无效或已过期')
+  let payload = {}
+  try { payload = text === '' ? {} : JSON.parse(text) } catch { payload = { error: text } }
+  if (!res.ok) throw new Error(payload.error ?? `HTTP ${res.status}`)
+  return payload
+}
+
+// ── rendering ──────────────────────────────────────────────────────────────
+
+/** Re-render the node list and keep the selection honest. */
+function renderNodes() {
+  const box = $('nodes')
+  box.textContent = ''
+  if (state.nodes.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'empty'
+    empty.style.margin = '8px 0'
+    empty.style.textAlign = 'left'
+    empty.textContent = '暂无节点（确认机器上的 dsh 已启动且插件配置正确）'
+    box.append(empty)
+    return
+  }
+  for (const node of state.nodes) {
+    const el = document.createElement('div')
+    el.className = 'node' + (node.nodeId === state.nodeId ? ' sel' : '')
+    const row = document.createElement('div')
+    row.className = 'row'
+    const dot = document.createElement('span')
+    dot.className = 'dot ' + (node.online ? (node.status === 'busy' ? 'busy' : 'online') : 'offline')
+    const nm = document.createElement('span')
+    nm.className = 'nm'
+    nm.textContent = node.name || node.nodeId
+    row.append(dot, nm)
+    const meta = document.createElement('div')
+    meta.className = 'meta'
+    const bits = []
+    if (!node.online) bits.push('离线')
+    else if (node.status === 'busy') bits.push(node.detail || '执行中')
+    else bits.push('空闲')
+    if (node.platform) bits.push(node.platform)
+    bits.push(`${node.workspaces.length} 个工作台`)
+    meta.textContent = bits.join(' · ')
+    el.append(row, meta)
+    el.addEventListener('click', () => selectNode(node.nodeId))
+    box.append(el)
+  }
+}
+
+/** Re-render the workspace list for the selected node. */
+function renderWorkspaces() {
+  const box = $('workspaces')
+  box.textContent = ''
+  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
+  if (!node) {
+    const empty = document.createElement('div')
+    empty.className = 'empty'
+    empty.style.margin = '8px 0'
+    empty.style.textAlign = 'left'
+    empty.textContent = '先选一个节点'
+    box.append(empty)
+    return
+  }
+  if (node.workspaces.length === 0) {
+    const empty = document.createElement('div')
+    empty.className = 'empty'
+    empty.style.margin = '8px 0'
+    empty.style.textAlign = 'left'
+    empty.textContent = '这个节点没有配置工作台'
+    box.append(empty)
+    return
+  }
+  for (const ws of node.workspaces) {
+    const el = document.createElement('button')
+    el.type = 'button'
+    el.className = 'ws' + (ws.path === state.workspace ? ' sel' : '')
+    el.textContent = ws.name || ws.path
+    const p = document.createElement('span')
+    p.className = 'p'
+    p.textContent = ws.path
+    el.append(p)
+    el.addEventListener('click', () => {
+      state.workspace = ws.path
+      renderWorkspaces()
+      renderLog()
+      renderHint()
+    })
+    box.append(el)
+  }
+}
+
+/** Render the selected node's transcript. */
+function renderLog() {
+  const log = $('log')
+  log.textContent = ''
+  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
+  if (!node) {
+    log.innerHTML = '<div class="empty">选一个在线节点和工作台，然后在下面提问。</div>'
+    return
+  }
+  const entries = state.transcript.get(state.nodeId) ?? []
+  if (entries.length === 0) {
+    log.innerHTML = '<div class="empty">还没有对话。在下面提问开始。</div>'
+    return
+  }
+  const pending = new Set()
+  for (const entry of entries) if (entry.kind === 'question') pending.add(entry.commandId)
+  for (const entry of entries) if (entry.kind !== 'question') pending.delete(entry.commandId)
+
+  const groups = []
+  for (const entry of entries) {
+    if (entry.kind === 'question') {
+      groups.push({ q: entry, answers: [] })
+      continue
+    }
+    const last = groups[groups.length - 1]
+    if (last === undefined) groups.push({ q: null, answers: [entry] })
+    else last.answers.push(entry)
+  }
+
+  for (const group of groups) {
+    const turn = document.createElement('div')
+    turn.className = 'turn'
+    if (group.q) {
+      const q = document.createElement('div')
+      q.className = 'q'
+      q.textContent = group.q.prompt
+      turn.append(q)
+    }
+    for (const answer of group.answers) {
+      const a = document.createElement('div')
+      a.className = 'a' + (answer.kind === 'error' ? ' err' : '')
+      const who = document.createElement('div')
+      who.className = 'who'
+      who.textContent = answer.kind === 'error' ? '失败' : 'DSH'
+      const body = document.createElement('div')
+      body.textContent = answer.kind === 'error' ? answer.error : answer.text
+      a.append(who, body)
+      if (answer.durationMs) {
+        const stamp = document.createElement('div')
+        stamp.className = 'stamp'
+        stamp.textContent = `${(answer.durationMs / 1000).toFixed(1)}s · ${new Date(answer.at).toLocaleTimeString()}`
+        a.append(stamp)
+      }
+      turn.append(a)
+    }
+    if (group.q && pending.has(group.q.commandId)) {
+      const a = document.createElement('div')
+      a.className = 'a'
+      const body = document.createElement('div')
+      body.className = 'pending'
+      body.textContent = node.online ? '已下发，等待 DSH 跑完这一轮…' : '节点离线，命令在队列里等它回来…'
+      a.append(body)
+      turn.append(a)
+    }
+    log.append(turn)
+  }
+  log.scrollTop = log.scrollHeight
+}
+
+/** Update the composer hint to match the current selection. */
+function renderHint() {
+  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
+  const parts = []
+  if (!node) parts.push('先选节点')
+  else {
+    parts.push(`目标 <code>${escapeHtml(node.name || node.nodeId)}</code>`)
+    if (state.sessions[node.nodeId]) parts.push(`续接会话 <code>${escapeHtml(short(state.sessions[node.nodeId]))}</code>`)
+    else parts.push('将开一个新会话')
+  }
+  if (state.workspace) parts.push(`工作台 <code>${escapeHtml(state.workspace)}</code>`)
+  else parts.push('未选工作台')
+  parts.push('权限 <code>workspace-write + ask</code>；越界操作会弹在你本机 DSH 里等确认')
+  $('hint').innerHTML = parts.join(' · ')
+}
+
+/** Escape text for the few places that need markup. */
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+}
+/** Shorten a session id for display. */
+function short(id) { return String(id).length > 18 ? `${String(id).slice(0, 18)}…` : String(id) }
+
+/** Sync the header line with the current selection. */
+function renderHeader() {
+  const node = state.nodes.find((n) => n.nodeId === state.nodeId)
+  $('title').textContent = node ? node.name || node.nodeId : '未选择'
+  $('subtitle').textContent = node ? (node.online ? (node.status === 'busy' ? node.detail || '执行中' : '空闲') : '离线') : ''
+}
+
+/** Re-render everything that depends on the current selection. */
+function renderAll() {
+  renderNodes()
+  renderWorkspaces()
+  renderHeader()
+  renderLog()
+  renderHint()
+  $('send').disabled = !state.nodeId || !state.workspace
+}
+
+// ── selection ──────────────────────────────────────────────────────────────
+
+/**
+ * Select a node, loading its transcript from the relay.
+ * @param {string} nodeId - target node.
+ */
+async function selectNode(nodeId) {
+  state.nodeId = nodeId
+  const node = state.nodes.find((n) => n.nodeId === nodeId)
+  if (node && node.workspaces.length > 0) {
+    const stillValid = node.workspaces.some((ws) => ws.path === state.workspace)
+    if (!stillValid) state.workspace = node.workspaces[0].path
+  } else {
+    state.workspace = null
+  }
+  renderAll()
+  try {
+    const snap = await api(`/api/state?nodeId=${encodeURIComponent(nodeId)}`)
+    state.transcript.set(nodeId, Array.isArray(snap.transcript) ? snap.transcript : [])
+    renderLog()
+  } catch (error) {
+    $('hint').textContent = `读取历史失败：${error.message}`
+  }
+}
+
+// ── live updates ───────────────────────────────────────────────────────────
+
+/** Apply a roster push from the relay. */
+function applyRoster(nodes) {
+  state.nodes = Array.isArray(nodes) ? nodes : []
+  if (state.nodeId && !state.nodes.some((n) => n.nodeId === state.nodeId)) {
+    state.nodeId = null
+    state.workspace = null
+  }
+  // Pick a target for a first-time visitor. Without this the roster renders and
+  // the page still looks broken: no workspaces, no history, and a dead send
+  // button, because every one of those depends on a selection the user has no
+  // reason to know they must make. Prefer a node that is online and actually
+  // offers somewhere to work.
+  if (!state.nodeId) {
+    const candidate = state.nodes.find((node) => node.online && node.workspaces.length > 0)
+    if (candidate) {
+      void selectNode(candidate.nodeId)
+      return
+    }
+  }
+  renderAll()
+}
+
+/** Apply one transcript push from the relay. */
+function applyTranscript(entry) {
+  if (!entry || typeof entry.nodeId !== 'string') return
+  const list = state.transcript.get(entry.nodeId) ?? []
+  // Each relay entry carries a monotonic `seq` per node, so a duplicate push is
+  // identified exactly rather than by guessing from timestamps — two entries can
+  // legitimately share a millisecond, and dropping one of those would silently
+  // lose a question or an answer.
+  if (list.some((existing) => existing.seq === entry.seq)) return
+  list.push(entry)
+  list.sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
+  state.transcript.set(entry.nodeId, list)
+  if (entry.kind === 'answer' && entry.sessionId) {
+    state.sessions[entry.nodeId] = entry.sessionId
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(state.sessions)) } catch {}
+  }
+  if (entry.nodeId === state.nodeId) { renderLog(); renderHint() }
+}
+
+/** Open the event stream; fall back to polling when SSE is unavailable. */
+function connect() {
+  if (state.source) state.source.close()
+  if (typeof EventSource === 'undefined') { startPolling(); return }
+  const source = new EventSource(`${endpoint('/api/events')}?token=${encodeURIComponent(state.token)}`)
+  state.source = source
+  source.onmessage = (event) => {
+    let payload
+    try { payload = JSON.parse(event.data) } catch { return }
+    if (payload.type === 'roster') applyRoster(payload.nodes)
+    else if (payload.type === 'transcript') applyTranscript(payload.entry)
+  }
+  source.onerror = () => {
+    // EventSource retries on its own; the roster refresh below covers the gap.
+    refresh()
+  }
+}
+
+/** Refresh the roster and the focused transcript once. */
+async function refresh() {
+  try {
+    const snap = await api('/api/state' + (state.nodeId ? `?nodeId=${encodeURIComponent(state.nodeId)}` : ''))
+    applyRoster(snap.nodes)
+    if (state.nodeId && Array.isArray(snap.transcript)) {
+      state.transcript.set(state.nodeId, snap.transcript)
+      renderLog()
+    }
+  } catch { /* transient; the next tick retries */ }
+}
+
+/** Polling fallback for browsers without EventSource. */
+function startPolling() {
+  if (state.rosterTimer !== null) return
+  state.rosterTimer = setInterval(refresh, POLL_FALLBACK_MS)
+}
+
+// ── actions ────────────────────────────────────────────────────────────────
+
+/** Send the composer contents to the selected node. */
+async function send() {
+  const box = $('prompt')
+  const prompt = box.value.trim()
+  if (prompt === '' || !state.nodeId || !state.workspace) return
+  const button = $('send')
+  button.disabled = true
+  // Clear the composer synchronously: this is the only part of sending the user
+  // waits on, and it must not depend on the round trip.
+  box.value = ''
+  box.style.height = 'auto'
+  try {
+    await api('/api/command', {
+      body: {
+        nodeId: state.nodeId,
+        workspace: state.workspace,
+        prompt,
+        ...(state.sessions[state.nodeId] ? { sessionId: state.sessions[state.nodeId] } : {})
+      }
+    })
+    // The question is rendered from the relay's own broadcast rather than from a
+    // local guess. An optimistic entry here would carry no `seq`, so the matching
+    // push would not dedupe against it and the turn would render twice — once as
+    // pending forever and once as answered.
+  } catch (error) {
+    box.value = prompt
+    $('hint').textContent = `发送失败：${error.message}`
+  } finally {
+    button.disabled = false
+  }
+}
+
+/** Start a fresh conversation on the selected node. */
+function newChat() {
+  if (state.nodeId) delete state.sessions[state.nodeId]
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(state.sessions)) } catch {}
+  renderHint()
+  $('hint').textContent = '下一条指令会在这台 harness 上开一个新会话。'
+}
+
+// ── gate ───────────────────────────────────────────────────────────────────
+
+/**
+ * Verify a token and enter the app.
+ * @param {string} token - candidate control token.
+ */
+async function enter(token) {
+  state.token = token
+  const snap = await api('/api/state')
+  try { localStorage.setItem(TOKEN_KEY, token) } catch {}
+  $('gate').style.display = 'none'
+  $('app').classList.add('on')
+  applyRoster(snap.nodes)
+  connect()
+}
+
+$('gate-form').addEventListener('submit', async (event) => {
+  event.preventDefault()
+  const token = $('gate-token').value.trim()
+  if (token === '') return
+  $('gate-err').textContent = ''
+  try {
+    await enter(token)
+  } catch (error) {
+    $('gate-err').textContent = error.message
+  }
+})
+
+$('send').addEventListener('click', send)
+$('newchat').addEventListener('click', newChat)
+$('signout').addEventListener('click', () => {
+  try { localStorage.removeItem(TOKEN_KEY) } catch {}
+  if (state.source) state.source.close()
+  location.reload()
+})
+
+$('prompt').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault()
+    void send()
+  }
+})
+$('prompt').addEventListener('input', (event) => {
+  const el = event.target
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+})
+
+// ── boot ───────────────────────────────────────────────────────────────────
+
+try {
+  const stored = localStorage.getItem(SESSION_KEY)
+  if (stored !== null) state.sessions = JSON.parse(stored)
+} catch { state.sessions = {} }
+
+const savedToken = (() => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } })()
+if (savedToken) {
+  enter(savedToken).catch(() => {
+    $('gate').style.display = 'grid'
+    $('gate-err').textContent = '保存的令牌已失效，请重新输入'
+  })
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,64 @@
+# Example node configuration for `dsh-remote-control`.
+#
+# This file is documentation, not loaded code. The live configuration lives in
+# your profile's patch layer:
+#
+#   ~/.dsh/profiles/web/cordis.patch.yml      (macOS and Linux)
+#   %USERPROFILE%\.dsh\profiles\web\cordis.patch.yml   (Windows)
+#
+# Replace the secrets with the ones from the relay's environment file
+# (`/etc/dsh-remote-relay.env` on the systemd deployment). They are shared
+# secrets, but they are *different* secrets:
+#
+#   nodeToken  ← DSH_REMOTE_AGENT_TOKEN    (this machine may advertise and answer)
+#   (page)     ← DSH_REMOTE_CONTROL_TOKEN  (a browser may read and ask)
+#
+# A node never needs the control token, and the page never needs the agent token.
+# Keeping them separate means a leaked browser token cannot impersonate a machine
+# and a leaked machine token cannot read other machines' transcripts.
+
+- id: remote-control
+  config:
+    # Where the relay is reachable. Include the sub-path if you mounted it under
+    # one, and no trailing slash.
+    relayUrl: 'https://icyu.online/harness'
+
+    # This machine's shared secret.
+    nodeToken: 'REPLACE_WITH_DSH_REMOTE_AGENT_TOKEN'
+
+    # Identity and label. `nodeId` defaults to a hash of host name + home dir, so
+    # you only need to set it when two machines would collide — or when you want
+    # a stable id you can recognise.
+    # nodeId: 'studio-mac'
+    # displayName: 'Studio Mac'
+
+    # Workbenches you are willing to answer questions about. Anything not listed
+    # here is refused before the Harness is touched, no matter what the relay
+    # asks for. A bare string means the directory name is the label; the mapping
+    # form lets you name it something friendlier.
+    workspaces:
+      - { name: deepseek, path: '~/Desktop/deepseek' }
+      - { name: notes, path: '~/Documents/notes' }
+      # - '~/another/project'
+
+    # Which agent preset remote sessions are composed from. This is the same
+    # preset list the local GUI shows.
+    agentPreset: standard
+
+    # The permission posture pinned onto every remote session. `workspace-write`
+    # is the shipped preset that bundles the `workspace-write` sandbox with the
+    # `ask` approval policy: work inside the workspace proceeds, and anything
+    # outside it stops and waits for a human at this machine. The relay has no
+    # approval channel at all, so a remote question genuinely cannot approve
+    # anything — that is the design, not a limitation.
+    permissionPreset: workspace-write
+
+    # Reconnect backoff. The first retry waits reconnectMinMs, then doubles up to
+    # reconnectMaxMs. A laptop that wakes up on a different network reconnects on
+    # its own; nothing needs restarting.
+    # reconnectMinMs: 2000
+    # reconnectMaxMs: 60000
+
+    # Set false to validate the configuration and log the verdict without
+    # connecting. Useful for checking a machine before pointing it at a relay.
+    # enabled: true
