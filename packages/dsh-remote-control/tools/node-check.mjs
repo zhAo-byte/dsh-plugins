@@ -12,7 +12,12 @@
  * @module dsh-remote-control/tools/node-check
  */
 
+import { spawn } from 'node:child_process'
+import { readFile, readdir } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { RelayAuthError, RelayClient, RelayUnreachableError, normalizeRelayUrl } from '../lib/client.js'
 import { deriveNodeId } from '../lib/config.js'
 import { normalizeWorkspaces } from '../lib/runner.js'
@@ -97,10 +102,6 @@ try {
   // Two assertions: no `@deepseek-ai/*` static import anywhere in the package's
   // own lib, and the entry point actually importing in a subprocess.
   {
-    const { readFile, readdir } = await import('node:fs/promises')
-    const { spawn } = await import('node:child_process')
-    const { fileURLToPath } = await import('node:url')
-    const { dirname, join } = await import('node:path')
     const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 
     const offenders = []
@@ -125,7 +126,11 @@ try {
       process.execPath,
       [
         '-e',
-        `import(${JSON.stringify(join(packageRoot, 'lib', 'index.js'))})` +
+        // `import()` takes a URL, not a path. Handing it a bare Windows path
+        // (`D:\a\...`) fails with ERR_UNSUPPORTED_ESM_URL_SCHEME, which is a bug
+        // in this check rather than in the plugin — and one that only ever shows
+        // up on Windows.
+        `import(${JSON.stringify(pathToFileURL(join(packageRoot, 'lib', 'index.js')).href)})` +
           `.then((m) => { console.log(typeof m.apply === 'function' ? 'apply-ok' : 'no-apply'); process.exit(0) })` +
           `.catch((e) => { console.error(e.code ?? e.message); process.exit(3) })`
       ],
@@ -179,12 +184,17 @@ try {
   check('the derived node id is URL-safe', /^node-[0-9a-f]{12}$/.test(idA), idA)
 
   // ── workspace normalization ──────────────────────────────────────────────
+  // Every path assertion here has to be platform-neutral. `/tmp` is not a place
+  // on Windows, so the checks use the home directory (which exists everywhere)
+  // and assert relationships rather than literal prefixes — the first version of
+  // this block asserted `startsWith('/')` and failed on windows-latest for a
+  // reason that had nothing to do with the code under test.
   const stringForm = normalizeWorkspaces(['/tmp', '~/projects'])
   check('a string entry becomes a named workspace', stringForm[0].name === '/tmp' && stringForm[0].path === '/tmp')
   check(
-    'a leading ~ expands to the home directory',
-    stringForm[1].path.startsWith('/') && !stringForm[1].path.includes('~'),
-    stringForm[1].path
+    'a leading ~ expands under the home directory',
+    stringForm[1].path.startsWith(homedir()) && !stringForm[1].path.startsWith('~'),
+    `${stringForm[1].path} (home is ${homedir()})`
   )
   const objectForm = normalizeWorkspaces([{ name: 'proj', path: '/tmp' }])
   check('an object entry keeps its display name', objectForm[0].name === 'proj' && objectForm[0].path === '/tmp')
