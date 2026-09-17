@@ -53,7 +53,9 @@ function check(what, ok, detail = '') {
  * A session stand-in that records the events a real turn would commit.
  *
  * `summarizeTurn` only reads `seq` and `eventAt`, so this is enough surface to
- * exercise reply extraction without a model request.
+ * exercise reply extraction without a model request. The admitted prompt is
+ * recorded too, because that identity is how a reply is attributed to the right
+ * question once a session is shared with the local GUI.
  */
 class FakeSession {
   /**
@@ -79,12 +81,14 @@ class FakeSession {
   }
 
   /**
-   * Append one assistant message and close the turn.
+   * Append one admitted prompt, one reply, and close the turn.
    *
    * @param {string} text - assistant text.
    * @param {object} [reason] - turn outcome; defaults to completed.
+   * @param {object} [message] - the admitted user message, when there was one.
    */
-  commitReply(text, reason = { kind: 'completed' }) {
+  commitReply(text, reason = { kind: 'completed' }, message) {
+    if (message !== undefined) this.events.push({ type: 'user/message', data: message })
     this.events.push({ type: 'turn/start', data: {} })
     this.events.push({
       type: 'assistant/message',
@@ -98,7 +102,9 @@ class FakeSession {
  * An AgentHandle stand-in that answers the next question when asked.
  *
  * The canned reply is set by the test, so a failure path and a success path use
- * exactly the same plumbing.
+ * exactly the same plumbing. `whenIdle` waits for the reply being produced, which
+ * is what makes a held turn (`next.gate`) look like a turn that is still running
+ * — the property the runner's serialization and its shared-agent path depend on.
  */
 class FakeHandle {
   /**
@@ -109,15 +115,23 @@ class FakeHandle {
     this.session = new FakeSession(sessionId)
     this.ledger = ledger
     this.disposed = false
-    /** Next reply to commit: `{ text, reason }`, or `{ silent: true }` for no events. */
+    /** Next reply to commit: `{ text, reason, gate }`, or `{ silent: true }` for no events. */
     this.next = { text: 'answer' }
+    /** Resolves when the turn currently being produced has been committed. */
+    this.reply = Promise.resolve()
     this.agent = {
       session: this.session,
-      whenIdle: () => Promise.resolve(),
+      whenIdle: () => this.reply,
       followup: (message) => {
         this.ledger.followups.push({ sessionId, message })
-        if (this.next.silent === true) return
-        this.session.commitReply(this.next.text ?? '', this.next.reason)
+        if (this.next.silent === true) {
+          this.reply = Promise.resolve()
+          return
+        }
+        const gate = this.next.gate
+        this.reply = (gate === undefined ? Promise.resolve() : gate).then(() => {
+          this.session.commitReply(this.next.text ?? '', this.next.reason, message)
+        })
       }
     }
   }
@@ -138,6 +152,7 @@ class FakeHandle {
 function fakeHarness(options = {}) {
   const ledger = {
     creates: [],
+    resumes: [],
     resolvedPresets: [],
     mountedPresets: [],
     standingKeys: [],
@@ -148,9 +163,12 @@ function fakeHarness(options = {}) {
     titles: [],
     flushed: [],
     followups: [],
+    observed: [],
     disposed: []
   }
   const handles = new Map()
+  /** Durable header facts per session, as the real `sessionQuery` would report them. */
+  const stored = new Map()
   const ctx = {
     agentDefaultModel: {
       currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash' })
@@ -196,9 +214,34 @@ function fakeHarness(options = {}) {
         ledger.creates.push(request)
         const handle = new FakeHandle(request.sessionId, ledger)
         handles.set(request.sessionId, handle)
+        stored.set(request.sessionId, { cwd: request.meta?.cwd, agentPreset: request.meta?.agentPreset })
         // Real creation composes the agent before publishing it, so the setup
         // callback must have run by the time create() resolves.
         return Promise.resolve(request.setup({ name: 'agent-scope' })).then(() => handle)
+      },
+      resume: (request) => {
+        ledger.resumes.push(request)
+        const handle = new FakeHandle(request.resumeSessionId, ledger)
+        handles.set(request.resumeSessionId, handle)
+        return Promise.resolve(request.setup({ name: 'agent-scope' })).then(() => handle)
+      },
+      // Real disposal unregisters the agent, so a session whose handle was given
+      // back must not look live — that distinction is what the resume path and
+      // the "somebody else owns it" path are told apart by.
+      get: (id) => (handles.get(id)?.disposed === true ? undefined : handles.get(id)?.agent)
+    },
+    sessionQuery: {
+      observeSession: (sessionId) => {
+        ledger.observed.push(sessionId)
+        const facts = stored.get(sessionId)
+        if (facts === undefined) return Promise.reject(new Error(`session "${sessionId}" not found`))
+        return Promise.resolve({
+          header: { id: sessionId, cwd: facts.cwd },
+          projections: { values: { agentPreset: facts.agentPreset } },
+          [Symbol.dispose]: () => {
+            ledger.observedDisposed = (ledger.observedDisposed ?? 0) + 1
+          }
+        })
       }
     },
     sessionTitle: {
@@ -212,9 +255,13 @@ function fakeHarness(options = {}) {
         return Promise.resolve()
       }
     },
-    get: (name) => (name === 'sessions' ? ctx.sessions : undefined)
+    get: (name) => {
+      if (name === 'sessions') return ctx.sessions
+      if (name === 'sessionQuery') return ctx.sessionQuery
+      return undefined
+    }
   }
-  return { ctx, ledger, handles }
+  return { ctx, ledger, handles, stored }
 }
 
 /**
@@ -222,11 +269,11 @@ function fakeHarness(options = {}) {
  *
  * @param {object} [overrides] - config overrides.
  * @param {object} [harnessOptions] - fake Harness options.
- * @returns {Promise<{ runner: object, ledger: object, handles: Map<string, object>, warnings: string[], tracked: string[], released: string[] }>} the wired runner.
+ * @returns {Promise<{ runner: object, ctx: object, ledger: object, handles: Map<string, object>, stored: Map<string, object>, warnings: string[], tracked: string[], released: string[] }>} the wired runner.
  */
 async function makeRunner(overrides = {}, harnessOptions = {}) {
   const { RemoteRunner } = await import('../lib/runner.js')
-  const { ctx, ledger, handles } = fakeHarness(harnessOptions)
+  const { ctx, ledger, handles, stored } = fakeHarness(harnessOptions)
   const warnings = []
   /** Session ids the runner handed to the question bridge. */
   const tracked = []
@@ -251,7 +298,7 @@ async function makeRunner(overrides = {}, harnessOptions = {}) {
       release: (sessionId) => released.push(sessionId)
     }
   })
-  return { runner, ledger, handles, warnings, tracked, released }
+  return { runner, ctx, ledger, handles, stored, warnings, tracked, released }
 }
 
 const command = (overrides = {}) => ({
@@ -393,7 +440,7 @@ try {
 
   // ── a first turn ─────────────────────────────────────────────────────────
   {
-    const { runner, ledger, tracked, released } = await makeRunner()
+    const { runner, ledger, handles, tracked, released } = await makeRunner()
     const result = await runner.run(command())
     check('the first question succeeds', result.ok === true, JSON.stringify(result))
     check('the answer is the committed assistant text', result.text === 'answer')
@@ -428,6 +475,27 @@ try {
       tracked.includes(String(result.sessionId)),
       `tracked ${JSON.stringify(tracked)} for ${String(result.sessionId)} — without this the relay cannot answer its questions`
     )
+    // The turn is over, so the claim and the write handle are both gone. This is
+    // the pair that makes the conversation usable from the local GUI: a held
+    // handle is a held kernel lease, and a held claim would route the person at
+    // the machine's own question to the relay page.
+    check(
+      'the write handle is given back when the turn ends',
+      handles.get(result.sessionId)?.disposed === true,
+      'the session is still held open, so no other process can write it'
+    )
+    check('the node holds no handle between turns', runner.handles.size === 0)
+    check(
+      'the session stops being claimed by the bridge when the turn ends',
+      released.includes(String(result.sessionId)),
+      `released ${JSON.stringify(released)}`
+    )
+    check(
+      'the created session is remembered for follow-ups',
+      runner.sessions.get(result.sessionId)?.workspacePath === '/workspace/proj',
+      JSON.stringify([...runner.sessions.values()])
+    )
+    check('the admitted prompt carries an identity', typeof ledger.followups[0]?.message?.id === 'string')
     await runner.dispose()
     check(
       'disposing the session also retires it from the bridge',
@@ -442,20 +510,184 @@ try {
     )
   }
 
-  // ── a follow-up continues the same session ───────────────────────────────
+  // ── a session held by another process is explained, not surfaced raw ────
+  // `SessionAlreadyOwnedError` is what the person actually sees when two DSH
+  // instances share `~/.dsh` and both open the same conversation. The raw
+  // framework text reaches the page as `gateway/internal` and says nothing about
+  // what to do, so the runner translates the one case it can explain.
   {
-    const { runner, ledger, handles } = await makeRunner()
+    const { runner, ctx } = await makeRunner()
     const first = await runner.run(command())
-    const handle = handles.get(first.sessionId)
-    handle.next = { text: 'the second answer' }
+    ctx.agents.resume = async () => {
+      const error = new Error('session "x" is already owned by an active write handle')
+      error.name = 'SessionAlreadyOwnedError'
+      throw error
+    }
+    const failed = await runner.run(command({ commandId: 'cmd-2', prompt: 'x', sessionId: first.sessionId }))
+    check('a session held by another process fails the turn', failed.ok === false, JSON.stringify(failed))
+    check(
+      'the failure says what to do about it',
+      String(failed.error).includes('another DSH process') && String(failed.error).includes('one writer'),
+      failed.error
+    )
+    check('the framework error class is not leaked to the page', !String(failed.error).includes('SessionAlreadyOwnedError'), failed.error)
+  }
+
+  // ── a follow-up continues the same session ───────────────────────────────
+  // The handle from the first turn is gone by now, so this is the path that has
+  // to *resume* the conversation from its durable log — the same thing the local
+  // GUI does when it opens a remote-started session. Identity, workspace, and
+  // posture all have to survive that round trip.
+  {
+    const { runner, ctx, ledger, handles } = await makeRunner()
+    const first = await runner.run(command())
+    const originalResume = ctx.agents.resume
+    ctx.agents.resume = async (request) => {
+      const handle = await originalResume(request)
+      handle.next = { text: 'the second answer' }
+      return handle
+    }
     const second = await runner.run(command({ commandId: 'cmd-2', prompt: 'and then?', sessionId: first.sessionId }))
-    check('a follow-up reuses the same session id', second.sessionId === first.sessionId)
-    check('a follow-up does not create a second agent', ledger.creates.length === 1, `${String(ledger.creates.length)} creates`)
-    check('a follow-up does not re-resolve the preset', ledger.resolvedPresets.length === 1)
+    check('a follow-up continues the same session id', second.sessionId === first.sessionId)
+    check('a follow-up does not create a second session', ledger.creates.length === 1, `${String(ledger.creates.length)} creates`)
+    check(
+      'a follow-up resumes the session this node created',
+      ledger.resumes.length === 1 && ledger.resumes[0]?.resumeSessionId === first.sessionId,
+      JSON.stringify(ledger.resumes.map((entry) => entry.resumeSessionId))
+    )
+    check(
+      'the resumed agent is composed on the preset the session records',
+      ledger.mountedPresets.at(-1)?.id === 'standard' && ledger.resolvedPresets.length === 2,
+      JSON.stringify({ mounted: ledger.mountedPresets.map((entry) => entry.id), resolved: ledger.resolvedPresets })
+    )
     check('a follow-up does not re-attach the workspace', ledger.attached.length === 1)
     check('a follow-up returns the new answer', second.text === 'the second answer')
     check('a follow-up admits the new prompt', ledger.followups[1]?.message?.content?.[0]?.text === 'and then?')
     check('a follow-up re-flushes', ledger.flushed.length === 2)
+    check(
+      'the resumed turn re-pins the configured permission preset',
+      ledger.permissions.at(-1)?.preset === 'workspace-write',
+      JSON.stringify(ledger.permissions)
+    )
+    check(
+      'the follow-up hands its write handle back too',
+      handles.get(first.sessionId)?.disposed === true && runner.handles.size === 0
+    )
+  }
+
+  // ── the stored session decides the composition, not the current setting ──
+  // Mounting a different preset onto an existing log is how a conversation ends
+  // up with two personas, so the stored header wins; the configured id is only
+  // the fallback for a session that cannot be read.
+  {
+    const { runner, ctx, ledger, stored } = await makeRunner()
+    const first = await runner.run(command())
+    stored.set(first.sessionId, { cwd: '/workspace/proj', agentPreset: 'stored-preset' })
+    await runner.run(command({ commandId: 'cmd-2', prompt: 'and then?', sessionId: first.sessionId }))
+    check(
+      'the preset stored in the session wins over the configured one',
+      ledger.resolvedPresets.at(-1) === 'stored-preset' && ledger.mountedPresets.at(-1)?.id === 'stored-preset',
+      JSON.stringify({ resolved: ledger.resolvedPresets, mounted: ledger.mountedPresets.map((entry) => entry.id) })
+    )
+  }
+  {
+    const { runner, ctx, ledger, warnings } = await makeRunner()
+    const first = await runner.run(command())
+    ctx.sessionQuery.observeSession = async () => {
+      throw new Error('stored session is unreadable')
+    }
+    const second = await runner.run(command({ commandId: 'cmd-2', prompt: 'and then?', sessionId: first.sessionId }))
+    check('an unreadable stored session still continues the conversation', second.ok === true, JSON.stringify(second))
+    check(
+      'the fallback is the configured preset',
+      ledger.resolvedPresets.at(-1) === 'standard',
+      JSON.stringify(ledger.resolvedPresets)
+    )
+    check(
+      'the unreadable session is warned about rather than swallowed',
+      warnings.some((line) => line.includes('could not read the stored session')),
+      warnings.join(' | ')
+    )
+  }
+
+  // ── a stored conversation in another directory is not continued ──────────
+  // Same rule as a relay-supplied id from a workspace this node does not serve:
+  // running the question in the session's directory instead of the one the
+  // command named is a failure with no visible symptom, so it starts over.
+  {
+    const { runner, ctx, ledger, stored } = await makeRunner({
+      workspaces: [
+        { name: 'proj', path: '/workspace/proj' },
+        { name: 'notes', path: '/workspace/notes' }
+      ]
+    })
+    const first = await runner.run(command())
+    stored.set(first.sessionId, { cwd: '/workspace/notes', agentPreset: 'standard' })
+    const second = await runner.run(command({ commandId: 'cmd-2', prompt: 'moved?', sessionId: first.sessionId }))
+    check('a session whose stored cwd moved starts a fresh conversation', second.ok === true && second.sessionId !== first.sessionId, JSON.stringify(second))
+    check('the fresh conversation ignores the stale session record', ledger.creates.length === 2 && ledger.resumes.length === 0, JSON.stringify({ creates: ledger.creates.length, resumes: ledger.resumes.length }))
+    check('the fresh conversation is created in the requested workspace', ledger.creates[1]?.meta?.cwd === '/workspace/proj')
+  }
+
+  // ── a conversation the local GUI has open is driven, not locked out ──────
+  // This is the case that used to end in `SessionAlreadyOwnedError`: the person
+  // at the machine opened the remote-started conversation, so *their* agent is
+  // the writer. A second write handle is both impossible and wrong — it is the
+  // same conversation — and the runner has to leave their agent alone when it is
+  // done with the turn.
+  {
+    const { runner, ctx, ledger, tracked, released } = await makeRunner()
+    const first = await runner.run(command())
+    const live = new FakeHandle(first.sessionId, ledger)
+    live.next = { text: 'answered through the open conversation' }
+    const lookup = ctx.agents.get
+    ctx.agents.get = (id) => (id === first.sessionId ? live.agent : lookup(id))
+    const second = await runner.run(command({ commandId: 'cmd-2', prompt: 'still there?', sessionId: first.sessionId }))
+    check(
+      'a follow-up drives the agent the local GUI already has open',
+      second.text === 'answered through the open conversation',
+      JSON.stringify(second)
+    )
+    check('no second write handle is opened for a session somebody else owns', ledger.resumes.length === 0)
+    check(
+      'the shared session is claimed while the remote turn runs',
+      tracked.includes(String(first.sessionId)) && released.includes(String(first.sessionId)),
+      JSON.stringify({ tracked, released })
+    )
+    await runner.dispose()
+    check('dispose leaves an agent this node did not create alone', live.disposed === false)
+  }
+
+  // ── two commands in flight cannot interleave their turns ────────────────
+  // The relay sends one command per node at a time, but the runner no longer
+  // relies on that: with a session shared with the local GUI, two interleaved
+  // `followup`/`whenIdle` pairs on one agent is how a reply gets attributed to
+  // the wrong question.
+  {
+    const { runner, ctx, ledger } = await makeRunner()
+    let open
+    const gate = new Promise((resolve) => {
+      open = resolve
+    })
+    const originalCreate = ctx.agents.create
+    ctx.agents.create = async (request) => {
+      const handle = await originalCreate(request)
+      handle.next = { text: 'first answer', gate }
+      return handle
+    }
+    const first = runner.run(command())
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = runner.run(command({ commandId: 'cmd-2', prompt: 'second question' }))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    check(
+      'a second command does not start while a turn is running',
+      ledger.creates.length === 1 && ledger.followups.length === 1,
+      JSON.stringify({ creates: ledger.creates.length, followups: ledger.followups.length })
+    )
+    open()
+    const results = await Promise.all([first, second])
+    check('both serialized commands complete', results.every((entry) => entry.ok === true), JSON.stringify(results))
+    check('the second command runs after the first', ledger.followups.length === 2, JSON.stringify(ledger.followups.length))
   }
 
   // ── an unknown session id must start over, not silently reuse ────────────
@@ -511,25 +743,31 @@ try {
 
   // ── a failed turn must not look like a successful one ────────────────────
   {
-    const { runner, handles } = await makeRunner()
-    const promise = runner.run(command())
-    // The turn's reply is configured before `followup` runs, so hook the first
-    // create to install the failure.
-    const created = await promise
+    const { runner, ctx } = await makeRunner()
+    const created = await runner.run(command())
     check('a completed turn has no error field', created.error === undefined)
-    const handle = handles.get(created.sessionId)
-    handle.next = { text: '', reason: { kind: 'error', error: { code: 'NO_ADAPTER', message: 'no adapter for route' } } }
+    const originalResume = ctx.agents.resume
+    ctx.agents.resume = async (request) => {
+      const handle = await originalResume(request)
+      handle.next = { text: '', reason: { kind: 'error', error: { code: 'NO_ADAPTER', message: 'no adapter for route' } } }
+      return handle
+    }
     const failed = await runner.run(command({ commandId: 'cmd-err', prompt: 'again', sessionId: created.sessionId }))
     check('an error turn is reported as a failure', failed.ok === false, JSON.stringify(failed))
     check('the failure carries the adapter code', String(failed.error).includes('NO_ADAPTER'), failed.error)
     check('the failure carries the adapter message', String(failed.error).includes('no adapter for route'))
   }
   {
-    const { runner, handles } = await makeRunner()
+    const { runner, ctx } = await makeRunner()
     const first = await runner.run(command())
-    handles.get(first.sessionId).next = {
-      text: 'partial answer',
-      reason: { kind: 'error', error: { code: 'CANCELLED', message: 'stopped' } }
+    const originalResume = ctx.agents.resume
+    ctx.agents.resume = async (request) => {
+      const handle = await originalResume(request)
+      handle.next = {
+        text: 'partial answer',
+        reason: { kind: 'error', error: { code: 'CANCELLED', message: 'stopped' } }
+      }
+      return handle
     }
     const failed = await runner.run(command({ commandId: 'cmd-partial', prompt: 'x', sessionId: first.sessionId }))
     check('a cancelled turn still surfaces the delivered text', String(failed.error).includes('partial answer'), failed.error)
@@ -566,6 +804,24 @@ try {
     check('the failed session is detached from the workspace', ledger.detached.length === 1)
     check('no prompt is admitted after a permission failure', ledger.followups.length === 0)
   }
+  {
+    // The same failure on the *resume* path, where the fallback (detach the
+    // workspace) does not apply. A handle kept after a failed pinning is a lock
+    // the person at this machine cannot clear without restarting the backend.
+    const { runner, ctx, ledger, handles } = await makeRunner()
+    const first = await runner.run(command())
+    ctx.permissionPresets.set = () => {
+      throw new Error('unknown permission preset')
+    }
+    const failed = await runner.run(command({ commandId: 'cmd-2', prompt: 'x', sessionId: first.sessionId }))
+    check('a resume whose permission pinning fails fails the turn', failed.ok === false, JSON.stringify(failed))
+    check(
+      'the failed resume hands its write handle back',
+      ledger.resumes.length === 1 && handles.get(first.sessionId)?.disposed === true,
+      JSON.stringify({ resumes: ledger.resumes.length, disposed: handles.get(first.sessionId)?.disposed })
+    )
+    check('the failed resume leaves no handle behind', runner.handles.size === 0)
+  }
 
   // ── disposal ─────────────────────────────────────────────────────────────
   {
@@ -574,6 +830,42 @@ try {
     await runner.dispose()
     check('dispose disposes the sessions it created', handles.get(first.sessionId)?.disposed === true)
     check('dispose empties the session table', runner.sessions.size === 0)
+    const refused = await runner.run(command({ commandId: 'cmd-after-stop', prompt: 'anyone there?' }))
+    check('a stopped node refuses new commands', refused.ok === false, JSON.stringify(refused))
+    check('the refusal says the node was stopped', String(refused.error).includes('stopped'), refused.error)
+  }
+
+  // ── dispose hands back a turn that is still running ──────────────────────
+  // A plugin reload or a settings change tears the node down mid-turn. The session
+  // it was writing must go back immediately; otherwise the reload leaves a kernel
+  // lease behind and the local GUI cannot open the conversation until the backend
+  // itself is restarted.
+  {
+    const { runner, ctx, ledger, handles, tracked, released } = await makeRunner()
+    let open
+    const gate = new Promise((resolve) => {
+      open = resolve
+    })
+    const originalCreate = ctx.agents.create
+    ctx.agents.create = async (request) => {
+      const handle = await originalCreate(request)
+      handle.next = { text: 'late answer', gate }
+      return handle
+    }
+    const running = runner.run(command())
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const sessionId = ledger.creates[0]?.sessionId
+    check('a turn is in flight before the node is stopped', typeof sessionId === 'string', JSON.stringify(ledger.creates))
+    await runner.dispose()
+    check('dispose hands back the write handle of an in-flight turn', handles.get(sessionId)?.disposed === true)
+    check(
+      'dispose retires the in-flight turn from the bridge',
+      released.includes(String(sessionId)),
+      JSON.stringify({ tracked, released })
+    )
+    open()
+    await running
+    check('the holder list is empty after disposal', runner.handles.size === 0)
   }
 
   process.stdout.write(`\nrunner-check: ${String(checks - failures)}/${String(checks)} passed\n`)

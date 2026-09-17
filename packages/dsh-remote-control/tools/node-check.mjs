@@ -529,6 +529,49 @@ try {
     0,
     (value) => value
   ).text === '')
+  // A session this node shares with the local GUI can hold the person's own turn
+  // in the same window, and the relay page asks one question at a time. Reporting
+  // their turn as the remote reply is a wrong answer with no visible symptom, so
+  // the walk stops at the end of the turn it started reading.
+  check(
+    'a later turn in the same window is not reported as the reply',
+    (() => {
+      const summary = summarizeTurn(
+        {
+          seq: 6,
+          eventAt: (seq) =>
+            [
+              { type: 'turn/start' },
+              { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ours' }] } } },
+              { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+              { type: 'turn/start' },
+              { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'somebody else' }] } } },
+              { type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'X', message: 'y' } } } }
+            ][seq]
+        },
+        0,
+        (value) => value
+      )
+      return summary.text === 'ours' && turnFailure(summary.reason) === undefined
+    })()
+  )
+  check(
+    'the reply is attributed to the admitted prompt, not to the first turn in the window',
+    (() => {
+      const events = [
+        { type: 'user/message', data: { id: 'theirs' } },
+        { type: 'turn/start' },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'their answer' }] } } },
+        { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+        { type: 'user/message', data: { id: 'ours' } },
+        { type: 'turn/start' },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'our answer' }] } } },
+        { type: 'turn/end', data: { reason: { kind: 'completed' } } }
+      ]
+      const summary = summarizeTurn({ seq: events.length, eventAt: (seq) => events[seq] }, 0, (value) => value, 'ours')
+      return summary.text === 'our answer'
+    })()
+  )
   check(
     'an error turn becomes a code-and-message line',
     turnFailure({ kind: 'error', error: { code: 'NO_ADAPTER', message: 'no adapter' } }) === 'NO_ADAPTER: no adapter'

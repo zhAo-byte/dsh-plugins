@@ -125,7 +125,8 @@ dsh-remote-control: node "node-3f9a1c2b7d4e" (Studio Mac) → https://icyu.onlin
 
 **这次对话是这台机器上一个普通的 DSH 会话**：它会出现在本地 GUI 的侧边栏和工作区分组里，
 有标题、有完整日志、能被你自己继续追问。远程不是一条暗线，它就是本机的一个会话，
-只是发起人来自公网。
+只是发起人来自公网。远程回合一结束，写句柄就还给本机——「本机能不能接着聊」这件事的
+完整规则见下面 3·5。
 
 ---
 
@@ -237,6 +238,7 @@ workspaces: registry
    → 命令进信箱，正挂着的那条长轮询立刻拿到它
    → 插件收到命令，先回报 status=busy（页面上就能看到「执行中」）
    → RemoteRunner 在本地：
+     首次提问（这条会话是本节点建的）
         ctx.agentPresets.resolve('standard')       取预设
         ctx.workspaceRegistry.create(path)         确保工作台已登记
         ctx.agentDefaultModel.currentSelection()   取默认模型（会话必须有路由）
@@ -246,10 +248,17 @@ workspaces: registry
         workspace.attachSession(sessionId)         归入工作区分组
         permissionPresets.set(session, 'workspace-write')
         sessionTitle.rename(session, 问题前 60 字)
+     追问（同一条对话的下一个回合）
+        ctx.agents.get(sessionId)                  本机已经把这条会话打开了？直接用它
+        否则 ctx.agents.resume({ resumeSessionId })  从落盘日志恢复，预设按会话自己记的
+        permissionPresets.set(session, 'workspace-write')  每次远程回合都重新钉一遍
+     然后
         agent.followup(用户消息)
         await agent.whenIdle()
    → 从中转台收到回复？不：从本地会话日志里读
-        从提问前的 seq 开始扫事件，取最后一条非空 assistant/message 的文本
+        从这次提问自己的 user/message 开始扫，取本轮第一条 turn/end 之前最后一条非空
+        assistant/message 的文本（本机如果同时在聊，那一轮不算进来）
+   → dispose 释放写句柄——会话当场交还给本机 GUI（见 3·5）
    → POST /api/agent/report，带上结果
    → 页面收到 SSE 推送，渲染回答
 ```
@@ -281,6 +290,35 @@ workspaces: registry
 创建的、搬不走，所以在另一个工作台上追问必须开新会话。页面按目标存 session，节点侧也会
 核对一遍：`sessionId` 带来的工作台和这个会话自己的工作台不一致时重开一个。少了这道核对，
 那句提问会跑在**错误的目录**里，然后报告成功——一个没有症状的失败。
+
+### 3·5、远程开的对话，本机随时能接着聊
+
+DSH 的会话**只有一个写者**：一个打开的写句柄会用内核 flock 占住 `session.lock`，别的
+进程再去写打开就是 `SessionAlreadyOwnedError`（页面上会看到
+`resume failed for session "…" (gateway/internal)`）。
+
+所以节点**按回合持有会话**：
+
+- 远程回合开始时才创建/恢复会话，句柄打开；
+- 远程回合结束时**立刻 dispose 释放**——锁还给本机，你在电脑上点开这条对话就能接着聊；
+- 下一条远程消息按 `sessionId` **resume**（就是本机 GUI 自己续接会话用的那个 API），
+  所以连续性不变、历史都在；
+- 如果这条会话**已经在本机开着**（你刚点开它、本机 GUI 正拿着写句柄），远程回合就直接
+  驱动那个活着的 agent，而不是再开一个写句柄——同一场对话，两端看到的是同一份历史。
+
+三条要记住的规则：
+
+- **同一时刻只有一个写者。** 远程回合正在跑的时候，本机打不开这条会话（这是对的）；
+  反过来你本机开着它的时候从页面发，会直接接续到这场对话里，不会报锁错。
+- **权限预设每次远程回合都重新钉一遍。** 包括接进一条本机开着的会话时——页面上写的
+  `workspace-write + ask` 是一句承诺，不能因为这条会话在本机被改成过别的而悄悄变。
+- **插件重载会忘掉自己创建过哪些会话。** 那张表只活在内存里（它是「中转台能指挥哪些
+  会话」的信任边界，不是持久化状态），所以重载后页面上的旧 session id 会被当成陌生 id、
+  下一条提问开新会话。这和本机 GUI 重启后的行为一致。
+
+> 一个进程只跑一个后端。`nodeId` 是「主机名 + 家目录」的哈希，同一个 profile 起两个
+> `dsh web` 会在中转台眼里注册成**同一个节点**，命令随机落到其中一个，而会话锁又按进程
+> 分——这正是「本机明明开着，却怎么都打不开」的另一半原因（见第七节的自检说明）。
 
 ---
 
@@ -559,6 +597,14 @@ Harness 自己的 `@deepseek-ai/cordis` 和 `@deepseek-ai/dsh-user-questions`，
 `runner-check` 和 `questions-check` 都需要磁盘上能解析到 `@deepseek-ai/*`（它们要真调
 Harness 的代码），解析不到时报告**跳过**而不是失败，所以 `npm test` 在裸检出上照样能跑。
 
+`runner-check` 里最要紧的一组断言是**会话交接**：一个回合跑完写句柄必须已经 dispose
+（`handles.size === 0`）、提问桥必须已经不再认领这个会话、追问必须走 `agents.resume`
+而不是新建一个会话、本机已经开着的会话必须去驱动那个活着的 agent（而且 dispose 时**不许**
+动它）、两条同时在飞的命令不许交错，以及正在跑的回合被 `dispose()` 时句柄必须当场还回去。
+这些不是覆盖率，是这次真踩到的坑：旧的 runner 把句柄一直攥到插件卸载，于是「远程开的对话」
+在整个后端生命周期里都打不开——本机 GUI 只会看到
+`resume failed for session "…": SessionAlreadyOwnedError`。
+
 `live-check` 是最关键的一个：它建一个临时 `DSH_HOME`、把插件按用户的方式装进去、
 用 `--dump-config` 确认行被组合出来、真启动 web profile、然后断言插件出现在后端日志里、
 连上了中转台、报上了工作台、挂上了长轮询、并且在收到一个**未授权工作台**的命令时
@@ -604,9 +650,9 @@ href）。手写渲染器最典型的 bug 正好落在这两条之间：它可�
 
 ```
 relay-check     62/62
-node-check      82/82
+node-check      84/84
 questions-check 12/12
-runner-check    64/64
+runner-check    98/98
 live-check      21/21
 ui-check        51/51
 ```
