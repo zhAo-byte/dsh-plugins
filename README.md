@@ -22,6 +22,58 @@ dsh plugin --profile web add <本仓中该插件目录的路径>
 
 ---
 
+## 安装源：一律 GitHub，不走本地 link
+
+**本地 link 只在开发期用，不要留在配置里。** `link:` 有一个很难察觉的坏处：插件的行为
+取决于**这台机器上那个 checkout 当时的内容**，于是「配置文件里写的版本」和「真正跑起来
+的代码」不再是同一个东西——同一份 profile 拷到另一台机器上就是另一套行为，而且 `git log`
+说不了谎也没用，因为压根没经过版本控制。
+
+所以正式安装一律指 GitHub（三台插件都是同一个仓里的子目录）：
+
+```sh
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-remote-control"
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-remote-control/client"
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-git-repos"
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-codex-bridge"
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-codex-bridge/client"
+```
+
+**`dsh-git-repos` 只有一条**：它的浏览器半边并进了同一个包（`dsh.client` 就声明在里面），
+不像另外两个那样有独立的 `-client` 包名。
+
+### 改了代码怎么生效
+
+```
+1. 在仓里改 → 提交 → 推到 main
+2. dsh plugin --profile web update     # 重新解析 git 源，拉到 main 最新
+3. 重启后端（⇧⌘R）
+```
+
+第 2 步是必须的：`update` 会把 git 源的 revision 重新指向当时 `main` 的最新提交。不跑它，
+profile 就一直用安装那一刻的旧代码——**症状是「代码推上去了，界面没变」**，很容易被误判
+成插件没生效。
+
+> `dsh plugin --profile web update` 只刷新 `github:` 源；`link:` 源不受影响。
+
+### 开发期想改一行就看到效果
+
+上面那条流程要「提交 + 推送 + update + 重启」才能看到一行改动，迭代会很慢。开发期可以
+临时把某个包换成 link：
+
+```sh
+dsh plugin --profile web remove dsh-git-repos
+dsh plugin --profile web add ./packages/dsh-git-repos        # 换成 link:
+# 改代码 → 重启后端即可，不用提交
+# 验完记得改回来：
+dsh plugin --profile web remove dsh-git-repos
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-git-repos"
+```
+
+**只在这台机器上、只在开发期这么做**，而且干完要换回来——理由就是本节第一段。
+
+---
+
 ## packages/dsh-codex-bridge
 
 把 Codex 的**知识层**（skills）和**能力层**（MCP server）接进 DSH，
