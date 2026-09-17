@@ -82,9 +82,12 @@ const ctx = {
 // directory created afterwards would be refused for reasons that look like a bug
 // in the guard but are really an ordering mistake in this harness.
 const fixtureRoot = await mkdtemp(resolve(tmpdir(), 'dsh-git-repos-host-'))
+// The registry is a real SQLite file, so the harness points it at the fixture
+// rather than letting a self-check write into the developer's `~/.dsh`.
+const storePath = join(fixtureRoot, 'registry', 'registry.db')
 const pluginConfig = expectedRepos === undefined
-  ? { discover: { maxDepth: 3, limit: 20 }, extraRoots: [fixtureRoot] }
-  : { extraRoots: [fixtureRoot] }
+  ? { discover: { maxDepth: 3, limit: 20 }, extraRoots: [fixtureRoot], store: { path: storePath } }
+  : { extraRoots: [fixtureRoot], store: { path: storePath } }
 applyHost(ctx, pluginConfig)
 
 console.log('\n# registration')
@@ -170,6 +173,93 @@ if (expectedRepos !== undefined) {
   check('the rows carry repo-relative paths',
     repos.every((row) => typeof row.relPath === 'string'), JSON.stringify(repos.map((row) => row.relPath)))
 }
+
+/* ── the repository registry ──────────────────────────────────────────────────
+ * The behaviour that matters is not "a database exists" but which operation
+ * walks the tree: the first sight of a root, the user's manual rescan, and
+ * nothing else. A directory created after a scan has to stay invisible until
+ * `repos.rescan` — that is the difference between "cheap to open" and "cheap to
+ * open because it is showing yesterday's list".
+ */
+console.log('\n# repository registry')
+const registryRoot = join(fixtureRoot, 'registry-check')
+const alpha = join(registryRoot, 'alpha')
+await mkdir(alpha, { recursive: true })
+spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: alpha })
+
+const firstScan = await call('repos.list', { root: registryRoot })
+check('an unseen root is walked once and recorded',
+  firstScan.body?.value?.source === 'scan' && (firstScan.body?.value?.repos ?? []).length === 1,
+  JSON.stringify({ source: firstScan.body?.value?.source, count: firstScan.body?.value?.repos?.length }))
+check('the scan record is dated', typeof firstScan.body?.value?.discovery?.at === 'string',
+  JSON.stringify(firstScan.body?.value?.discovery))
+check('the listing names the registry it wrote to',
+  firstScan.body?.value?.registry?.available === true && firstScan.body?.value?.registry?.path === storePath,
+  JSON.stringify(firstScan.body?.value?.registry))
+
+// A repository created after the scan is invisible until the user asks for a
+// rescan; the listing itself must come back from the registry instead.
+const beta = join(registryRoot, 'beta')
+await mkdir(beta, { recursive: true })
+spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: beta })
+const cached = await call('repos.list', { root: registryRoot })
+check('a later listing is served from the registry, not a new walk',
+  cached.body?.value?.source === 'registry' && (cached.body?.value?.repos ?? []).length === 1,
+  JSON.stringify({ source: cached.body?.value?.source, count: cached.body?.value?.repos?.length }))
+check('the cached listing still syncs git status',
+  typeof cached.body?.value?.repos?.[0]?.branch === 'string', JSON.stringify(cached.body?.value?.repos?.[0]))
+check('the cached listing reports the scan that produced it',
+  typeof cached.body?.value?.discovery?.at === 'string'
+  && cached.body.value.discovery.at === firstScan.body?.value?.discovery?.at,
+  JSON.stringify(cached.body?.value?.discovery))
+
+const rescanned = await call('repos.rescan', { root: registryRoot })
+check('a manual rescan discovers the new repository',
+  rescanned.status === 200 && rescanned.body?.value?.repos?.length === 2
+  && rescanned.body?.value?.diff?.added?.length === 1,
+  JSON.stringify(rescanned.body?.value?.diff))
+
+await rm(beta, { recursive: true, force: true })
+const afterRemoval = await call('repos.rescan', { root: registryRoot })
+check('a manual rescan prunes a repository that is gone',
+  afterRemoval.body?.value?.repos?.length === 1 && afterRemoval.body?.value?.diff?.removed?.length === 1,
+  JSON.stringify(afterRemoval.body?.value?.diff))
+
+// Something the registry lists but git no longer accepts is flagged rather than
+// hidden: the row has to be able to say "rescan" about itself.
+await mkdir(join(registryRoot, 'ghost', '.git'), { recursive: true })
+const ghostScan = await call('repos.rescan', { root: registryRoot })
+const ghostRow = (ghostScan.body?.value?.repos ?? []).find((row) => String(row.root).endsWith('/ghost'))
+check('a repository git no longer recognizes is marked stale', ghostRow?.stale === true, JSON.stringify(ghostRow))
+check('the stale row is still listed', (ghostScan.body?.value?.repos ?? []).length === 2,
+  String(ghostScan.body?.value?.repos?.length))
+
+const healthWithRegistry = await call('health', {}, { httpMethod: 'GET' })
+check('health reports the registry path and counts',
+  healthWithRegistry.body?.value?.registry?.available === true
+  && healthWithRegistry.body?.value?.registry?.path === storePath
+  && typeof healthWithRegistry.body?.value?.registry?.workspaces === 'number',
+  JSON.stringify(healthWithRegistry.body?.value?.registry))
+
+// A walk that ran out of budget must not delete anything. "Not found" and
+// "deleted" are indistinguishable in a truncated walk, so the registry keeps
+// every row it had — this is the assertion behind the promise that a scan can
+// make the list long and stale but never quietly short. Enough directories are
+// created to trip whatever `limit` this run is configured with (the harness
+// uses 20 locally and the shipped 60 against a real workbench).
+console.log('\n# registry under a truncated walk')
+for (let index = 0; index < 61; index += 1) {
+  await mkdir(join(registryRoot, `bulk-${String(index).padStart(2, '0')}`, '.git'), { recursive: true })
+}
+const truncatedScan = await call('repos.rescan', { root: registryRoot })
+check('a truncated walk reports that it was cut short', truncatedScan.body?.value?.truncated === true,
+  JSON.stringify({ truncated: truncatedScan.body?.value?.truncated, scanned: truncatedScan.body?.value?.scanned }))
+check('a truncated walk reports no removals', (truncatedScan.body?.value?.diff?.removed ?? ['x']).length === 0,
+  JSON.stringify(truncatedScan.body?.value?.diff))
+const afterTruncated = await call('repos.list', { root: registryRoot })
+check('a truncated walk keeps the rows it did not reach',
+  (afterTruncated.body?.value?.repos ?? []).some((row) => String(row.root).endsWith('/ghost')),
+  JSON.stringify((afterTruncated.body?.value?.repos ?? []).map((row) => row.root).slice(0, 4)))
 
 console.log('\n# repository detail')
 const target = first?.root ?? root

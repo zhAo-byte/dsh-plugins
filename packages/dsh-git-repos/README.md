@@ -11,6 +11,7 @@ DSH 的**多仓库 Git 工具窗**：像 Rider / WebStorm 的 Git 面板那样�
 packages/dsh-git-repos/
   lib/index.js     宿主行：/dsh-git-repos/api/* 的 JSON RPC + 两道守卫
   lib/git.js       git 引擎：只走 spawn(argv)，机器可解析格式
+  lib/store.js     仓库注册表：SQLite 里的扫描记录与仓库清单
   lib/gitlab.js    GitLab：远端 URL 解析、深链、v4 REST
   lib/client.js    浏览器半边：右侧栏 tab（手写 bundle，无需打包器）
   cordis.patch.yml 一行 insert（随 bundle 自动合并）
@@ -19,14 +20,30 @@ packages/dsh-git-repos/
 
 ## 安装
 
+正式安装指 GitHub（profile 里的依赖写成 `github:` 源）：
+
 ```sh
 npm i -g pnpm                                  # dsh plugin 依赖 pnpm
-dsh plugin --profile web add <本仓>/packages/dsh-git-repos
+dsh plugin --profile web add "github:zhAo-byte/dsh-plugins#path:/packages/dsh-git-repos"
 ```
 
 装完**重启一次后端**（macOS 外壳：`Harness → 重启后端`，⇧⌘R）。
-`dsh plugin add` 会把包加进 `dsh.profile.bundles` 并软链到 profile 的
-`node_modules`，所以之后改代码只要重启后端就能生效（宿主半边不吃 HMR）。
+本包的浏览器半边并进同一个包（`dsh.client` 就声明在里面），不像另外两个插件那样有
+独立的 `-client` 包名，所以只有这一条。
+
+**改了这个包的代码怎么生效**（manifest 里的版本和真正跑的代码必须是同一个东西，
+所以正式安装不用本地 `link:`）：
+
+```
+1. 提交 → 推到 main
+2. dsh plugin --profile web update     # 重新解析 git 源
+3. 重启后端（⇧⌘R）
+```
+
+第 2 步不能省：不跑 `update`，profile 一直用安装那一刻的代码，症状是
+「代码推上去了、面板没变」。开发期想改一行就见效，可以临时换成
+`dsh plugin --profile web add ./packages/dsh-git-repos`（`link:`），验完换回来；
+完整说明见[上层 README](../README.md#安装源一律-github不走本地-link)。
 
 > 不要把这一行再手写进 `~/.dsh/profiles/web/cordis.patch.yml`：
 > 同一个 `id: git-repos` 出现两次会让**整个 profile 启动失败**
@@ -39,8 +56,11 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
 
 **仓库列表**（顶部，可折叠）
 
-- 扫描当前会话工作目录下的所有仓库（含子目录里的嵌套仓库、submodule），
-  深度与数量有预算（默认 8 层 / 60 个 / 40000 个目录），每次都带时间戳。
+- 仓库清单来自**本地注册表**（SQLite），不是每次打开都扫目录。打开面板只做一件事：
+  对已知仓库跑一遍 `git status`。目录只在三种情况下被重新扫描——这个根从没扫过、
+  扫描用的预算（`maxDepth`/`limit`/`maxEntries`）变了、或者用户点了「更新仓库列表」。
+  这样二十次打开里只有一次付扫描的钱，而真正会变的那部分（工作区状态）每次都是新的。
+- 扫描本身仍然有预算（默认 8 层 / 60 个 / 40000 个目录），仍然带时间戳。
   预算**从不静默生效**，但两种预算的报法不同，因为它们性质不同：
   深度是策略边界（深目录树上出现很正常），只在列表下方给一行浅色说明；
   目录数上限是保护阀被顶开（扫描可能停在半路），给黄色警示条。
@@ -48,9 +68,19 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
   8 层覆盖的是各类常见容器布局：Unity 工程的同级 checkout 在
   `Assets/<Group>/<Module>`（第 5 层，旧默认值 4 层正好把整层藏掉），
   monorepo 的 `packages/<group>/<pkg>` 是第 3 层，其余多在 2–4 层。
+- 列表下面那行**浅色出处说明**写清当前这份列表是怎么来的：首次/手动扫描时是
+  「已重新扫描目录 · 12:03:11」，从注册表读时是「列表来自注册表 · 上次扫描 12:03:11 ·
+  状态同步 12:07:40」。两个按钮的差别（见下）只有在这里才看得出来，所以它必须写在界面上。
 - 每行：脏/干净圆点、相对路径、当前分支、`↑ahead ↓behind`、变更数、`GL` 标记。
+  注册表里有、但 git 已经不认识的目录（被删掉/移走/换成普通目录）标一个
+  「已失效」而不是直接消失——静默丢掉一行会掩盖"清单过期了"这件事本身。
 - 悬停即出快捷动作：抓取 / 拉取 / 推送。
-- 顶部工具栏：工作台切换（跟随 DSH 工作区注册表）、刷新、设置；
+- 顶部工具栏：工作台切换（跟随 DSH 工作区注册表）、**刷新状态**、**更新仓库列表**、设置。
+  这两个按钮刻意分开：
+  - **刷新状态**（转圈箭头）= 对当前清单跑 `git status`，不碰目录。默认 10 秒的自动刷新走的也是它。
+  - **更新仓库列表**（放大镜）= 重新扫描目录，发现新增/已删除的仓库，并把差异报出来
+    （「新增 2 个，移除 1 个，共 24 个」）。在面板外 `git clone` 出来的仓库只有走这一步
+    才会出现在列表里——这是"进入面板不扫描"必然的代价，所以它被做成了一个显式动作。
   仓库列表标题栏上是**三个批量动作**——全部抓取 / 全部拉取 / 全部推送，
   一次打到列表里全部仓库（有界并发 4，逐仓结果，互不遮蔽）。
   分支的**批量切换**在「分支」页签里，带只读预检（见下）。
@@ -59,7 +89,8 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
   分桶统计，而不是一句「部分失败」。
 - **批量操作不会碰有未完成合并/rebase 的仓库**：那种仓库在列表里就带一个
   「合并进行中」标识，批量结果里也会如实报出来。
-- 目录下没有仓库时提供「在此初始化仓库」（`git init`）。
+- 目录下没有仓库时提供「重新扫描目录」与「在此初始化仓库」（`git init`；
+  初始化完会顺手重扫一次，否则刚建出来的仓库不在清单里）。
 
 **仓库详情**（下半，master–detail）
 
@@ -129,6 +160,35 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
 - 批量拉取遇到 fast-forward 走不通的分叉时，报的是**「需要合并」**而不是一句
   git 报错：那正是「接下来该在这个仓库上用合并」的信号。
 
+## 仓库注册表
+
+注册表是一个 SQLite 文件（默认 `~/.dsh/git-repos/registry.db`，走 `node:sqlite`），
+只存**清单**，不存状态：三张表分别是「这个根扫过什么、用的什么预算」
+（`workspace`）、「有哪些仓库」（`repository`）、「哪个根里能看到哪些仓库、相对路径是什么」
+（`membership`）。
+
+三条规则决定了它的行为，也各自对应一个自检断言：
+
+1. **第一次见到的根扫一次，之后不同预算不认。** 扫描记录里存着当时的
+   `maxDepth`/`limit`/`maxEntries` 指纹；指纹对不上就说明现有清单是按另一套规则产出的，
+   于是重扫而不是拿旧列表配上新预算继续显示。另外 `~/.dsh/settings.yaml` 里没有开关能
+   让"改了配置却没生效"这件事变得模糊——要么重扫，要么显式关掉注册表。
+2. **只有显式的重扫会删东西，而且只在不缺预算时删。** 目录或数量预算被顶开的那次扫描，
+   分不清"这个 checkout 被删了"和"它在预算外"，所以那次扫描**不允许**删除任何 membership。
+   多一行过期数据比悄悄少一个仓库好收场。`repos.rescan` 报的 `diff` 也是从**注册表**里
+   读回来的，不是拿这次扫描的结果去比——被截断的扫描会保留它没走到的行，
+   拿它去比就会宣布一次注册表其实没做过的删除。
+3. **根是可以重叠的。** 面板既能指向工作台、也能指向它的子目录，两次扫描会合法地看到
+   同一个 checkout；membership 因此是独立的表而不是 `repository` 上的一个列，
+   否则列子目录的那次会把行从父目录下面偷走。没有 membership 的 repository 才会被清掉。
+
+`membership` 和 `repository` 里**没有** git 状态。状态是每次打开都重新跑的
+`git status`——它便宜、实时、不会过期；清单才是值得记住的那部分。
+
+注册表**不是**必需品：`store.enabled: false`、拿不到 `node:sqlite`、路径不可写，
+三种情况都会退化成"每次打开都扫目录"，并在 API 信封、`health`、面板设置里如实写出来，
+而不是报错或者假装自己还是快的。
+
 ## 配置
 
 全部可选，写在 `packages/dsh-git-repos/cordis.patch.yml`，或在你自己的
@@ -141,17 +201,23 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
       maxDepth: 8            # 1–24；每多一层，多 readdir 一层目录
       limit: 60              # 1–400；列出的仓库个数上限
       maxEntries: 40000      # 1000–2000000；访问目录数上限，防病态目录树
+    store:
+      enabled: true          # false = 回到"每次打开都扫目录"
+      path: ~/.dsh/git-repos/registry.db   # 支持 ~/；:memory: 只对自检有意义
     extraRoots: []            # 工作区注册表之外还允许碰的目录
     allowHome: true           # 允许 $HOME 下的任何仓库
     gitlabHosts: []           # 自建 GitLab 主机名（含 "gitlab" 的自动识别）
     timeouts: { read: 20000, network: 180000 }
 ```
 
-三个预算各自的失效方式不同，因此面板分开报告：`limit` 用仓库计数上的 `+`
-表示（`truncated`）；`maxEntries` 顶开时是黄色条
+改 `discover` 的三个值会让已有的扫描记录失效并在下一次打开时重扫（指纹不同），
+所以不存在"配置改了、列表还是旧的"这种状态。
+
+三个预算各自的失效方式不同，因此面板分开报告：`maxEntries` 顶开时是黄色条
 （`discovery.entryLimited`）；`maxDepth` 触边时是列表下方一行浅色说明
-（`discovery.depthLimited`）。三者都带本次访问目录数 `discovery.visited`
-（在提示的悬停 title 里），并写明该改哪个字段。
+（`discovery.depthLimited`）；收满 `limit` 个仓库就停下时是计数上的 `+` 加一行浅色说明
+（`truncated`）——第三种不只是一条提示，它还决定了这次扫描**不许删任何东西**（见下）。
+三者都带本次访问目录数 `discovery.visited`（在提示的悬停 title 里），并写明该改哪个字段。
 
 **为什么不把深度默认值取得更大以求「一次扫完」**：实测这个 200 GB 的 Unity
 工作台（22 个嵌套仓库）在 8 层时访问约 6.5k 个目录、耗时 0.64 秒，就已经把
@@ -161,6 +227,8 @@ dsh plugin --profile web add <本仓>/packages/dsh-git-repos
 而不是假装扫完了。`maxDepth` 的成本是每层一次 `readdir`，`Library`、
 `node_modules`、`build`、`dist`、`Pods` 等重型目录已被剪掉；`limit` 的成本高
 得多——每个仓库都要跑一次 `git status`——所以它保持 60，仓库特别多时再调大。
+注册表让这笔成本从"每次打开"变成"这个根第一次被看到的那一次"（以及用户显式重扫
+的那一次），但预算的语义没有变：它描述的仍然是一次真实扫描能看到多远。
 
 GitLab 令牌（只读即可，`read_api`）按优先级取：
 
@@ -227,6 +295,16 @@ PLAYWRIGHT_CORE=/path/to/playwright-core \
 引擎一开始信任退出码、把这种情况报成 `switched`，是 `host-check` 的断言把它逼出来的——
 现在成功路径也要读索引，因为那是唯一诚实的判据。
 
+注册表那一块的断言全在 `host-check.mjs` 里，因为它要的是一条真的 RPC + 一个真的
+SQLite 文件：第一次列表是 `source: 'scan'` 且落盘；扫描之后新建的仓库在下一次列表里
+**必须看不到**（`source: 'registry'`）——这条是「打开面板不扫目录」唯一可证伪的形式；
+`repos.rescan` 必须报出 `diff.added`/`diff.removed`；git 不再认识的目录必须带
+`stale` 而不是消失；收满 `limit` 的那次扫描必须**一个 membership 都不删**
+（测试会造出比 `limit` 更多的目录来顶开它）。自检把 `store.path` 指到临时目录，
+绝不写进开发者的 `~/.dsh`。面板那行"列表从哪来"是纯函数 `registryLine`，
+三种情形（刚扫过 / 读注册表 / 注册表不可用）由 `client-check.mjs` 钉住——
+两个按钮的差别只体现在这一行上，写错了没人能看见。
+
 ## 已知限制
 
 - 提交文件树视图、多 worktree 选择器、blame 尚未实现。
@@ -236,7 +314,12 @@ PLAYWRIGHT_CORE=/path/to/playwright-core \
   两栏之间的行级对齐与滚动同步，也没有逐行的接受/拒绝。逐块 + 手改覆盖了大多数实际冲突，
   行级对齐是另一个量级的工作。
 - diff 是文本视图，没有并排（split）模式与字符级高亮。
-- 自动刷新只在面板可见时轮询（默认 10s，可调 3–120s），不是 `fs.watch`。
+- 自动刷新只在面板可见时轮询（默认 10s，可调 3–120s），不是 `fs.watch`；它同步的是
+  状态，不发现新仓库。
+- 在面板外新建的仓库要等一次手动「更新仓库列表」才会出现——这是「打开不扫描」的代价，
+  被做成了显式动作而不是后台偷偷扫描。
+- 注册表按根路径记账：工作台改名或移动后是新的记录，旧记录留在库里（不影响正确性，
+  只是 `health` 里的根数会虚高）。
 - 只读 GitLab：不在面板里创建/合并 MR（只给「新建 MR」的网页深链）。
 
 ## 授权

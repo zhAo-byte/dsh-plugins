@@ -161,8 +161,47 @@ try {
 check('body shows the empty state before any data', JSON.stringify(tree).includes('没有可管理的仓库')
   || JSON.stringify(tree).includes('等待会话工作目录'))
 
+console.log('\n# render with a registry-backed listing')
+// The registry added four render paths the empty first render never reaches:
+// the provenance line, the stale chip, the truncation caption, and the settings
+// row. Seeding them through the fake hook cells is what keeps a JSX-level crash
+// (a typo inside an optional chain) from shipping; the assertions below name the
+// seeded values, so a wrong cell index fails loudly instead of passing quietly.
+hooks.reset()
+hooks.seed(0, '/tmp/ws')
+hooks.seed(4, {
+  root: '/tmp/ws',
+  source: 'registry',
+  generatedAt: '2026-09-16T09:00:00.000Z',
+  truncated: true,
+  discovery: {
+    at: '2026-09-16T08:30:05.000Z', visited: 42, maxDepth: 8, maxEntries: 40000,
+    depthLimited: false, entryLimited: false,
+  },
+  registry: { enabled: true, available: true, path: '/tmp/registry.db', workspaces: 2, repositories: 24 },
+  repos: [
+    { root: '/tmp/ws/alpha', name: 'alpha', relPath: 'alpha', branch: 'main', clean: true, counts: { changed: 0 }, remotes: [] },
+    { root: '/tmp/ws/gone', name: 'gone', relPath: 'gone', error: 'fatal: not a git repository', stale: true, remotes: [] },
+  ],
+})
+hooks.seed(10, '/tmp/ws/alpha')
+hooks.seed(21, true)
+let dataTree
+try {
+  dataTree = moduleExports.GitReposBody({ sessionId: 's1', useSessions, useTabInfo: () => ({ tab: { visible: true, actions: {} } }) })
+  check('the body renders with a registry-backed listing', dataTree?.type === 'div', JSON.stringify(dataTree).slice(0, 120))
+} catch (error) {
+  check('the body renders with a registry-backed listing', false, error?.message ?? String(error))
+}
+const dataFlat = JSON.stringify(dataTree)
+check('the listing renders its rows', dataFlat.includes('alpha') && dataFlat.includes('/tmp/ws/alpha'))
+check('a stale row is labelled', dataFlat.includes('已失效'))
+check('the provenance line names the registry', dataFlat.includes('列表来自注册表'))
+check('the truncation caption is rendered', dataFlat.includes('discover.limit 截断'))
+check('the settings row names the registry file', dataFlat.includes('registry.db'))
+
 console.log('\n# helpers')
-const { asArray, unpackDetail, statusLetter, splitPath, diffLineClass, renderChanges, renderDiff, gitlabUrl, pipelineStyle, formatDate, operationText, bulkOutcomeText, renderConflictPanel, conflictText } = moduleExports.internals
+const { asArray, unpackDetail, statusLetter, splitPath, diffLineClass, renderChanges, renderDiff, gitlabUrl, pipelineStyle, formatDate, formatClock, operationText, bulkOutcomeText, registryLine, renderConflictPanel, conflictText } = moduleExports.internals
 
 // The two new surfaces are pure label maps, so they are asserted here rather
 // than through a rendered tree: the banner and the row chips both decide what to
@@ -174,6 +213,44 @@ check('a conflicted bulk result is called out', bulkOutcomeText('conflict') === 
 check('a divergence points at merging', bulkOutcomeText('diverged') === '需要合并', bulkOutcomeText('diverged'))
 check('every bulk outcome has a label', ['fetched', 'pulled', 'rebased', 'pushed', 'diverged', 'conflict', 'failed']
   .every((outcome) => bulkOutcomeText(outcome) !== ''), JSON.stringify(['fetched', 'pulled'].map(bulkOutcomeText)))
+
+// "Did the panel just walk the tree, or read the registry?" is the one question
+// the two toolbar buttons exist to answer, and this line is the only place the
+// answer appears. All three states are pinned: a walk, a registry read, and the
+// degraded mode where there is no registry at all.
+const scanLine = registryLine({
+  source: 'scan',
+  discovery: { at: '2026-09-16T08:30:05.000Z' },
+  registry: { available: true, path: '/tmp/registry.db' },
+})
+check('a walk says it walked',
+  scanLine?.text.includes('已重新扫描目录') && scanLine.text.includes(formatClock('2026-09-16T08:30:05.000Z')),
+  scanLine?.text)
+const cachedLine = registryLine({
+  source: 'registry',
+  discovery: { at: '2026-09-16T08:30:05.000Z' },
+  generatedAt: '2026-09-16T09:00:00.000Z',
+  registry: { available: true, path: '/tmp/registry.db' },
+})
+check('a cached list names both instants',
+  cachedLine?.text.includes('列表来自注册表')
+  && cachedLine.text.includes(formatClock('2026-09-16T08:30:05.000Z'))
+  && cachedLine.text.includes(formatClock('2026-09-16T09:00:00.000Z')),
+  cachedLine?.text)
+const degradedLine = registryLine({
+  source: 'scan',
+  discovery: { at: '2026-09-16T08:30:05.000Z' },
+  registry: { available: false, error: 'no sqlite' },
+})
+check('a missing registry is a warning, not a silent fallback',
+  degradedLine?.kind === 'warning' && degradedLine.text.includes('no sqlite'), JSON.stringify(degradedLine))
+// A page reloaded against a backend that has not picked this version up yet
+// reports neither provenance; naming one would be inventing it.
+const unknownLine = registryLine({ generatedAt: '2026-09-16T09:00:00.000Z' })
+check('an unknown provenance is named as unknown',
+  unknownLine?.text.includes('来源未知') && unknownLine.text.includes(formatClock('2026-09-16T09:00:00.000Z')),
+  unknownLine?.text)
+check('nothing loaded means no provenance line', registryLine(null) === null && registryLine(undefined) === null)
 
 check('asArray accepts arrays', asArray([1, 2]).length === 2)
 check('asArray rejects objects', asArray({ remotes: [] }).length === 0)
@@ -317,6 +394,11 @@ check('new MR link carries the source branch',
 check('missing project yields no link', gitlabUrl({}, 'tree', 'main') === undefined)
 check('pipeline colours by status', pipelineStyle('failed').color.includes('error'))
 check('date formats', formatDate('2026-09-16T08:30:00.000Z').startsWith('2026-09-16'))
+// The registry line compares two instants that are almost always today, so it
+// shows a clock; a missing one must degrade to a word, not to "Invalid Date".
+check('clock formats an instant', /^\d{2}:\d{2}:\d{2}$/.test(formatClock('2026-09-16T08:30:05.000Z')),
+  formatClock('2026-09-16T08:30:05.000Z'))
+check('clock names an unknown instant', formatClock(undefined) === '未知', formatClock(undefined))
 
 console.log(failures === 0 ? '\nAll checks passed.\n' : `\n${failures} check(s) failed.\n`)
 process.exit(failures === 0 ? 0 : 1)

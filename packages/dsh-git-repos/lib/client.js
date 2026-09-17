@@ -96,6 +96,44 @@ window.__ModuleLoader__.load({
       return '失败'
     }
 
+    /**
+     * The one-line answer to "where did this list come from?".
+     *
+     * The panel has two buttons that look similar and are not: one re-reads
+     * `git status` for the repositories already known, the other walks the
+     * directory tree and is the only one that can find a checkout created
+     * outside the panel. Without this line that difference is invisible, and a
+     * user who just cloned a repository has no way to tell whether the panel is
+     * stale or the clone failed. Kept pure so `tools/client-check.mjs` can pin
+     * the three cases down.
+     *
+     * @param list - a `repos.list` / `repos.rescan` envelope, or null.
+     * @returns `{ kind, text }` — `kind` is `warning` or `note` — or null when
+     *   nothing has loaded yet.
+     */
+    function registryLine(list) {
+      if (list === null || list === undefined) return null
+      const registry = list.registry
+      if (registry?.available === false) {
+        return {
+          kind: 'warning',
+          text: `仓库注册表不可用（${registry.error ?? '未知原因'}）：每次打开都会重新扫描目录`,
+        }
+      }
+      const scannedAt = formatClock(list.discovery?.at)
+      if (list.source === 'scan') return { kind: 'note', text: `已重新扫描目录 · ${scannedAt}` }
+      if (list.source === 'registry') {
+        return {
+          kind: 'note',
+          text: `列表来自注册表 · 上次扫描 ${scannedAt} · 状态同步 ${formatClock(list.generatedAt)}`,
+        }
+      }
+      // A host that reports neither knows nothing about a registry — a page
+      // reloaded against a backend that has not picked this version up yet.
+      // Claiming either provenance would be inventing one.
+      return { kind: 'note', text: `列表来源未知 · 状态同步 ${formatClock(list.generatedAt)}` }
+    }
+
     /* ── Styles ─────────────────────────────────────────────────────────────── */
 
     const CSS = `
@@ -266,6 +304,7 @@ window.__ModuleLoader__.load({
       back: 'M10.78 3.22a.75.75 0 010 1.06L7.06 8l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z',
       copy: 'M5.5 2A1.5 1.5 0 014 3.5v8.25a.75.75 0 01-1.5 0V3.5A3 3 0 015.5.5h5.25a.75.75 0 010 1.5H5.5zM7 3.5A1.5 1.5 0 018.5 2h4A1.5 1.5 0 0114 3.5v9a1.5 1.5 0 01-1.5 1.5h-4A1.5 1.5 0 017 12.5v-9z',
       tag: 'M2.25 2A.75.75 0 013 1.25h5.09c.2 0 .39.08.53.22l5.66 5.66a.75.75 0 010 1.06l-6.09 6.09a.75.75 0 01-1.06 0L1.47 8.62a.75.75 0 01-.22-.53V2.75A.75.75 0 012.25 2zm2.25 2.5a1 1 0 100 2 1 1 0 000-2z',
+      scan: 'M6.5 1a5.5 5.5 0 014.23 9.02l3.12 3.13a.75.75 0 11-1.06 1.06l-3.13-3.12A5.5 5.5 0 116.5 1zm0 1.5a4 4 0 100 8 4 4 0 000-8z',
     }
 
     /* ── RPC ────────────────────────────────────────────────────────────────── */
@@ -472,6 +511,12 @@ window.__ModuleLoader__.load({
       const [health, setHealth] = React.useState(null)
       const [list, setList] = React.useState(null)
       const [listLoading, setListLoading] = React.useState(false)
+      /**
+       * What the in-flight list load is doing: `sync` is a `git status` pass
+       * over the registry's inventory, `scan` is a directory walk. They are
+       * told apart on screen because only the second one is slow.
+       */
+      const [listPhase, setListPhase] = React.useState(null)
       const [error, setError] = React.useState(null)
       const [notice, setNotice] = React.useState(null)
       const [busy, setBusy] = React.useState(null)
@@ -547,20 +592,45 @@ window.__ModuleLoader__.load({
         return () => { alive = false }
       }, [])
 
-      /** Reload the repository list; returns the fresh rows. */
-      const loadList = React.useCallback(async (target, { quiet = false } = {}) => {
+      /**
+       * Load the repository list.
+       *
+       * Two very different operations share this path, and the difference is
+       * the point of the registry: a plain call syncs `git status` against the
+       * repositories the host already knows about (fast, and what every open
+       * and every poll does), while `rescan` asks the host to walk the
+       * directory tree again and adopt whatever it finds — the only way a
+       * checkout created outside the panel shows up.
+       *
+       * @param target - root to list.
+       * @param options - `quiet` skips the spinner; `rescan` walks instead of
+       *   reading the registry.
+       * @returns the fresh envelope, or null on failure.
+       */
+      const loadList = React.useCallback(async (target, { quiet = false, rescan = false } = {}) => {
         if (!target) return null
-        if (!quiet) setListLoading(true)
+        if (!quiet) { setListLoading(true); setListPhase(rescan ? 'scan' : 'sync') }
         try {
-          const value = await rpc('repos.list', { root: target })
+          const value = await rpc(rescan ? 'repos.rescan' : 'repos.list', { root: target })
           setList(value)
           setError(null)
+          if (rescan) {
+            // The diff is the answer to "did anything change?", which is the
+            // only reason the user pressed the button.
+            const added = asArray(value?.diff?.added).length
+            const removed = asArray(value?.diff?.removed).length
+            const total = asArray(value?.repos).length
+            const cut = value?.truncated ? '（已按 discover.limit 截断）' : ''
+            setNotice(added === 0 && removed === 0
+              ? `重新扫描完成：没有新仓库，共 ${total} 个${cut}`
+              : `重新扫描完成：新增 ${added} 个，移除 ${removed} 个，共 ${total} 个${cut}`)
+          }
           return value
         } catch (failure) {
           setError(failure.message)
           return null
         } finally {
-          if (!quiet) setListLoading(false)
+          if (!quiet) { setListLoading(false); setListPhase(null) }
         }
       }, [])
 
@@ -867,6 +937,9 @@ window.__ModuleLoader__.load({
       }, [act])
 
       const repos = asArray(list?.repos)
+      // The listing's own view of the store is fresher than the one `health`
+      // captured at mount (a rescan changes the counts), so it wins when present.
+      const registry = list?.registry ?? health?.registry ?? null
       const activeRepo = repos.find((row) => row.root === activeRoot) ?? null
       const gitlabRemote = asArray(detail?.remotes).find((row) => row.described?.gitlab) ?? null
 
@@ -939,8 +1012,12 @@ window.__ModuleLoader__.load({
           ...roots.map((row) => h('option', { key: row.id ?? row.path, value: row.path }, `${row.title ?? row.path}`)),
         ]),
         h(Btn, {
-          key: 'refresh', icon: P.refresh, title: '刷新', disabled: Boolean(busy),
+          key: 'refresh', icon: P.refresh, title: '刷新状态：只对已知仓库跑一次 git status，不重新扫描目录', disabled: Boolean(busy),
           onClick: () => { void loadList(root, { quiet: false }); if (activeRoot) void loadDetail(activeRoot) },
+        }),
+        h(Btn, {
+          key: 'rescan', icon: P.scan, title: '更新仓库列表：重新扫描目录，发现新增或已不存在的仓库', disabled: Boolean(busy) || !root,
+          onClick: () => { void loadList(root, { quiet: false, rescan: true }) },
         }),
         h(Btn, {
           key: 'settings', icon: P.settings, title: '设置', variant: showSettings ? 'primary' : undefined,
@@ -957,6 +1034,15 @@ window.__ModuleLoader__.load({
             onChange: (event) => setIntervalSeconds(Number(event.target.value)),
           }),
           h('span', { className: 'gr-mono gr-dim' }, `${interval}s`),
+        ]),
+        h('div', { className: 'gr-kv', key: 'registry' }, [
+          h('span', { className: 'gr-kvKey' }, '仓库注册表'),
+          h('span', {
+            className: 'gr-mono gr-dim gr-ellipsis',
+            title: registry?.path ?? '',
+          }, registry?.available === true
+            ? `已启用：${registry.workspaces} 个根 / ${registry.repositories} 个仓库 · ${registry.path}`
+            : `不可用（${registry?.error ?? '未初始化'}）：每次打开都会重新扫描目录`),
         ]),
         h('div', { className: 'gr-kv', key: 'token' }, [
           h('span', { className: 'gr-kvKey' }, 'GitLab'),
@@ -1001,7 +1087,9 @@ window.__ModuleLoader__.load({
         h('span', { key: 'count', className: 'gr-count' }, `${repos.length}${list?.truncated ? '+' : ''}`),
         h('span', { key: 'spacer', className: 'gr-grow' }),
         busy ? h(Glyph, { key: 'busy', path: P.refresh, spin: true }) : null,
-        listLoading ? h('span', { key: 'load', className: 'gr-dim' }, '扫描中…') : null,
+        listLoading
+          ? h('span', { key: 'load', className: 'gr-dim' }, listPhase === 'scan' ? '扫描目录中…' : '同步状态中…')
+          : null,
         // Bulk actions are the reason a multi-repository tool window exists: one
         // click has to reach every checkout the list is already showing.
         h(Btn, {
@@ -1038,10 +1126,18 @@ window.__ModuleLoader__.load({
           h('span', { key: 't' }, root ? '这个目录下没有 Git 仓库' : '等待会话工作目录…'),
           root ? h('div', { key: 'p', className: 'gr-mono gr-dim', style: { overflowWrap: 'anywhere' } }, root) : null,
           root ? h(Btn, {
+            key: 'rescan', icon: P.scan, label: '重新扫描目录',
+            title: '重新扫描目录，发现新增的仓库',
+            onClick: () => { void loadList(root, { quiet: false, rescan: true }) },
+          }) : null,
+          root ? h(Btn, {
             key: 'init', icon: P.plus, label: '在此初始化仓库',
             onClick: () => act('初始化仓库', async () => {
               await rpc('repo.init', { root })
-              const fresh = await loadList(root)
+              // `git init` creates a repository the registry has never seen, so
+              // this has to be a walk: a plain reload would correctly report the
+              // list it already had, without the thing that was just made.
+              const fresh = await loadList(root, { rescan: true })
               const first = asArray(fresh?.repos)[0]
               if (first) setActiveRoot(first.root)
             }),
@@ -1059,6 +1155,17 @@ window.__ModuleLoader__.load({
             h('span', { key: 'dot', className: `gr-dot${letter ? ` gr-dot--${letter}` : ''}` }),
             h('span', { key: 'name', className: 'gr-repoName gr-ellipsis' }, row.relPath === '.' ? row.name : row.relPath),
             h('span', { key: 'spacer', className: 'gr-grow' }),
+            // A repository the registry remembers but git no longer accepts.
+            // It stays in the list — dropping it silently would hide the fact
+            // that the inventory is out of date — and the chip names the action
+            // that clears it.
+            row.stale
+              ? h('span', {
+                key: 'stale', className: 'gr-chip',
+                style: { color: 'var(--dsw-alias-state-warning-primary,#b7791f)' },
+                title: `${row.error ?? 'git 不再认识这个目录'}\n点工具栏的「更新仓库列表」可以从注册表里清掉它`,
+              }, '已失效')
+              : null,
             row.error ? h('span', { key: 'err', className: 'gr-chip', style: { color: 'var(--dsw-alias-state-error-primary)' } }, '错误') : null,
             row.branch ? h('span', { key: 'b', className: 'gr-chip gr-chip--branch' }, [
               h(Glyph, { path: P.branch, size: 10, key: 'i' }),
@@ -1103,30 +1210,71 @@ window.__ModuleLoader__.load({
           ])
         })
 
-      // Two different kinds of "short", told apart on purpose:
+      // Three different kinds of "this list may be short", told apart on purpose:
       // - the depth boundary is policy, and normal on a deep tree → a caption;
-      // - an exhausted directory budget is the safety valve tripping, which
-      //   can stop the scan mid-tree → a warning.
-      // Either way the list never just looks empty for no stated reason.
+      // - an exhausted directory budget is the safety valve tripping, which can
+      //   stop the scan mid-tree → a warning;
+      // - a reached repository limit means the walk came back as soon as it had
+      //   enough, so whatever it had not reached yet is missing → a caption.
+      // They can hold at the same time, so this is a list rather than a chain:
+      // the list never just looks short for no stated reason.
       const discovery = list?.discovery
-      const scanHint = discovery?.entryLimited
-        ? h('div', {
+      const scanNotes = []
+      if (discovery?.entryLimited) {
+        scanNotes.push(h('div', {
           className: 'gr-scanHint',
           key: 'budget',
           title: `本次扫描访问了 ${discovery.visited} 个目录`,
         }, [
           h(Glyph, { path: P.warn, size: 12, key: 'i' }),
           h('span', { key: 't' }, `扫描提前结束：目录数达到 ${discovery.maxEntries} 上限，可能有仓库未列出（可调大插件配置 discover.maxEntries）`),
-        ])
-        : discovery?.depthLimited
-          ? h('div', {
-            className: 'gr-scanNote',
-            key: 'depth',
-            title: `本次扫描访问了 ${discovery.visited} 个目录；调大插件配置 discover.maxDepth 可继续下钻`,
-          }, `已扫描 ${discovery.maxDepth} 层，更深的目录未展开`)
-          : null
+        ]))
+      }
+      if (discovery?.depthLimited) {
+        scanNotes.push(h('div', {
+          className: 'gr-scanNote',
+          key: 'depth',
+          title: `本次扫描访问了 ${discovery.visited} 个目录；调大插件配置 discover.maxDepth 可继续下钻`,
+        }, `已扫描 ${discovery.maxDepth} 层，更深的目录未展开`))
+      }
+      if (list?.truncated) {
+        scanNotes.push(h('div', {
+          className: 'gr-scanNote',
+          key: 'limit',
+          title: '收满 discover.limit 个仓库后扫描就停了；调大这个上限并「更新仓库列表」可以收录更多',
+        }, '仓库数按 discover.limit 截断，可能还有仓库未列出'))
+      }
 
-      const scan = h('div', { className: `gr-scan${scanCollapsed ? ' gr-scan--collapsed' : ''}` }, [scanHead, scanHint, ...scanList])
+      // Where the list came from. This line exists because the panel's two
+      // buttons differ in a way that is invisible otherwise: "刷新状态" re-reads
+      // the same inventory, "更新仓库列表" is the only one that can find a
+      // checkout that appeared on disk. Saying which one produced what is on
+      // screen — and when — is what makes that distinction checkable by the
+      // user rather than a claim in a README.
+      const provenanceInfo = registryLine(list)
+      const provenance = provenanceInfo === null
+        ? null
+        : provenanceInfo.kind === 'warning'
+          ? h('div', {
+            className: 'gr-scanHint',
+            key: 'prov',
+            title: registry?.error ?? '',
+          }, [
+            h(Glyph, { path: P.warn, size: 12, key: 'i' }),
+            h('span', { key: 't' }, provenanceInfo.text),
+            h(Btn, {
+              key: 'rescan', icon: P.scan, label: '扫描', variant: 'ghost',
+              onClick: () => { void loadList(root, { quiet: false, rescan: true }) },
+            }),
+          ])
+          : h('div', {
+            className: 'gr-scanNote',
+            key: 'prov',
+            title: `${list.source === 'scan' ? '刚刚重新扫描了目录' : '列表来自本地注册表'}\n扫描记录：${discovery?.at ?? '未知'}\n注册表：${registry?.path ?? ''}`,
+          }, provenanceInfo.text)
+
+      const scan = h('div', { className: `gr-scan${scanCollapsed ? ' gr-scan--collapsed' : ''}` },
+        [scanHead, ...scanNotes, ...scanList, provenance])
 
       /* detail */
       const detailHeader = activeRepo ? h('div', { className: 'gr-detailHead' }, [
@@ -2020,6 +2168,24 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Render an ISO instant as a wall-clock time.
+     *
+     * The registry line compares two instants that are almost always today —
+     * when the directory was last walked and when status was last read — so the
+     * clock alone is what the user needs, and a full date would bury it.
+     *
+     * @param iso - ISO-8601 string.
+     * @returns `HH:MM:SS`, or `未知` when there is no usable instant.
+     */
+    function formatClock(iso) {
+      if (!iso) return '未知'
+      const date = new Date(iso)
+      if (Number.isNaN(date.getTime())) return String(iso)
+      const pad = (value) => String(value).padStart(2, '0')
+      return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    }
+
+    /**
      * The guide capsule glyph.
      *
      * @returns the svg element.
@@ -2086,9 +2252,11 @@ window.__ModuleLoader__.load({
       gitlabUrl,
       pipelineStyle,
       formatDate,
+      formatClock,
       shortPath,
       operationText,
       bulkOutcomeText,
+      registryLine,
       renderConflictPanel,
       conflictText,
     }

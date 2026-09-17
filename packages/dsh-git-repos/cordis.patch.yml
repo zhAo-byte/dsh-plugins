@@ -10,13 +10,27 @@
     - id: git-repos
       name: 'dsh-git-repos'
       config:
-        # Directory scan budget when the panel enumerates repositories.
+        # The repository inventory lives in a local SQLite registry
+        # (`node:sqlite`), so opening the panel only runs `git status` over the
+        # repositories it already knows. The directory tree is walked only when
+        # a root has never been seen, when the budgets below changed, or when
+        # the user presses "更新仓库列表" (`repos.rescan`). With `enabled: false`
+        # — or on a Node without `node:sqlite` — the panel falls back to walking
+        # the tree on every open and says so.
+        store:
+          enabled: true
+          # Default; `~/` is expanded.
+          # path: ~/.dsh/git-repos/registry.db
+        # Directory scan budget, used whenever a root is actually walked.
         # 8 levels covers every ordinary container layout — a Unity project
         # keeps sibling checkouts at `Assets/<Group>/<Module>`, i.e. depth 5,
         # and the old default of 4 hid that whole layer silently.
         # `maxEntries` is the safety valve for pathological trees.
         # Neither budget is applied quietly: when one bites, the panel says
-        # which, above the repository list.
+        # which, above the repository list. Changing any of the three
+        # invalidates every stored scan, so the affected roots are re-walked on
+        # the next open instead of being shown against budgets they were not
+        # produced with.
         discover:
           maxDepth: 8
           limit: 60

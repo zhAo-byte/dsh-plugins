@@ -25,6 +25,7 @@ import { isAbsolute, resolve, sep } from 'node:path'
 
 import * as gitEngine from './git.js'
 import * as gitlab from './gitlab.js'
+import { openRegistry, resolveStorePath, scanFingerprint } from './store.js'
 
 /** Cordis plugin name. */
 export const name = 'dsh-git-repos'
@@ -107,7 +108,13 @@ function normalizeConfig(raw) {
   const config = raw && typeof raw === 'object' ? raw : {}
   const discover = config.discover && typeof config.discover === 'object' ? config.discover : {}
   const timeouts = config.timeouts && typeof config.timeouts === 'object' ? config.timeouts : {}
+  const store = config.store && typeof config.store === 'object' ? config.store : {}
   return {
+    // The repository inventory is persisted, so opening the panel only syncs
+    // status. `enabled: false` restores the old "walk the tree every time"
+    // behaviour; an unavailable backend degrades to the same thing on its own.
+    storeEnabled: store.enabled !== false,
+    storePath: resolveStorePath(store.path),
     // Covers the ordinary container layouts; the ceiling lets a deeper monorepo
     // be scanned deliberately, and either budget is reported when it bites.
     maxDepth: clamp(Number(discover.maxDepth) || gitEngine.DEFAULT_MAX_DEPTH, 1, 24),
@@ -199,21 +206,255 @@ class HttpError extends Error {
   }
 }
 
+/* ── Registry ─────────────────────────────────────────────────────────────── */
+
+/**
+ * Lazy, single-flight access to the repository registry.
+ *
+ * Opening is deferred to the first request so an unused plugin never touches
+ * the disk, and it is cached for the process because every scan and every
+ * listing wants the same handle. A backend that cannot open (no `node:sqlite`,
+ * an unwritable path, `store.enabled: false`) resolves to an inert registry
+ * instead of failing: the panel then walks the tree on every open, which is the
+ * behaviour this cache replaced, and says so.
+ *
+ * @param config - normalized plugin config.
+ * @returns `{ get, describe, close }`.
+ */
+function createRegistry(config) {
+  let pending
+  let live
+
+  /** A registry that remembers nothing. */
+  const inert = (error) => ({
+    available: false,
+    path: config.storePath,
+    error,
+    getWorkspace: async () => undefined,
+    listRepos: async () => [],
+    applyScan: async () => {},
+    stats: async () => ({ workspaces: 0, repositories: 0 }),
+    close: () => {},
+  })
+
+  const get = () => {
+    if (!config.storeEnabled) return Promise.resolve(inert('disabled by configuration'))
+    if (pending === undefined) {
+      pending = openRegistry({ path: config.storePath })
+        .then((registry) => { live = registry; return registry })
+        .catch((error) => inert(error?.message ?? String(error)))
+    }
+    return pending
+  }
+
+  return {
+    get,
+    /** What the panel and `health` report about the store. */
+    async describe() {
+      const store = await get()
+      return {
+        enabled: config.storeEnabled,
+        available: store.available === true,
+        path: store.path,
+        error: store.error,
+        ...(await store.stats()),
+      }
+    },
+    /** Release the handle when the plugin is disposed. */
+    close: () => { if (live?.available === true) live.close() },
+  }
+}
+
 /* ── RPC methods ──────────────────────────────────────────────────────────── */
+
+/**
+ * Walk one root and describe everything the walk saw.
+ *
+ * A root that is itself a repository is not a reason to stop looking — it is
+ * exactly where nested ones live: sibling checkouts under a Unity `Assets/`,
+ * vendored clones, submodules. The fallback below only fires when the walk found
+ * nothing at all, which is the shape a bare repository or a directory inside a
+ * working tree has (git resolves the enclosing repository itself).
+ *
+ * @param root - absolute directory to scan.
+ * @param config - normalized plugin config.
+ * @returns `{ rows, truncated, discovery }` in the panel's row shape.
+ */
+async function scanRoot(root, config) {
+  const scan = await gitEngine.discoverRepositoriesDetailed(root, {
+    maxDepth: config.maxDepth,
+    limit: config.limit,
+    maxEntries: config.maxEntries,
+  })
+  let roots = scan.roots
+  let single = false
+  if (roots.length === 0) {
+    const top = await gitEngine.findRepoRoot(root)
+    if (top !== undefined || await gitEngine.isRepository(root)) {
+      roots = [root]
+      single = true
+    }
+  }
+  return {
+    rows: roots.map((repoRoot) => ({
+      root: repoRoot,
+      relPath: repoRoot === root ? '.' : repoRoot.slice(root.length + 1),
+      name: repoRoot.split(sep).filter(Boolean).pop() ?? repoRoot,
+    })),
+    truncated: roots.length >= config.limit,
+    discovery: {
+      single,
+      visited: scan.visited,
+      maxDepth: scan.maxDepth,
+      maxEntries: scan.maxEntries,
+      depthLimited: scan.depthLimited,
+      entryLimited: scan.entryLimited,
+    },
+  }
+}
+
+/**
+ * The stored scan record, flattened into the envelope the panel renders.
+ *
+ * @param record - one `workspace` row from the registry.
+ * @returns the discovery envelope, with `at` naming when the walk ran.
+ */
+function discoveryOf(record) {
+  return {
+    single: record.single,
+    visited: record.visited,
+    maxDepth: record.maxDepth,
+    maxEntries: record.maxEntries,
+    depthLimited: record.depthLimited,
+    entryLimited: record.entryLimited,
+    at: record.scannedAt,
+  }
+}
 
 /**
  * Build the method table bound to one host context.
  *
  * @param ctx - host context.
  * @param config - normalized plugin config.
+ * @param registry - the {@link createRegistry} handle.
  * @returns method name to handler.
  */
-function buildMethods(ctx, config) {
+function buildMethods(ctx, config, registry) {
   const read = { timeoutMs: config.readTimeoutMs }
   const net = { timeoutMs: config.networkTimeoutMs }
 
   /** Resolve a payload's repo root against the allowlist. */
   const repo = async (payload, label = 'root') => assertContained(payload.root, await allowedRoots(ctx, config), label)
+
+  /** Walks already under way, keyed by root and scan budgets. */
+  const scans = new Map()
+
+  /**
+   * Walk one root, store the result, and report what was found.
+   *
+   * Concurrent callers asking for the same root with the same budgets share one
+   * walk: the panel's poll and its first paint can easily overlap, and two
+   * simultaneous tree walks are exactly the cost this cache exists to avoid.
+   *
+   * @param root - absolute directory.
+   * @returns `{ rows, discovery, truncated, source: 'scan' }`.
+   */
+  const runScan = (root) => {
+    const fingerprint = scanFingerprint(config)
+    const key = `${root}\u0000${fingerprint}`
+    const running = scans.get(key)
+    if (running !== undefined) return running
+    const promise = (async () => {
+      const store = await registry.get()
+      const scan = await scanRoot(root, config)
+      const scannedAt = new Date().toISOString()
+      await store.applyScan({
+        root,
+        rows: scan.rows,
+        meta: { ...scan.discovery, fingerprint, scannedAt, truncated: scan.truncated },
+        // A walk that ran out of budget cannot tell "this checkout was deleted"
+        // from "this checkout is past where I stopped", so it may not remove
+        // anything. A stale extra row is a much smaller problem than a
+        // repository that silently disappears from the list.
+        prune: !scan.discovery.entryLimited && !scan.truncated,
+      })
+      return {
+        rows: scan.rows,
+        discovery: { ...scan.discovery, at: scannedAt },
+        truncated: scan.truncated,
+        source: 'scan',
+      }
+    })()
+    scans.set(key, promise)
+    const done = () => scans.delete(key)
+    promise.then(done, done)
+    return promise
+  }
+
+  /**
+   * The inventory for one root — from the registry when it is current.
+   *
+   * "Current" means a record exists and was produced by the same scan budgets
+   * (the fingerprint). Anything else walks the tree: a root nobody has scanned
+   * yet, a configuration whose `maxDepth`/`limit`/`maxEntries` changed, or the
+   * user's explicit `repos.rescan`.
+   *
+   * @param root - absolute directory.
+   * @param options - `force` always walks.
+   * @returns `{ rows, discovery, truncated, source }`.
+   */
+  const inventoryFor = async (root, { force = false } = {}) => {
+    const store = await registry.get()
+    const record = await store.getWorkspace(root)
+    const current = record !== undefined && record.fingerprint === scanFingerprint(config)
+    if (!force && current) {
+      return {
+        rows: await store.listRepos(root),
+        discovery: discoveryOf(record),
+        truncated: record.truncated,
+        source: 'registry',
+      }
+    }
+    return runScan(root)
+  }
+
+  /**
+   * Run `git status` (and the rest of one summary) for every inventory row.
+   *
+   * This is the half that stays live: the registry answers "which repositories
+   * exist", git answers "what state they are in right now".
+   *
+   * @param root - the scanned root the rows are relative to.
+   * @param rows - registry rows.
+   * @returns the panel's repository rows.
+   */
+  const summarizeAll = async (root, rows) => mapLimit(rows, 6, async (row) => {
+    const repoRoot = row.root
+    const summary = await gitEngine.summary(repoRoot, read)
+    summary.relPath = row.relPath ?? (repoRoot === root ? '.' : repoRoot.slice(root.length + 1))
+    // Something the registry lists but git no longer recognizes is stale rather
+    // than broken: the honest instruction is "rescan", and the manual rescan is
+    // what removes it.
+    if (summary.error !== undefined && !(await gitEngine.isRepository(repoRoot))) summary.stale = true
+    summary.remotes = (summary.remotes ?? []).map((remote) => {
+      const described = gitlab.describeRemote(remote.fetch ?? remote.push, config.gitlabHosts)
+      return { ...remote, hosting: described.gitlab ? 'gitlab' : (described.local ? 'local' : 'other'), described }
+    })
+    return summary
+  })
+
+  /**
+   * Reject a root that is not a directory.
+   *
+   * @param root - canonical absolute path.
+   * @returns the same path.
+   * @throws {HttpError} when nothing is there.
+   */
+  const assertDirectory = async (root) => {
+    const info = await stat(root).catch(() => undefined)
+    if (!info?.isDirectory()) throw new HttpError(400, `not a directory: ${root}`)
+    return root
+  }
 
   return {
     /** Liveness plus the roots this plugin may touch. */
@@ -225,16 +466,17 @@ function buildMethods(ctx, config) {
         roots,
         gitlab: { hosts: config.gitlabHosts, tokenConfigured: Boolean(config.token) },
         discover: { maxDepth: config.maxDepth, limit: config.limit, maxEntries: config.maxEntries },
+        registry: await registry.describe(),
       }
     },
 
     /** The registered workspaces, for the panel's root switcher. */
     'workspaces': async () => {
-      const registry = registryOf(ctx)
+      const registryService = registryOf(ctx)
       const list = []
-      if (registry && typeof registry.list === 'function') {
+      if (registryService && typeof registryService.list === 'function') {
         try {
-          for (const workspace of registry.list()) {
+          for (const workspace of registryService.list()) {
             list.push({ id: workspace.id, path: workspace.path, title: workspace.title })
           }
         } catch {
@@ -244,63 +486,70 @@ function buildMethods(ctx, config) {
       return { workspaces: list, extraRoots: config.extraRoots }
     },
 
-    /** Enumerate repositories under a root and summarize each one. */
+    /**
+     * The repositories under a root, with freshly read status.
+     *
+     * The inventory comes from the registry — the directory tree is walked only
+     * when this root has never been scanned or the scan budgets changed, which
+     * is what makes opening the panel cheap on a deep workbench. What runs on
+     * every call is `git status` per repository, because that is the part that
+     * actually goes stale between two opens.
+     */
     'repos.list': async (payload) => {
-      const root = await repo(payload)
-      const info = await stat(root).catch(() => undefined)
-      if (!info?.isDirectory()) throw new HttpError(400, `not a directory: ${root}`)
-
-      // A root that is itself a repository is not a reason to stop looking —
-      // it is exactly where nested ones live: sibling checkouts under a Unity
-      // `Assets/`, vendored clones, submodules. This used to short-circuit on
-      // "the root is a repo" and return the root alone, which is why a
-      // workspace like a game project showed one row and none of its modules.
-      const scan = await gitEngine.discoverRepositoriesDetailed(root, {
-        maxDepth: config.maxDepth,
-        limit: config.limit,
-        maxEntries: config.maxEntries,
-      })
-      let roots = scan.roots
-      // Nothing under the root carries its own `.git`. Then the root is either
-      // a bare repository (no `.git` entry to find) or a directory inside a
-      // working tree; one row is right for both, and git resolves the
-      // enclosing repository itself.
-      let single = false
-      if (roots.length === 0) {
-        const top = await gitEngine.findRepoRoot(root)
-        if (top !== undefined || await gitEngine.isRepository(root)) {
-          roots = [root]
-          single = true
-        }
-      }
-
-      // Carried to the panel so an incomplete list can say why it is short.
-      const discovery = {
-        single,
-        visited: scan.visited,
-        maxDepth: scan.maxDepth,
-        maxEntries: scan.maxEntries,
-        depthLimited: scan.depthLimited,
-        entryLimited: scan.entryLimited,
-      }
-
-      const repos = await mapLimit(roots, 6, async (repoRoot) => {
-        const row = await gitEngine.summary(repoRoot, read)
-        row.relPath = repoRoot === root ? '.' : repoRoot.slice(root.length + 1)
-        row.remotes = (row.remotes ?? []).map((remote) => {
-          const described = gitlab.describeRemote(remote.fetch ?? remote.push, config.gitlabHosts)
-          return { ...remote, hosting: described.gitlab ? 'gitlab' : (described.local ? 'local' : 'other'), described }
-        })
-        return row
-      })
-
+      const root = await assertDirectory(await repo(payload))
+      const outcome = await inventoryFor(root)
+      const repos = await summarizeAll(root, outcome.rows)
       return {
         root,
         repos,
-        scanned: roots.length,
-        truncated: roots.length >= config.limit,
-        discovery,
+        scanned: outcome.rows.length,
+        truncated: outcome.truncated,
+        discovery: outcome.discovery,
         generatedAt: new Date().toISOString(),
+        source: outcome.source,
+        registry: await registry.describe(),
+      }
+    },
+
+    /**
+     * Re-walk one root by hand, and report what the registry lost and gained.
+     *
+     * This is the only way a repository created outside the panel enters the
+     * list (short of a fresh root or a configuration change), which is the
+     * deliberate trade: a scan that never runs silently is also a scan that
+     * never surprises anyone by taking a second on a cold tree.
+     */
+    'repos.rescan': async (payload) => {
+      const root = await assertDirectory(await repo(payload))
+      const store = await registry.get()
+      const before = (await store.listRepos(root)).map((row) => row.root)
+      const beforeSet = new Set(before)
+      const outcome = await inventoryFor(root, { force: true })
+      // What comes back is the *registry*, not the walk's own rows, and for the
+      // same reason the diff is read back out of it: a truncated walk keeps rows
+      // it did not re-find, so the two answer differently exactly when the
+      // budget bit. Showing the walk's rows here would also make the panel
+      // change its mind on the next poll, which reads the registry — the list a
+      // rescan produces and the list an ordinary open produces must be the same
+      // list.
+      const inventory = store.available === true ? await store.listRepos(root) : outcome.rows
+      const after = inventory.map((row) => row.root)
+      const afterSet = new Set(after)
+      const repos = await summarizeAll(root, inventory)
+      return {
+        root,
+        repos,
+        scanned: after.length,
+        truncated: outcome.truncated,
+        discovery: outcome.discovery,
+        generatedAt: new Date().toISOString(),
+        source: 'scan',
+        diff: {
+          added: after.filter((repoRoot) => !beforeSet.has(repoRoot)),
+          removed: before.filter((repoRoot) => !afterSet.has(repoRoot)),
+          kept: after.filter((repoRoot) => beforeSet.has(repoRoot)).length,
+        },
+        registry: await registry.describe(),
       }
     },
 
@@ -898,7 +1147,8 @@ function crossSiteReason(req) {
  */
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
-  const methods = buildMethods(ctx, config)
+  const registry = createRegistry(config)
+  const methods = buildMethods(ctx, config, registry)
 
   const handler = async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://dsh.internal')
@@ -956,9 +1206,17 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'prefix',
-    path: '/dsh-git-repos/api',
-    handler,
-  }), 'dsh-git-repos: /dsh-git-repos/api routes')
+  ctx.effect(() => {
+    const dispose = ctx.webServer.register({
+      kind: 'prefix',
+      path: '/dsh-git-repos/api',
+      handler,
+    })
+    return () => {
+      if (typeof dispose === 'function') dispose()
+      // The registry is a process-lifetime handle; releasing it with the route
+      // keeps a reloaded plugin from leaving a second `DatabaseSync` behind.
+      registry.close()
+    }
+  }, 'dsh-git-repos: /dsh-git-repos/api routes')
 }

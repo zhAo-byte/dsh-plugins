@@ -112,6 +112,8 @@ dsh plugin --profile web add ./packages/dsh-remote-control
 
 官方右侧栏里的**多仓库 Git 工具窗**：把一个工作台下的所有仓库列成一棵树，
 逐个下钻到变更 / 历史 / 分支 / 远程，并识别 GitLab 托管仓（MR、流水线、深链）。
+仓库清单存在本地 SQLite 注册表里，所以打开面板只同步 `git status`、不重扫目录；
+新仓库由「更新仓库列表」这个显式动作（`repos.rescan`）发现。
 **读写都有**：单仓和批量的抓取 / 拉取 / 推送、暂存 / 提交 / 放弃改动、分支切换与删除、
 stash，以及真正的合并与 rebase（含冲突状态、完成 / 放弃）。
 单包两半——宿主行提供 `/dsh-git-repos/api/*`，浏览器半边是右侧栏 tab，
