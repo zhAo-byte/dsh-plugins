@@ -369,22 +369,58 @@ function buildMethods(ctx, config) {
     },
 
     /** Fetch every named repository at once. */
-    'repo.fetchAll': async (payload) => {
-      const roots = await allowedRoots(ctx, config)
-      const targets = []
-      for (const candidate of Array.isArray(payload.roots) ? payload.roots : []) {
-        targets.push(await assertContained(candidate, roots, 'roots[]'))
-      }
-      const results = await mapLimit(targets, 4, async (root) => {
-        try {
-          const output = await gitEngine.fetch(root, payload.remote || 'origin', net)
-          return { root, ok: true, output }
-        } catch (error) {
-          return { root, ok: false, error: error?.message ?? String(error) }
-        }
+    'repo.fetchAll': async (payload) => bulk(ctx, config, payload, 'fetch', net),
+
+    /**
+     * Run one network operation across many repositories.
+     *
+     * Kept as one method rather than three near-identical ones because the
+     * interesting behaviour is shared: the allow-list check per root, bounded
+     * concurrency, and a per-repository outcome so one failure never hides the
+     * rest. `fetch`/`pull`/`push` only differ in which engine call runs.
+     *
+     * A `pull` that stops on a conflict is reported as `conflict` rather than as
+     * a failure, and the repository is left mid-merge on purpose — that is how a
+     * bulk pull is supposed to end when the base diverged, and the panel's merge
+     * banner is what finishes it.
+     */
+    'repo.bulk': async (payload) => bulk(ctx, config, payload, payload.action, net),
+
+    /** The merge/rebase/cherry-pick/revert state that owns this working tree, if any. */
+    'repo.operation': async (payload) => ({
+      operation: await gitEngine.operationState(await repo(payload)),
+    }),
+
+    /** Merge one ref into the current branch. */
+    'repo.merge': async (payload) => {
+      const root = await repo(payload)
+      const result = await gitEngine.merge(root, payload.target, {
+        noFf: payload.noFf === true,
+        ffOnly: payload.ffOnly === true,
+        timeoutMs: config.networkTimeoutMs,
       })
-      return { results }
+      return result
     },
+
+    /** Abandon the merge in progress. */
+    'repo.mergeAbort': async (payload) => ({ output: await gitEngine.mergeAbort(await repo(payload)) }),
+
+    /** Finish the merge in progress by committing the resolved index. */
+    'repo.mergeContinue': async (payload) => ({
+      output: await gitEngine.mergeContinue(await repo(payload), payload.message),
+    }),
+
+    /** Replay the current branch onto another ref. */
+    'repo.rebase': async (payload) => {
+      const root = await repo(payload)
+      return await gitEngine.rebaseOnto(root, payload.onto, { timeoutMs: config.networkTimeoutMs })
+    },
+
+    /** Abandon the rebase in progress. */
+    'repo.rebaseAbort': async (payload) => ({ output: await gitEngine.rebaseAbort(await repo(payload)) }),
+
+    /** Continue the rebase in progress. */
+    'repo.rebaseContinue': async (payload) => ({ output: await gitEngine.rebaseContinue(await repo(payload)) }),
 
     /** Pull the current branch. */
     'repo.pull': async (payload) => {
@@ -568,6 +604,82 @@ async function mapLimit(items, limit, fn) {
   })
   await Promise.all(workers)
   return results
+}
+
+/** The network actions `repo.bulk` knows how to run. */
+const BULK_ACTIONS = new Set(['fetch', 'pull', 'push'])
+
+/**
+ * Run one network action across many repositories, reporting each one.
+ *
+ * Concurrency is bounded because these are network calls against the same
+ * remote, and the per-repository outcome is the point: a bulk action that
+ * aborted on the first failure would hide which repositories were never
+ * attempted. A `pull` that stops on a conflict is reported as `conflict` rather
+ * than as an error, because that is a state the panel can finish.
+ *
+ * @param ctx - host context.
+ * @param config - normalized plugin config.
+ * @param payload - `{ roots, remote?, rebase?, setUpstream? }`.
+ * @param action - `'fetch'`, `'pull'`, or `'push'`.
+ * @param net - network timeout options.
+ * @returns `{ action, results }` with one row per requested root.
+ * @throws {HttpError} when the action or a root is not admissible.
+ */
+async function bulk(ctx, config, payload, action, net) {
+  if (!BULK_ACTIONS.has(action)) {
+    throw new HttpError(400, `unknown bulk action: ${JSON.stringify(action)}; use fetch, pull, or push`)
+  }
+  const roots = await allowedRoots(ctx, config)
+  const requested = Array.isArray(payload.roots) ? payload.roots : []
+  if (requested.length === 0) throw new HttpError(400, 'roots must name at least one repository')
+  const targets = []
+  for (const candidate of requested) {
+    targets.push(await assertContained(candidate, roots, 'roots[]'))
+  }
+
+  const results = await mapLimit(targets, 4, async (root) => {
+    try {
+      if (action === 'fetch') {
+        return { root, ok: true, outcome: 'fetched', output: await gitEngine.fetch(root, payload.remote || 'origin', net) }
+      }
+      if (action === 'pull') {
+        const rebase = payload.rebase === true
+        const output = await gitEngine.pull(root, { rebase, ...net })
+        // A fast-forward and a rebase are different enough to name apart: one
+        // moved the branch, the other rewrote local commits.
+        return { root, ok: true, outcome: rebase ? 'rebased' : 'pulled', output }
+      }
+      const output = await gitEngine.push(root, {
+        remote: payload.remote,
+        setUpstream: payload.setUpstream === true,
+        ...net,
+      })
+      return { root, ok: true, outcome: 'pushed', output }
+    } catch (error) {
+      const stderr = typeof error?.stderr === 'string' ? error.stderr : ''
+      // `pull --ff-only` refuses a divergence by exiting non-zero, and that
+      // refusal is exactly what a bulk pull is most likely to hit. Naming it
+      // `diverged` is what lets the panel say "run merge here" instead of
+      // showing a raw git message.
+      const diverged = /not possible to fast-forward|divergent branches|need to specify how to reconcile/i.test(stderr)
+        || /not possible to fast-forward|divergent branches|need to specify how to reconcile/i.test(String(error?.message ?? ''))
+      // A pull that stopped on conflicts leaves the repository mid-merge, which
+      // is a different report from one that simply refused to fast-forward: the
+      // first needs the user in the working tree, the second needs a merge.
+      const operation = action === 'pull' ? (await gitEngine.operationState(root)).kind : 'none'
+      if (operation === 'merge' || operation === 'rebase') {
+        return { root, ok: false, outcome: 'conflict', error: error?.message ?? String(error) }
+      }
+      return {
+        root,
+        ok: false,
+        outcome: diverged ? 'diverged' : 'failed',
+        error: error?.message ?? String(error),
+      }
+    }
+  })
+  return { action, results }
 }
 
 /* ── Transport ────────────────────────────────────────────────────────────── */

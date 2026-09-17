@@ -39,6 +39,42 @@ window.__ModuleLoader__.load({
     const MIN_REFRESH = 3
     const MAX_REFRESH = 120
 
+    /* ── Pure labels ────────────────────────────────────────────────────────── */
+
+    /**
+     * Human label for the operation that owns a working tree.
+     *
+     * Module scope on purpose: the banner and the row chips both call it, and the
+     * label set is part of this panel's vocabulary rather than of one render.
+     *
+     * @param operation - `{ kind, rebaseKind? }` from `repo.status`.
+     * @returns the label, or an empty string for an ordinary working tree.
+     */
+    function operationText(operation) {
+      const kind = operation?.kind
+      if (kind === 'merge') return '合并进行中'
+      if (kind === 'rebase') return operation.rebaseKind === 'apply' ? 'rebase 进行中 (apply)' : 'rebase 进行中'
+      if (kind === 'cherry-pick') return 'cherry-pick 进行中'
+      if (kind === 'revert') return 'revert 进行中'
+      return ''
+    }
+
+    /**
+     * Short verdict for one bulk outcome.
+     *
+     * @param outcome - one `repo.bulk` result's `outcome`.
+     * @returns the label the row chip shows.
+     */
+    function bulkOutcomeText(outcome) {
+      if (outcome === 'fetched') return '已抓取'
+      if (outcome === 'pulled') return '已拉取'
+      if (outcome === 'rebased') return '已 rebase'
+      if (outcome === 'pushed') return '已推送'
+      if (outcome === 'diverged') return '需要合并'
+      if (outcome === 'conflict') return '停在冲突'
+      return '失败'
+    }
+
     /* ── Styles ─────────────────────────────────────────────────────────────── */
 
     const CSS = `
@@ -411,9 +447,22 @@ window.__ModuleLoader__.load({
       const [scanCollapsed, setScanCollapsed] = React.useState(prefs('scanCollapsed') === '1')
       const [interval, setIntervalSeconds] = React.useState(Number(prefs('interval') ?? 10))
       const [showSettings, setShowSettings] = React.useState(false)
+      /** Per-repository outcome of the last bulk action, keyed by repo root. */
+      const [bulk, setBulk] = React.useState(null)
+      const [mergeTarget, setMergeTarget] = React.useState('')
+      const [rebaseTarget, setRebaseTarget] = React.useState('')
 
       const stateRef = React.useRef({})
       stateRef.current = { root, activeRoot, busy, tab, visible }
+      // The bulk runner needs the repository list, but it is defined before the
+      // rows are derived; a ref keeps it reading the latest list instead of the
+      // one captured the render the callback was created in.
+      const listRef = React.useRef(null)
+      listRef.current = list
+      const mergeTargetRef = React.useRef('')
+      mergeTargetRef.current = mergeTarget
+      const rebaseTargetRef = React.useRef('')
+      rebaseTargetRef.current = rebaseTarget
 
       // The session directory is the default root; a manual pick wins until the
       // session itself changes.
@@ -539,9 +588,102 @@ window.__ModuleLoader__.load({
         }
       }, [loadDetail, loadList])
 
+      /**
+       * Run one network action across every listed repository.
+       *
+       * The outcome is per repository and stays on screen, because "全部拉取" on a
+       * workbench of twenty checkouts is exactly where a single silent failure
+       * costs the most: the summary says how many succeeded, and each row keeps
+       * its own verdict until the next action replaces it.
+       */
+      const runBulk = React.useCallback(async (action, label, extra = {}) => {
+        const snapshot = stateRef.current
+        const targets = asArray(listRef.current?.repos).map((row) => row.root)
+        if (targets.length === 0) return
+        setBusy(label)
+        setError(null)
+        setNotice(null)
+        try {
+          const result = await rpc('repo.bulk', { roots: targets, action, ...extra })
+          const rows = asArray(result?.results)
+          const byRoot = {}
+          for (const row of rows) byRoot[row.root] = row
+          setBulk({ action, label, byRoot })
+          const failed = rows.filter((row) => row.ok !== true)
+          if (failed.length === 0) setNotice(`${label}完成：${rows.length} 个仓库`)
+          else {
+            // Conflicts are called out separately: they are not a failure of the
+            // action but a state the user has to finish in the working tree.
+            const conflicts = failed.filter((row) => row.outcome === 'conflict').length
+            const diverged = failed.filter((row) => row.outcome === 'diverged').length
+            const parts = [`${rows.length - failed.length} 成功`]
+            if (diverged > 0) parts.push(`${diverged} 个需要合并才能拉取`)
+            if (conflicts > 0) parts.push(`${conflicts} 个停在冲突`)
+            const rest = failed.length - conflicts - diverged
+            if (rest > 0) parts.push(`${rest} 个失败`)
+            setError(`${label}：${parts.join('，')}`)
+          }
+          if (snapshot.activeRoot) await loadDetail(snapshot.activeRoot, { quiet: true })
+          if (snapshot.root) await loadList(snapshot.root, { quiet: true })
+          return result
+        } catch (failure) {
+          setError(`${label}失败：${failure.message}`)
+          return null
+        } finally {
+          setBusy(null)
+        }
+      }, [loadDetail, loadList])
+
+      /**
+       * Finish or abandon the merge/rebase that owns this working tree.
+       *
+       * Every one of these refreshes twice on purpose: the operation state drives
+       * the banner, and the working tree it leaves behind drives the changes tab.
+       */
+      const operationAction = React.useCallback(async (label, method, payload = {}) => {
+        if (stateRef.current.activeRoot === null) return
+        await act(label, async () => {
+          const result = await rpc(method, { root: stateRef.current.activeRoot, ...payload })
+          if (result?.merged === 'conflict') {
+            throw new Error(`仍然有 ${asArray(result.conflicts).length} 个冲突文件没有解决`)
+          }
+          return result
+        })
+      }, [act])
+
       const repos = asArray(list?.repos)
       const activeRepo = repos.find((row) => row.root === activeRoot) ?? null
       const gitlabRemote = asArray(detail?.remotes).find((row) => row.described?.gitlab) ?? null
+
+      /**
+       * Merge a ref into the current branch, or replay onto it.
+       *
+       * A conflict is a normal ending, not a failure: the action reports how many
+       * files stopped it, the panel's banner switches to "finish or abandon", and
+       * the conflicted files appear in the changes tab. Throwing here would show
+       * the same string as a network error and hide that the repository is now
+       * mid-merge.
+       */
+      const mergeNow = React.useCallback(async (kind, extra = {}) => {
+        const snapshot = stateRef.current
+        const root = snapshot.activeRoot
+        if (root === null) return
+        const target = (kind === 'merge' ? mergeTargetRef.current : rebaseTargetRef.current).trim()
+        if (target === '') return
+        const label = kind === 'merge' ? (extra.noFf ? '合并 (--no-ff)' : '合并') : 'Rebase'
+        await act(label, async () => {
+          const result = kind === 'merge'
+            ? await rpc('repo.merge', { root, target, ...extra })
+            : await rpc('repo.rebase', { root, onto: target })
+          if (result?.merged === 'conflict') {
+            setNotice(`${label}停在冲突：${asArray(result.conflicts).length} 个文件需要你解决`)
+            return result
+          }
+          if (result?.merged === 'fast-forward') setNotice(`${label}完成：快进到 ${target}`)
+          return result
+        })
+      }, [act, mergeTarget, rebaseTarget])
+
 
       /** Load GitLab facts for the open repository. */
       const loadGitlab = React.useCallback(async () => {
@@ -584,10 +726,6 @@ window.__ModuleLoader__.load({
         h(Btn, {
           key: 'refresh', icon: P.refresh, title: '刷新', disabled: Boolean(busy),
           onClick: () => { void loadList(root, { quiet: false }); if (activeRoot) void loadDetail(activeRoot) },
-        }),
-        h(Btn, {
-          key: 'fetchall', icon: P.down, title: '全部抓取 (fetch all)', disabled: Boolean(busy) || repos.length === 0,
-          onClick: () => act('全部抓取', () => rpc('repo.fetchAll', { roots: repos.map((row) => row.root) }), { refreshList: true }),
         }),
         h(Btn, {
           key: 'settings', icon: P.settings, title: '设置', variant: showSettings ? 'primary' : undefined,
@@ -649,6 +787,30 @@ window.__ModuleLoader__.load({
         h('span', { key: 'spacer', className: 'gr-grow' }),
         busy ? h(Glyph, { key: 'busy', path: P.refresh, spin: true }) : null,
         listLoading ? h('span', { key: 'load', className: 'gr-dim' }, '扫描中…') : null,
+        // Bulk actions are the reason a multi-repository tool window exists: one
+        // click has to reach every checkout the list is already showing.
+        h(Btn, {
+          key: 'fetchAll', icon: P.down, label: '全部抓取', variant: 'ghost',
+          disabled: Boolean(busy) || repos.length === 0,
+          title: `对列表中全部 ${repos.length} 个仓库执行 git fetch`,
+          onClick: () => void runBulk('fetch', '全部抓取'),
+        }),
+        h(Btn, {
+          key: 'pullAll', icon: P.sync, label: '全部拉取', variant: 'ghost',
+          disabled: Boolean(busy) || repos.length === 0,
+          title: `对列表中全部 ${repos.length} 个仓库执行 git pull --ff-only`,
+          onClick: () => void runBulk('pull', '全部拉取'),
+        }),
+        h(Btn, {
+          key: 'pushAll', icon: P.up, label: '全部推送', variant: 'ghost',
+          disabled: Boolean(busy) || repos.length === 0,
+          title: `对列表中全部 ${repos.length} 个仓库执行 git push（未设上游的会一并设置）`,
+          onClick: () => {
+            if (window.confirm(`把 ${repos.length} 个仓库的当前分支都推送到它们的上游？`)) {
+              void runBulk('push', '全部推送', { setUpstream: true })
+            }
+          },
+        }),
         h('span', {
           key: 'when', className: 'gr-dim gr-mono',
           title: list?.generatedAt ?? '',
@@ -689,6 +851,23 @@ window.__ModuleLoader__.load({
             ]) : null,
             row.ahead ? h('span', { key: 'a', className: 'gr-chip gr-chip--ahead' }, `↑${row.ahead}`) : null,
             row.behind ? h('span', { key: 'be', className: 'gr-chip gr-chip--behind' }, `↓${row.behind}`) : null,
+            // An operation in progress is a property of the repository, not of the
+            // selection: a bulk pull has to be visible as "this one needs me" from
+            // the list alone.
+            operationText(row.operation)
+              ? h('span', {
+                key: 'op', className: 'gr-chip',
+                style: { color: 'var(--dsw-alias-state-warning-primary,#b7791f)' },
+                title: '这个仓库有未完成的合并/rebase，其它操作会先要求你处理它',
+              }, operationText(row.operation))
+              : null,
+            bulk?.byRoot?.[row.root]
+              ? h('span', {
+                key: 'bulk', className: 'gr-chip',
+                style: { color: bulk.byRoot[row.root].ok === true ? 'var(--dsw-alias-state-success-primary,#2f9e63)' : 'var(--dsw-alias-state-error-primary,#d8503f)' },
+                title: [bulk.byRoot[row.root].error ?? bulk.byRoot[row.root].output ?? ''].join('\n').trim(),
+              }, bulkOutcomeText(bulk.byRoot[row.root].outcome))
+              : null,
             !row.clean && row.counts ? h('span', { key: 'c', className: 'gr-count' }, `${row.counts.changed}`) : null,
             asArray(row.remotes).some((remote) => remote.hosting === 'gitlab')
               ? h('span', { key: 'gl', className: 'gr-chip gr-chip--gl' }, 'GL') : null,
@@ -784,6 +963,53 @@ window.__ModuleLoader__.load({
           }),
         ]),
       ]) : null
+
+      /**
+       * The unfinished operation, when there is one.
+       *
+       * It sits between the header and the tabs rather than inside a tab, because
+       * it changes what every other button in the panel means: while a merge is
+       * stopped, "提交" finishes the merge and a pull would refuse. Naming the
+       * state and offering its two endings is the minimum honest surface.
+       */
+      const operation = detail?.status?.operation
+      const operationKind = operation?.kind && operation.kind !== 'none' ? operation.kind : null
+      const operationBar = activeRepo && operationKind
+        ? h('div', { className: 'gr-banner gr-banner--notice', key: 'operation' }, [
+          h(Glyph, { path: P.warn, key: 'i' }),
+          h('span', { key: 't', className: 'gr-grow' }, [
+            operationText(operation),
+            (detail?.status?.counts?.conflicted ?? 0) > 0
+              ? `：还有 ${detail.status.counts.conflicted} 个冲突文件待解决`
+              : '：冲突都已解决，可以直接继续',
+          ].join('')),
+          operationKind === 'merge'
+            ? h(Btn, {
+              key: 'cont', icon: P.check, label: '完成合并', variant: 'primary', disabled: Boolean(busy),
+              title: 'git commit --no-edit，提交已解决的索引',
+              onClick: () => void operationAction('完成合并', 'repo.mergeContinue'),
+            })
+            : null,
+          operationKind === 'rebase'
+            ? h(Btn, {
+              key: 'cont', icon: P.check, label: '继续 rebase', variant: 'primary', disabled: Boolean(busy),
+              title: 'git rebase --continue（使用 git 已准备好的提交信息）',
+              onClick: () => void operationAction('继续 rebase', 'repo.rebaseContinue'),
+            })
+            : null,
+          h(Btn, {
+            key: 'abort', icon: P.undo, label: '放弃', variant: 'danger', disabled: Boolean(busy),
+            title: operationKind === 'merge' ? 'git merge --abort' : 'git rebase --abort',
+            onClick: () => {
+              if (!window.confirm(`放弃这次${operationKind === 'merge' ? '合并' : ' rebase'}并恢复到操作前的状态？`)) return
+              void operationAction(
+                operationKind === 'merge' ? '放弃合并' : '放弃 rebase',
+                operationKind === 'merge' ? 'repo.mergeAbort' : 'repo.rebaseAbort',
+              )
+            },
+          }),
+        ])
+        : null
 
       const tabs = [
         { id: 'changes', label: '变更', count: detail?.status?.counts?.changed },
@@ -958,6 +1184,45 @@ window.__ModuleLoader__.load({
       ])
 
       const branchesTab = h('div', { className: 'gr-content' }, [
+        h('div', { className: 'gr-section', key: 'integrate' }, [
+          h('div', { className: 'gr-sectionTitle' }, '合并 / rebase'),
+          h('div', { className: 'gr-row', key: 'merge' }, [
+            h('input', {
+              className: 'gr-input', placeholder: '把哪个分支合并进来？例如 main 或 origin/main',
+              value: mergeTarget, disabled: operationKind !== null,
+              title: operationKind === null ? '' : '先完成或放弃进行中的操作',
+              onChange: (event) => setMergeTarget(event.target.value),
+              onKeyDown: (event) => { if (event.key === 'Enter') void mergeNow('merge') },
+            }),
+            h(Btn, {
+              icon: P.commit, label: '合并', disabled: Boolean(busy) || operationKind !== null || mergeTarget.trim() === '',
+              onClick: () => void mergeNow('merge'),
+            }),
+            h(Btn, {
+              icon: P.commit, label: '--no-ff', variant: 'ghost', disabled: Boolean(busy) || operationKind !== null || mergeTarget.trim() === '',
+              title: '强制生成一个合并提交，不用快进',
+              onClick: () => void mergeNow('merge', { noFf: true }),
+            }),
+          ]),
+          h('div', { className: 'gr-row', key: 'rebase' }, [
+            h('input', {
+              className: 'gr-input', placeholder: '把当前分支 rebase 到哪？例如 main',
+              value: rebaseTarget, disabled: operationKind !== null,
+              title: operationKind === null ? '' : '先完成或放弃进行中的操作',
+              onChange: (event) => setRebaseTarget(event.target.value),
+              onKeyDown: (event) => { if (event.key === 'Enter') void mergeNow('rebase') },
+            }),
+            h(Btn, {
+              icon: P.sync, label: 'Rebase', disabled: Boolean(busy) || operationKind !== null || rebaseTarget.trim() === '',
+              title: 'git rebase <目标>，会重写本地提交',
+              onClick: () => void mergeNow('rebase'),
+            }),
+          ]),
+          h('div', { className: 'gr-dim', style: { fontSize: 11, paddingTop: 2 } },
+            operationKind === null
+              ? '停到冲突时，这里会出现「完成/继续」和「放弃」两个按钮'
+              : '当前有进行中的操作，先在上方完成或放弃它'),
+        ]),
         h('div', { className: 'gr-section', key: 'new' }, [
           h('div', { className: 'gr-sectionTitle' }, '新建分支'),
           h('div', { className: 'gr-split' }, [
@@ -1136,7 +1401,7 @@ window.__ModuleLoader__.load({
         ...banners,
         h('div', { className: 'gr-body', key: 'body' }, [
           scan,
-          h('div', { className: 'gr-detail', key: 'detail' }, [detailHeader, tabStrip, content]),
+          h('div', { className: 'gr-detail', key: 'detail' }, [detailHeader, operationBar, tabStrip, content]),
         ]),
       ])
     }
@@ -1356,6 +1621,8 @@ window.__ModuleLoader__.load({
       pipelineStyle,
       formatDate,
       shortPath,
+      operationText,
+      bulkOutcomeText,
     }
     return module.exports
   },

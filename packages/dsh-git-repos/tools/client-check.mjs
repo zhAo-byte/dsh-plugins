@@ -162,7 +162,18 @@ check('body shows the empty state before any data', JSON.stringify(tree).include
   || JSON.stringify(tree).includes('等待会话工作目录'))
 
 console.log('\n# helpers')
-const { asArray, unpackDetail, statusLetter, splitPath, diffLineClass, renderChanges, renderDiff, gitlabUrl, pipelineStyle, formatDate } = moduleExports.internals
+const { asArray, unpackDetail, statusLetter, splitPath, diffLineClass, renderChanges, renderDiff, gitlabUrl, pipelineStyle, formatDate, operationText, bulkOutcomeText } = moduleExports.internals
+
+// The two new surfaces are pure label maps, so they are asserted here rather
+// than through a rendered tree: the banner and the row chips both decide what to
+// say from exactly these answers, and a wrong answer is a silent lie on screen.
+check('an unfinished merge is named', operationText({ kind: 'merge' }) === '合并进行中', operationText({ kind: 'merge' }))
+check('an unfinished rebase is named', operationText({ kind: 'rebase' }) === 'rebase 进行中', operationText({ kind: 'rebase' }))
+check('a clean tree has no operation label', operationText({ kind: 'none' }) === '' && operationText(undefined) === '')
+check('a conflicted bulk result is called out', bulkOutcomeText('conflict') === '停在冲突', bulkOutcomeText('conflict'))
+check('a divergence points at merging', bulkOutcomeText('diverged') === '需要合并', bulkOutcomeText('diverged'))
+check('every bulk outcome has a label', ['fetched', 'pulled', 'rebased', 'pushed', 'diverged', 'conflict', 'failed']
+  .every((outcome) => bulkOutcomeText(outcome) !== ''), JSON.stringify(['fetched', 'pulled'].map(bulkOutcomeText)))
 
 check('asArray accepts arrays', asArray([1, 2]).length === 2)
 check('asArray rejects objects', asArray({ remotes: [] }).length === 0)

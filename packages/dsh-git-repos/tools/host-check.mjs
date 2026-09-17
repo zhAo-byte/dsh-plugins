@@ -17,6 +17,10 @@
  */
 
 import http from 'node:http'
+import { spawnSync } from 'node:child_process'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 import { apply as applyHost } from '../lib/index.js'
 import { DEFAULT_MAX_DEPTH, DEFAULT_MAX_ENTRIES } from '../lib/git.js'
@@ -73,7 +77,14 @@ const ctx = {
 // A non-default budget proves the echo is the config and not a coincidence;
 // pointed at a real workbench, the shipped defaults are what the panel will
 // really use, so the repository count means something.
-const pluginConfig = expectedRepos === undefined ? { discover: { maxDepth: 3, limit: 20 } } : {}
+// The fixture root has to exist (and be registered) before `apply()` runs: the
+// containment guard reads the root set when the method table is built, so a
+// directory created afterwards would be refused for reasons that look like a bug
+// in the guard but are really an ordering mistake in this harness.
+const fixtureRoot = await mkdtemp(resolve(tmpdir(), 'dsh-git-repos-host-'))
+const pluginConfig = expectedRepos === undefined
+  ? { discover: { maxDepth: 3, limit: 20 }, extraRoots: [fixtureRoot] }
+  : { extraRoots: [fixtureRoot] }
 applyHost(ctx, pluginConfig)
 
 console.log('\n# registration')
@@ -219,6 +230,124 @@ check('repo-relative escapes are rejected', badPath.status === 409, `${badPath.s
 
 const getWrite = await call('repo.stage', {}, { httpMethod: 'GET' })
 check('GET is refused for non-health methods', getWrite.status === 405, String(getWrite.status))
+
+/* ── bulk operations and merge, over the real route ───────────────────────────
+ * The engine has its own fixture in `check.mjs`; this section exists because the
+ * *route* is where a bulk action's payload shape and its per-repository outcomes
+ * are decided, and because `pull`/`push` cannot be exercised against the working
+ * checkout this harness points at. Two clones of a local bare remote need no
+ * network and still produce a real divergence, a real fast-forward, and a real
+ * conflict.
+ */
+
+/**
+ * Run git inside the fixture and fail the check on a non-zero exit.
+ *
+ * @param cwd - fixture directory.
+ * @param args - argv array.
+ * @returns stdout.
+ */
+function fixtureGit(cwd, args) {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0' } })
+  if (result.status !== 0) throw new Error(`fixture git ${args.join(' ')} failed: ${result.stderr || result.stdout}`)
+  return result.stdout
+}
+
+console.log('\n# bulk operations and merge')
+const fixture = fixtureRoot
+try {
+  const origin = join(fixture, 'origin.git')
+  const alice = join(fixture, 'alice')
+  const bob = join(fixture, 'bob')
+  fixtureGit(fixture, ['init', '--bare', '-b', 'main', origin])
+  // alice is built locally and pushes first: a clone of an empty repository
+  // cannot check out a branch that does not exist yet, so the remote has to be
+  // seeded before bob exists at all.
+  fixtureGit(fixture, ['init', '-b', 'main', alice])
+  fixtureGit(alice, ['config', 'user.email', 'check@example.com'])
+  fixtureGit(alice, ['config', 'user.name', 'Check'])
+  fixtureGit(alice, ['remote', 'add', 'origin', origin])
+  await writeFile(join(alice, 'file.txt'), 'one\n')
+  fixtureGit(alice, ['add', '-A'])
+  fixtureGit(alice, ['commit', '-m', 'first'])
+  fixtureGit(alice, ['push', '-u', 'origin', 'main'])
+  fixtureGit(fixture, ['clone', origin, bob])
+  fixtureGit(bob, ['config', 'user.email', 'check@example.com'])
+  fixtureGit(bob, ['config', 'user.name', 'Check'])
+
+  // A clean tree reports no operation; the fixture has no conflict yet.
+  const opClean = await call('repo.operation', { root: bob })
+  check('repo.operation answers for a clean tree', opClean.status === 200 && opClean.body?.value?.operation?.kind === 'none',
+    JSON.stringify(opClean.body?.value))
+
+  // alice moves ahead, so bob's pull fast-forwards.
+  await writeFile(join(alice, 'file.txt'), 'two\n')
+  fixtureGit(alice, ['commit', '-am', 'second'])
+  fixtureGit(alice, ['push'])
+  const bulkFetch = await call('repo.bulk', { roots: [bob], action: 'fetch' })
+  check('bulk fetch answers per repository', bulkFetch.status === 200 && bulkFetch.body?.value?.results?.[0]?.outcome === 'fetched',
+    JSON.stringify(bulkFetch.body?.value))
+  const bulkPull = await call('repo.bulk', { roots: [bob], action: 'pull' })
+  check('bulk pull reports a per-repository outcome', bulkPull.body?.value?.results?.[0]?.outcome === 'pulled',
+    JSON.stringify(bulkPull.body?.value))
+  check('bulk pull actually moved the branch', fixtureGit(bob, ['log', '-1', '--format=%s']).trim() === 'second')
+
+  // bob commits, so his push has something to send.
+  await writeFile(join(bob, 'bob.txt'), 'bob\n')
+  fixtureGit(bob, ['add', '-A'])
+  fixtureGit(bob, ['commit', '-m', 'from bob'])
+  const bulkPush = await call('repo.bulk', { roots: [bob], action: 'push' })
+  check('bulk push reports a per-repository outcome', bulkPush.body?.value?.results?.[0]?.outcome === 'pushed',
+    JSON.stringify(bulkPush.body?.value))
+  check('bulk push reached the remote', fixtureGit(origin, ['log', '-1', '--format=%s', 'main']).trim() === 'from bob')
+
+  // A divergence that `--ff-only` cannot reconcile is a named outcome, not a
+  // raw git message: this is the case a bulk pull is most likely to hit.
+  // alice syncs first so that the *only* divergence is the one being tested.
+  fixtureGit(alice, ['pull', '--ff-only'])
+  await writeFile(join(alice, 'file.txt'), 'alice again\n')
+  fixtureGit(alice, ['commit', '-am', 'alice again'])
+  fixtureGit(alice, ['push'])
+  await writeFile(join(bob, 'other.txt'), 'bob again\n')
+  fixtureGit(bob, ['add', '-A'])
+  fixtureGit(bob, ['commit', '-m', 'bob again'])
+  const diverged = await call('repo.bulk', { roots: [bob], action: 'pull' })
+  check('a diverged bulk pull is named, not a bare failure',
+    diverged.body?.value?.results?.[0]?.outcome === 'diverged', JSON.stringify(diverged.body?.value))
+  check('a diverged pull leaves no half-merge behind', (await call('repo.operation', { root: bob })).body?.value?.operation?.kind === 'none')
+
+  // A merge that stops on a conflict: reported as an outcome, the repository
+  // stays in the merge state, and the route exposes the way out.
+  fixtureGit(bob, ['fetch', 'origin'])
+  await writeFile(join(alice, 'file.txt'), 'alice wins\n')
+  fixtureGit(alice, ['commit', '-am', 'alice wins'])
+  fixtureGit(alice, ['push'])
+  await writeFile(join(bob, 'file.txt'), 'bob wins\n')
+  fixtureGit(bob, ['commit', '-am', 'bob wins'])
+  fixtureGit(bob, ['fetch', 'origin'])
+  const conflict = await call('repo.merge', { root: bob, target: 'origin/main' })
+  check('a conflicting merge answers with its conflicts',
+    conflict.status === 200 && conflict.body?.value?.merged === 'conflict'
+    && conflict.body.value.conflicts.includes('file.txt'), JSON.stringify(conflict.body?.value))
+  const midMergeOp = await call('repo.operation', { root: bob })
+  check('the route reports the merge in progress', midMergeOp.body?.value?.operation?.kind === 'merge',
+    JSON.stringify(midMergeOp.body?.value))
+  const abortRoute = await call('repo.mergeAbort', { root: bob })
+  check('the merge can be abandoned over the route', abortRoute.status === 200, JSON.stringify(abortRoute.body).slice(0, 160))
+  check('the abort cleared the merge state', (await call('repo.operation', { root: bob })).body?.value?.operation?.kind === 'none')
+
+  // Argument guards the route must enforce before git sees anything.
+  const badAction = await call('repo.bulk', { roots: [bob], action: 'rebase-everything' })
+  check('an unknown bulk action is refused', badAction.status === 400, `${badAction.status} ${JSON.stringify(badAction.body)}`)
+  const noRoots = await call('repo.bulk', { roots: [], action: 'fetch' })
+  check('a bulk action with no roots is refused', noRoots.status === 400, String(noRoots.status))
+  const escapedRoot = await call('repo.bulk', { roots: ['/etc'], action: 'fetch' })
+  check('a bulk root outside every allowed root is refused', escapedRoot.status === 403, String(escapedRoot.status))
+  const optionTarget = await call('repo.merge', { root: bob, target: '--abort' })
+  check('an option-shaped merge target is refused', optionTarget.status === 409, `${optionTarget.status} ${JSON.stringify(optionTarget.body)}`)
+} finally {
+  await rm(fixture, { recursive: true, force: true })
+}
 
 server.close()
 console.log(failures === 0 ? '\nAll checks passed.\n' : `\n${failures} check(s) failed.\n`)

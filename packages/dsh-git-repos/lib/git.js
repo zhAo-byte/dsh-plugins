@@ -16,7 +16,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { readdir, realpath } from 'node:fs/promises'
+import { access, readdir, realpath } from 'node:fs/promises'
+import { constants } from 'node:fs'
 import { isAbsolute, join, normalize, relative, sep } from 'node:path'
 
 /** Field separator inside one `for-each-ref`/`log` record. */
@@ -53,7 +54,8 @@ const PRUNE = new Set([
  *
  * @param cwd - directory to run in (must exist; git resolves the repo itself).
  * @param args - argv array, passed verbatim.
- * @param options - `timeoutMs` bounds the process; `maxBytes` bounds stdout.
+ * @param options - `timeoutMs` bounds the process; `maxBytes` bounds stdout;
+ *   `env` adds variables for this call only (applied after the fixed defaults).
  * @returns the exit code plus both streams, decoded as UTF-8.
  * @throws {GitError} when the timeout fires or the process cannot be spawned.
  */
@@ -72,6 +74,7 @@ export function runGit(cwd, args, options = {}) {
         GIT_PAGER: 'cat',
         GIT_OPTIONAL_LOCKS: '1',
         LC_ALL: 'C',
+        ...(options.env ?? {}),
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -505,7 +508,217 @@ export async function status(root, options = {}) {
     if (entry.renamed) counts.renamed += 1
   }
 
-  return { ...parsed, counts, clean: parsed.entries.length === 0 }
+  const operation = await operationState(root)
+  return { ...parsed, counts, clean: parsed.entries.length === 0, operation }
+}
+
+/**
+ * Whether a path exists, without caring why it might not.
+ *
+ * @param path - absolute path.
+ * @returns true when it can be stat'ed.
+ */
+async function exists(path) {
+  try {
+    await access(path, constants.F_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Detect an operation that is in progress and therefore owns the working tree.
+ *
+ * A conflict is not just a dirty file: merge, rebase, cherry-pick and revert all
+ * leave the repository in a state where the next `git commit` finishes *their*
+ * work rather than the user's, and the panel has to say so or every button it
+ * offers is a trap. The paths come from `git rev-parse --git-dir`, so a linked
+ * worktree (where `.git` is a file, not a directory) is handled by git's own
+ * answer instead of by guessing.
+ *
+ * @param root - repo root.
+ * @returns `{ kind, rebaseKind }`; `kind` is `none` for an ordinary working tree.
+ */
+export async function operationState(root) {
+  let gitDir = ''
+  try {
+    const raw = (await git(root, ['rev-parse', '--absolute-git-dir'], { timeoutMs: 10_000 })).trim()
+    if (raw !== '') gitDir = raw
+  } catch {
+    // An unreadable git dir means "not a repository" for every caller of this
+    // helper; the surrounding status call reports the real failure.
+    return { kind: 'none' }
+  }
+  if (gitDir === '') return { kind: 'none' }
+
+  const [rebaseMerge, rebaseApply, cherryPick, revert] = await Promise.all([
+    exists(join(gitDir, 'rebase-merge')),
+    exists(join(gitDir, 'rebase-apply')),
+    exists(join(gitDir, 'CHERRY_PICK_HEAD')),
+    exists(join(gitDir, 'REVERT_HEAD')),
+  ])
+  // Checked before rebase: an interactive rebase stops on a conflict with the
+  // apply directory present too, and naming it `rebase` is the useful answer.
+  if (rebaseMerge || rebaseApply) {
+    const kind = await rebaseKindOf(gitDir)
+    return { kind: 'rebase', rebaseKind: kind }
+  }
+  if (cherryPick) return { kind: 'cherry-pick' }
+  if (revert) return { kind: 'revert' }
+  if (await exists(join(gitDir, 'MERGE_HEAD'))) return { kind: 'merge' }
+  return { kind: 'none' }
+}
+
+/**
+ * Whether the rebase in progress is replaying onto a new base or rewording.
+ *
+ * `rebase-apply` is what a plain `git rebase` leaves behind when it stops, and
+ * `rebase-merge` is interactive/merge-backed; the distinction decides which verb
+ * the panel offers to finish it.
+ *
+ * @param gitDir - absolute git directory.
+ * @returns `'merge'`, `'apply'`, or `undefined` when neither is readable.
+ */
+async function rebaseKindOf(gitDir) {
+  if (await exists(join(gitDir, 'rebase-merge'))) return 'merge'
+  if (await exists(join(gitDir, 'rebase-apply'))) return 'apply'
+  return undefined
+}
+
+/**
+ * The set of paths git currently reports as unmerged.
+ *
+ * Used after a merge attempt to tell "merged cleanly" from "stopped on
+ * conflicts", which is the difference between a finished action and one that
+ * needs the user in the working tree.
+ *
+ * @param root - repo root.
+ * @returns repo-relative conflicted paths.
+ */
+async function conflictedPaths(root) {
+  let raw = ''
+  try {
+    raw = await git(root, ['diff', '--name-only', '--diff-filter=U', '-z'], { timeoutMs: 20_000 })
+  } catch {
+    return []
+  }
+  return raw.split('\0').filter((path) => path !== '')
+}
+
+/**
+ * Merge one ref into the current branch.
+ *
+ * Both non-fast-forward policies are deliberate rather than defaults borrowed
+ * from git: a fast-forward is reported as its own outcome so the panel can say
+ * "moved the branch" instead of "created a commit", and a conflict comes back as
+ * a result instead of a thrown error, because stopping on a conflict is the
+ * normal way this operation ends in a tool window. The repository is left in the
+ * merge state on purpose — resolving and committing is the user's next step, and
+ * `mergeAbort` is the way out.
+ *
+ * @param root - repo root.
+ * @param target - branch, tag, or commit to merge in.
+ * @param options - `noFf` forces a merge commit; `ffOnly` refuses anything else.
+ * @returns how the merge ended, plus the conflicted paths when it stopped.
+ */
+export async function merge(root, target, options = {}) {
+  const ref = assertRefName(target, 'merge target')
+  const args = ['merge']
+  if (options.ffOnly) args.push('--ff-only')
+  else if (options.noFf) args.push('--no-ff')
+  args.push(ref)
+  let output = ''
+  try {
+    output = await git(root, args, { timeoutMs: options.timeoutMs ?? 120_000 })
+  } catch (error) {
+    // `git merge` exits non-zero on a conflict and prints what to do next; the
+    // files it names are read from the index rather than parsed out of stderr.
+    const conflicts = await conflictedPaths(root)
+    if (conflicts.length === 0) throw error
+    return { ok: false, merged: 'conflict', target: ref, conflicts, output: error.stderr || error.message }
+  }
+  const conflicts = await conflictedPaths(root)
+  if (conflicts.length > 0) return { ok: false, merged: 'conflict', target: ref, conflicts, output }
+  // Three distinct endings, and the panel words all three differently: a moved
+  // branch is not a merge commit, and neither is a no-op.
+  if (/already up to date/i.test(output)) return { ok: true, merged: 'up-to-date', target: ref, conflicts: [], output }
+  if (/^Fast-forward/m.test(output)) return { ok: true, merged: 'fast-forward', target: ref, conflicts: [], output }
+  return { ok: true, merged: 'merged', target: ref, conflicts: [], output }
+}
+
+/**
+ * Abort the merge in progress, restoring the pre-merge state.
+ *
+ * @param root - repo root.
+ * @returns git's own output.
+ */
+export async function mergeAbort(root) {
+  return git(root, ['merge', '--abort'], { timeoutMs: 60_000 })
+}
+
+/**
+ * Finish the merge in progress by committing the resolved index.
+ *
+ * @param root - repo root.
+ * @param message - optional message override; git's prepared `MERGE_MSG` is used when omitted.
+ * @returns git's own output.
+ */
+export async function mergeContinue(root, message) {
+  const text = String(message ?? '').trim()
+  const args = ['commit', '--no-edit']
+  if (text !== '') args.splice(1, 1, '-m', text)
+  return git(root, args, { timeoutMs: 60_000 })
+}
+
+/**
+ * Rebase the current branch onto another ref.
+ *
+ * Conflicts are returned rather than thrown for the same reason as `merge`: a
+ * stopped rebase is a state the panel renders and the user finishes. `onto`
+ * names the new base, which is also what a plain `git rebase <base>` means.
+ *
+ * @param root - repo root.
+ * @param onto - ref to replay onto.
+ * @param options - `interactive` is rejected on purpose: this surface cannot drive an editor.
+ * @returns how the rebase ended.
+ */
+export async function rebaseOnto(root, onto, options = {}) {
+  const ref = assertRefName(onto, 'rebase target')
+  let output = ''
+  try {
+    output = await git(root, ['rebase', ref], { timeoutMs: options.timeoutMs ?? 180_000 })
+  } catch (error) {
+    const state = await operationState(root)
+    const conflicts = await conflictedPaths(root)
+    if (state.kind !== 'rebase' && conflicts.length === 0) throw error
+    return { ok: false, merged: 'conflict', target: ref, conflicts, output: error.stderr || error.message }
+  }
+  return { ok: true, merged: /up to date|up-to-date/i.test(output) ? 'up-to-date' : 'rebased', target: ref, conflicts: [], output }
+}
+
+/**
+ * Abort the rebase in progress.
+ *
+ * @param root - repo root.
+ * @returns git's own output.
+ */
+export async function rebaseAbort(root) {
+  return git(root, ['rebase', '--abort'], { timeoutMs: 60_000 })
+}
+
+/**
+ * Continue the rebase in progress.
+ *
+ * `GIT_EDITOR=true` matters: without it git opens the commit-message editor for
+ * every stopped step, and this plugin has no terminal to show it in. Accepting
+ * the prepared message is the only behaviour a web panel can honestly offer.
+ *
+ * @param root - repo root.
+ * @returns git's own output.
+ */
+export async function rebaseContinue(root) {
+  return git(root, ['rebase', '--continue'], { env: { GIT_EDITOR: 'true' }, timeoutMs: 180_000 })
 }
 
 /**
@@ -751,6 +964,9 @@ export async function summary(root, options = {}) {
     row.behind = state.behind
     row.counts = state.counts
     row.clean = state.clean
+    // Every listed repository carries its in-progress operation, because that is
+    // what decides whether a bulk pull may touch it at all.
+    row.operation = state.operation
     row.remotes = remoteRows
     if (head !== '') {
       const [short, subject, author, date, refs] = head.split(US)
