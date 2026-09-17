@@ -13,7 +13,7 @@
  * assertion so it can gate a change to `lib/git.js`.
  */
 
-import { DEFAULT_MAX_DEPTH, discoverRepositories, discoverRepositoriesDetailed, findRepoRoot, status, branches, log, remotes, worktrees, stashes, summary, parseRemoteUrl, operationState, merge, mergeAbort, mergeContinue, rebaseOnto, rebaseAbort, rebaseContinue } from '../lib/git.js'
+import { DEFAULT_MAX_DEPTH, discoverRepositories, discoverRepositoriesDetailed, findRepoRoot, status, branches, log, remotes, worktrees, stashes, summary, parseRemoteUrl, operationState, merge, mergeAbort, mergeContinue, rebaseOnto, rebaseAbort, rebaseContinue, switchBranch, localBranchNames, workingTreeLoad } from '../lib/git.js'
 import { describeRemote, webUrl } from '../lib/gitlab.js'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
@@ -303,6 +303,82 @@ function fixtureGit(cwd, args) {
       rejected = error?.code === 'bad-argument'
     }
     check('an option-shaped merge target is refused', rejected)
+
+    // ── branch switching, including carrying changes across ─────────────────
+    // This is the operation whose failure modes differ the most between its two
+    // forms, so both are driven against the same fixture: plain `switch` refuses
+    // a dirty tree and changes nothing, `--merge` carries the edits over, and an
+    // untracked file the target also has is refused by *both*.
+    fixtureGit(fixture, ['switch', '-q', 'main'])
+    const plainSwitch = await switchBranch(fixture, 'rebase-me')
+    check('a clean switch succeeds', plainSwitch.ok === true && plainSwitch.outcome === 'switched',
+      JSON.stringify(plainSwitch))
+    check('the switch actually moved HEAD',
+      fixtureGit(fixture, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'rebase-me')
+    check('a switch neither starts nor leaves an operation',
+      (await operationState(fixture)).kind === 'none', JSON.stringify(await operationState(fixture)))
+
+    fixtureGit(fixture, ['switch', '-q', 'main'])
+    await writeFile(join(fixture, 'shared.txt'), 'dirty local\n')
+    const switchDirty = await switchBranch(fixture, 'rebase-me')
+    check('a plain switch refuses a dirty tree', switchDirty.outcome === 'failed', JSON.stringify(switchDirty))
+    check('the refusal left the branch alone',
+      fixtureGit(fixture, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'main')
+    check('the refusal left the edit in place',
+      (await status(fixture)).counts.changed > 0, JSON.stringify((await status(fixture)).counts))
+
+    // The untracked collision: a file the target branch tracks and the working
+    // tree has as untracked. Neither form may proceed — `--merge` would have to
+    // overwrite a file git does not know about.
+    fixtureGit(fixture, ['checkout', '-q', '--', '.'])
+    fixtureGit(fixture, ['switch', '-q', 'rebase-me'])
+    await writeFile(join(fixture, 'untracked-only.txt'), 'tracked on the other side\n')
+    fixtureGit(fixture, ['add', 'untracked-only.txt'])
+    fixtureGit(fixture, ['commit', '-m', 'track the file'])
+    fixtureGit(fixture, ['switch', '-q', 'main'])
+    await writeFile(join(fixture, 'untracked-only.txt'), 'local untracked\n')
+    const untrackedPlain = await switchBranch(fixture, 'rebase-me')
+    check('a plain switch refuses an untracked collision',
+      untrackedPlain.outcome === 'failed', JSON.stringify(untrackedPlain))
+    const untrackedMerge = await switchBranch(fixture, 'rebase-me', { merge: true })
+    check('a --merge switch also refuses an untracked collision',
+      untrackedMerge.outcome === 'failed', JSON.stringify(untrackedMerge))
+    check('the untracked file is still there',
+      fixtureGit(fixture, ['status', '--porcelain']).includes('?? untracked-only.txt'),
+      fixtureGit(fixture, ['status', '--porcelain']))
+    fixtureGit(fixture, ['clean', '-fd'])
+    fixtureGit(fixture, ['checkout', '-q', '--', '.'])
+
+    // --merge with a tracked modification: the only two acceptable endings are
+    // "carried across" and "conflict", and both must leave the edit recoverable.
+    await writeFile(join(fixture, 'shared.txt'), 'base for merge\n')
+    fixtureGit(fixture, ['add', '-A'])
+    fixtureGit(fixture, ['commit', '-m', 'base for merge'])
+    fixtureGit(fixture, ['switch', '-q', 'rebase-me'])
+    await writeFile(join(fixture, 'shared.txt'), 'other side\n')
+    fixtureGit(fixture, ['commit', '-am', 'other side edits shared'])
+    fixtureGit(fixture, ['switch', '-q', 'main'])
+    await writeFile(join(fixture, 'shared.txt'), 'my uncommitted change\n')
+
+    const carriedSwitch = await switchBranch(fixture, 'rebase-me', { merge: true })
+    check('a --merge switch ends as carried or conflicted',
+      carriedSwitch.outcome === 'switched' || carriedSwitch.outcome === 'conflict',
+      JSON.stringify(carriedSwitch))
+    check('the merge switch moved HEAD',
+      fixtureGit(fixture, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'rebase-me')
+    const carriedEntries = (await status(fixture)).entries
+    check('the local edit survived the merge switch',
+      carriedEntries.some((entry) => entry.path === 'shared.txt'), JSON.stringify(carriedEntries.map((e) => e.path)))
+    if (carriedSwitch.outcome === 'conflict') {
+      // A switch conflict has no MERGE_HEAD: the files are unmerged in the index
+      // and the way out is resolve + commit, not `merge --abort`.
+      check('a switch conflict names its files', carriedSwitch.conflicts.includes('shared.txt'),
+        JSON.stringify(carriedSwitch.conflicts))
+      check('a switch conflict reports no merge in progress', (await operationState(fixture)).kind === 'none',
+        JSON.stringify(await operationState(fixture)))
+    }
+    // Leave nothing behind for the next section.
+    fixtureGit(fixture, ['reset', '-q', '--hard', 'HEAD'])
   } finally {
     await rm(fixture, { recursive: true, force: true })
   }

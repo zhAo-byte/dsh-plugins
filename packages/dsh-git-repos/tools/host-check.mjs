@@ -336,6 +336,122 @@ try {
   check('the merge can be abandoned over the route', abortRoute.status === 200, JSON.stringify(abortRoute.body).slice(0, 160))
   check('the abort cleared the merge state', (await call('repo.operation', { root: bob })).body?.value?.operation?.kind === 'none')
 
+  // ── bulk branch switch: pre-flight, refusal, and carrying changes across ───
+  // The two behaviours that matter are both real here: a dirty repository
+  // refuses a plain switch without changing anything, and the same repository
+  // with `--merge` comes back holding conflict entries instead.
+  const preflight = await call('repo.bulkLoad', { roots: [alice, bob], branch: 'feature' })
+  check('bulkLoad answers per repository',
+    preflight.status === 200 && preflight.body?.value?.results?.length === 2, JSON.stringify(preflight.body?.value))
+  const byName = (rows, name) => (Array.isArray(rows) ? rows : []).find((row) => String(row.root).endsWith(`/${name}`))
+  const bobRow = byName(preflight.body?.value?.results, 'bob')
+  const aliceRow = byName(preflight.body?.value?.results, 'alice')
+  check('bulkLoad reports the current branch', typeof aliceRow?.branch === 'string', JSON.stringify(aliceRow))
+  check('bulkLoad reports the working-tree load', typeof bobRow?.load?.changed === 'number', JSON.stringify(bobRow))
+  check('bulkLoad says whether the target branch exists', bobRow?.hasBranch === false, JSON.stringify(bobRow))
+
+  // The branch exists locally in both clones once one of them creates it, and a
+  // clean tree switches without ceremony.
+  fixtureGit(alice, ['switch', '-c', 'feature', '-q'])
+  await writeFile(join(alice, 'feature.txt'), 'feature\n')
+  fixtureGit(alice, ['add', '-A'])
+  fixtureGit(alice, ['commit', '-m', 'feature work'])
+  fixtureGit(alice, ['push', '-u', 'origin', 'feature'])
+  // A clone only fetches the remote's default branch, so `origin/feature` does
+  // not exist until it is asked for.
+  fixtureGit(bob, ['fetch', 'origin'])
+  fixtureGit(bob, ['switch', '-qc', 'feature'])
+  fixtureGit(bob, ['branch', '-u', 'origin/feature', 'feature'])
+  const preflightKnown = await call('repo.bulkLoad', { roots: [alice], branch: 'feature' })
+  check('bulkLoad finds an existing branch', preflightKnown.body?.value?.results?.[0]?.hasBranch === true,
+    JSON.stringify(preflightKnown.body?.value?.results?.[0]))
+
+  // An untracked file that the target branch also has: both forms of the switch
+  // must refuse. This is the collision `--merge` cannot resolve, and the reason
+  // the plain form is the default rather than an optimisation.
+  fixtureGit(alice, ['switch', 'main', '-q'])
+  await writeFile(join(alice, 'feature.txt'), 'untracked local file\n')
+  const untrackedPlain = await call('repo.bulkSwitch', { roots: [alice], branch: 'feature' })
+  check('a plain switch refuses an untracked collision',
+    untrackedPlain.body?.value?.results?.[0]?.outcome === 'failed', JSON.stringify(untrackedPlain.body?.value))
+  const untrackedMerge = await call('repo.bulkSwitch', { roots: [alice], branch: 'feature', merge: true })
+  check('a --merge switch also refuses an untracked collision',
+    untrackedMerge.body?.value?.results?.[0]?.outcome === 'failed', JSON.stringify(untrackedMerge.body?.value))
+  check('the untracked file survived both refusals',
+    fixtureGit(alice, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'main'
+    && fixtureGit(alice, ['status', '--porcelain']).includes('?? feature.txt'),
+    fixtureGit(alice, ['status', '--porcelain']))
+  fixtureGit(alice, ['clean', '-fd'])
+
+  // A *fresh* repository for this pair, because every switch below leaves the
+  // working tree in a different shape and reusing one fixture is how the earlier
+  // operation's leftovers get mistaken for this one's result.
+  const carol = join(fixture, 'carol')
+  fixtureGit(fixture, ['init', '-q', '-b', 'main', carol])
+  fixtureGit(carol, ['config', 'user.email', 'check@example.com'])
+  fixtureGit(carol, ['config', 'user.name', 'Check'])
+  await writeFile(join(carol, 'clash.txt'), 'base\n')
+  await writeFile(join(carol, 'local-only.txt'), 'base\n')
+  fixtureGit(carol, ['add', '-A'])
+  fixtureGit(carol, ['commit', '-m', 'tracked base'])
+  fixtureGit(carol, ['switch', '-qc', 'feature'])
+  await writeFile(join(carol, 'clash.txt'), 'from feature\n')
+  fixtureGit(carol, ['commit', '-qam', 'feature edits clash'])
+  fixtureGit(carol, ['switch', '-q', 'main'])
+  await writeFile(join(carol, 'clash.txt'), 'local uncommitted\n')
+  await writeFile(join(carol, 'local-only.txt'), 'local only\n')
+
+  const refused = await call('repo.bulkSwitch', { roots: [carol], branch: 'feature' })
+  check('a plain bulk switch refuses a dirty repository',
+    refused.body?.value?.results?.[0]?.outcome === 'failed', JSON.stringify(refused.body?.value))
+  check('the refusal changed nothing',
+    fixtureGit(alice, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'main',
+    fixtureGit(alice, ['rev-parse', '--abbrev-ref', 'HEAD']).trim())
+
+  const carried = await call('repo.bulkSwitch', { roots: [carol], branch: 'feature', merge: true })
+  const carriedRow = carried.body?.value?.results?.[0]
+  // Both endings are legitimate here, and which one happens depends on how git's
+  // three-way merge reads the two versions. What must never happen is losing the
+  // local work, so that is what is asserted rather than one particular outcome.
+  check('a --merge switch either carries the edits across or reports the conflict',
+    carriedRow?.outcome === 'switched' || carriedRow?.outcome === 'conflict', JSON.stringify(carriedRow))
+  check('the merge switch did move the branch',
+    fixtureGit(carol, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === 'feature',
+    fixtureGit(carol, ['rev-parse', '--abbrev-ref', 'HEAD']).trim())
+  const carriedStatus = await call('repo.status', { root: carol })
+  const carriedEntries = carriedStatus.body?.value?.entries ?? []
+  check('the local work survived the switch',
+    carriedEntries.some((entry) => entry.path === 'clash.txt')
+    && carriedEntries.some((entry) => entry.path === 'local-only.txt'),
+    JSON.stringify(carriedEntries.map((entry) => entry.path)))
+  if (carriedRow?.outcome === 'conflict') {
+    // A switch conflict is *not* a merge in progress: there is no MERGE_HEAD, so
+    // `merge --abort` is meaningless and the panel must not offer it. The files
+    // are simply unmerged in the index, to be resolved and committed.
+    const carriedOp = await call('repo.operation', { root: carol })
+    check('a carried switch conflict reports no merge in progress',
+      carriedOp.body?.value?.operation?.kind === 'none', JSON.stringify(carriedOp.body?.value))
+    check('the carried conflict shows up as a conflict entry',
+      carriedStatus.body?.value?.counts?.conflicted >= 1, JSON.stringify(carriedStatus.body?.value?.counts))
+    const abortMeaningless = await call('repo.mergeAbort', { root: carol })
+    check('aborting is refused when there is no merge to abort', abortMeaningless.status === 409,
+      `${abortMeaningless.status} ${JSON.stringify(abortMeaningless.body)}`)
+  } else {
+    check('a clean carry leaves no operation behind',
+      carriedStatus.body?.value?.operation?.kind === 'none', JSON.stringify(carriedStatus.body?.value?.operation))
+    check('a clean carry leaves no conflict entry',
+      carriedStatus.body?.value?.counts?.conflicted === 0, JSON.stringify(carriedStatus.body?.value?.counts))
+  }
+
+  // A bulk switch to a branch that does not exist fails per repository without
+  // taking the others down with it.
+  const missing = await call('repo.bulkSwitch', { roots: [alice, bob], branch: 'no-such-branch' })
+  check('a missing branch fails per repository',
+    missing.body?.value?.results?.every((row) => row.ok !== true), JSON.stringify(missing.body?.value))
+  check('the failure names the branch',
+    String(missing.body?.value?.results?.[0]?.output ?? '').includes('no-such-branch')
+    || String(missing.body?.value?.results?.[0]?.output ?? '').length > 0, JSON.stringify(missing.body?.value?.results?.[0]))
+
   // Argument guards the route must enforce before git sees anything.
   const badAction = await call('repo.bulk', { roots: [bob], action: 'rebase-everything' })
   check('an unknown bulk action is refused', badAction.status === 400, `${badAction.status} ${JSON.stringify(badAction.body)}`)
@@ -343,6 +459,12 @@ try {
   check('a bulk action with no roots is refused', noRoots.status === 400, String(noRoots.status))
   const escapedRoot = await call('repo.bulk', { roots: ['/etc'], action: 'fetch' })
   check('a bulk root outside every allowed root is refused', escapedRoot.status === 403, String(escapedRoot.status))
+  const switchNoBranch = await call('repo.bulkSwitch', { roots: [bob] })
+  check('a bulk switch without a branch is refused', switchNoBranch.status === 400, String(switchNoBranch.status))
+  const switchBadBranch = await call('repo.bulkSwitch', { roots: [bob], branch: '--force' })
+  check('an option-shaped branch name is refused', switchBadBranch.status === 400, `${switchBadBranch.status} ${JSON.stringify(switchBadBranch.body)}`)
+  const loadNoRoots = await call('repo.bulkLoad', { roots: [] })
+  check('a pre-flight with no roots is refused', loadNoRoots.status === 400, String(loadNoRoots.status))
   const optionTarget = await call('repo.merge', { root: bob, target: '--abort' })
   check('an option-shaped merge target is refused', optionTarget.status === 409, `${optionTarget.status} ${JSON.stringify(optionTarget.body)}`)
 } finally {

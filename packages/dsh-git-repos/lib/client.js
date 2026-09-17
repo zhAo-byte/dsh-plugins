@@ -451,6 +451,10 @@ window.__ModuleLoader__.load({
       const [bulk, setBulk] = React.useState(null)
       const [mergeTarget, setMergeTarget] = React.useState('')
       const [rebaseTarget, setRebaseTarget] = React.useState('')
+      /** Branch name for the bulk switch, and its pre-flight result. */
+      const [switchBranch, setSwitchBranch] = React.useState('')
+      const [switchCarry, setSwitchCarry] = React.useState(false)
+      const [switchCheck, setSwitchCheck] = React.useState(null)
 
       const stateRef = React.useRef({})
       stateRef.current = { root, activeRoot, busy, tab, visible }
@@ -463,6 +467,12 @@ window.__ModuleLoader__.load({
       mergeTargetRef.current = mergeTarget
       const rebaseTargetRef = React.useRef('')
       rebaseTargetRef.current = rebaseTarget
+      const switchBranchRef = React.useRef('')
+      switchBranchRef.current = switchBranch
+      const switchCarryRef = React.useRef(false)
+      switchCarryRef.current = switchCarry
+      const switchCheckRef = React.useRef(null)
+      switchCheckRef.current = switchCheck
 
       // The session directory is the default root; a manual pick wins until the
       // session itself changes.
@@ -629,6 +639,92 @@ window.__ModuleLoader__.load({
         } catch (failure) {
           setError(`${label}失败：${failure.message}`)
           return null
+        } finally {
+          setBusy(null)
+        }
+      }, [loadDetail, loadList])
+
+      /**
+       * Ask every listed repository what it would do with a branch switch.
+       *
+       * Read-only, and a separate step from the switch itself on purpose: the
+       * useful question before switching twenty checkouts is which ones are
+       * missing the branch and which are carrying uncommitted work — and that
+       * answer is worth seeing before the action, not as a failure list after it.
+       */
+      const preflightSwitch = React.useCallback(async () => {
+        const branch = switchBranchRef.current.trim()
+        if (branch === '') return
+        const snapshot = stateRef.current
+        const targets = asArray(listRef.current?.repos).map((row) => row.root)
+        if (targets.length === 0) return
+        setBusy('检查分支')
+        setError(null)
+        setNotice(null)
+        try {
+          const result = await rpc('repo.bulkLoad', { roots: targets, branch })
+          const rows = asArray(result?.results)
+          const byRoot = {}
+          for (const row of rows) byRoot[row.root] = row
+          setSwitchCheck({ branch, byRoot })
+          const missing = rows.filter((row) => row.ok === true && row.hasBranch === false).length
+          const dirty = rows.filter((row) => row.ok === true && (row.load?.changed ?? 0) > 0).length
+          const broken = rows.filter((row) => row.ok !== true).length
+          const parts = [`${rows.length} 个仓库`, `其中 ${dirty} 个有未提交改动`]
+          if (missing > 0) parts.push(`${missing} 个没有这个分支`)
+          if (broken > 0) parts.push(`${broken} 个读不出来`)
+          setNotice(`预检 ${branch}：${parts.join('，')}`)
+        } catch (failure) {
+          setError(`预检失败：${failure.message}`)
+        } finally {
+          setBusy(null)
+        }
+      }, [])
+
+      /**
+       * Switch every listed repository to one branch.
+       *
+       * Confirmation is required once the pre-flight has run, because the branch
+       * a repository ends up on decides where the next bulk push goes — and that
+       * is the one consequence of this action that is not visible in the list.
+       */
+      const runBulkSwitch = React.useCallback(async () => {
+        const branch = switchBranchRef.current.trim()
+        if (branch === '') return
+        const snapshot = stateRef.current
+        const targets = asArray(listRef.current?.repos).map((row) => row.root)
+        if (targets.length === 0) return
+        const dirty = asArray(switchCheckRef.current?.byRoot ? Object.values(switchCheckRef.current.byRoot) : [])
+          .filter((row) => (row.load?.changed ?? 0) > 0).length
+        const carry = switchCarryRef.current
+        const warning = carry
+          ? `把 ${targets.length} 个仓库切到 ${branch}，并把本地未提交改动三方合并过去（${dirty} 个仓库有改动，可能停在冲突）？`
+          : `把 ${targets.length} 个仓库切到 ${branch}？有未提交改动的 ${dirty} 个仓库会拒绝切换。`
+        if (!window.confirm(warning)) return
+        setBusy('批量切换分支')
+        setError(null)
+        setNotice(null)
+        try {
+          const result = await rpc('repo.bulkSwitch', { roots: targets, branch, merge: carry })
+          const rows = asArray(result?.results)
+          const byRoot = {}
+          for (const row of rows) byRoot[row.root] = row
+          setSwitchCheck({ branch, byRoot })
+          const switched = rows.filter((row) => row.outcome === 'switched').length
+          const conflicts = rows.filter((row) => row.outcome === 'conflict')
+          const failed = rows.filter((row) => row.outcome === 'failed')
+          if (conflicts.length === 0 && failed.length === 0) {
+            setNotice(`已把 ${switched} 个仓库切到 ${branch}`)
+          } else {
+            const parts = [`${switched} 个已切换`]
+            if (conflicts.length > 0) parts.push(`${conflicts.length} 个停在冲突（在「变更」页签逐个解决）`)
+            if (failed.length > 0) parts.push(`${failed.length} 个拒绝切换（多为未提交改动）`)
+            setError(`批量切换分支：${parts.join('，')}`)
+          }
+          if (snapshot.activeRoot) await loadDetail(snapshot.activeRoot, { quiet: true })
+          if (snapshot.root) await loadList(snapshot.root, { quiet: true })
+        } catch (failure) {
+          setError(`批量切换分支失败：${failure.message}`)
         } finally {
           setBusy(null)
         }
@@ -974,6 +1070,23 @@ window.__ModuleLoader__.load({
        */
       const operation = detail?.status?.operation
       const operationKind = operation?.kind && operation.kind !== 'none' ? operation.kind : null
+      const conflictedCount = detail?.status?.counts?.conflicted ?? 0
+      // Unmerged files with no operation behind them is the shape a carried
+      // `switch --merge` leaves: there is no MERGE_HEAD to abort and no merge to
+      // finish by committing, so the only honest instruction is "resolve, stage,
+      // commit" — and offering 完成合并 here would run `git commit --no-edit`
+      // against a message git never prepared.
+      const switchConflictBar = activeRepo && operationKind === null && conflictedCount > 0
+        ? h('div', { className: 'gr-banner gr-banner--error', key: 'switch-conflict' }, [
+          h(Glyph, { path: P.warn, key: 'i' }),
+          h('span', { key: 't', className: 'gr-grow' },
+            `切换分支时有 ${conflictedCount} 个文件冲突：在「变更」页签里逐个解决并暂存，然后提交（没有可放弃的合并）`),
+          h(Btn, {
+            key: 'changes', label: '去解决', variant: 'primary',
+            onClick: () => { setTab('changes'); setDiff(null) },
+          }),
+        ])
+        : null
       const operationBar = activeRepo && operationKind
         ? h('div', { className: 'gr-banner gr-banner--notice', key: 'operation' }, [
           h(Glyph, { path: P.warn, key: 'i' }),
@@ -1183,7 +1296,79 @@ window.__ModuleLoader__.load({
         })) : null,
       ])
 
+      const switchRows = switchCheck === null || !switchCheck.byRoot ? [] : Object.values(switchCheck.byRoot)
+      const bulkSwitchSection = h('div', { className: 'gr-section', key: 'bulk-switch' }, [
+        h('div', { className: 'gr-sectionTitle' }, `批量切换分支（列表里全部 ${repos.length} 个仓库）`),
+        h('div', { className: 'gr-row' }, [
+          h('input', {
+            className: 'gr-input', placeholder: '要切到哪个分支，例如 feature/x',
+            value: switchBranch,
+            onChange: (event) => setSwitchBranch(event.target.value),
+            onKeyDown: (event) => { if (event.key === 'Enter') void preflightSwitch() },
+          }),
+          h(Btn, {
+            icon: P.refresh, label: '预检', variant: 'ghost',
+            disabled: Boolean(busy) || switchBranch.trim() === '' || repos.length === 0,
+            title: '只读：逐个仓库看它有没有这个分支、有没有未提交改动',
+            onClick: () => void preflightSwitch(),
+          }),
+          h(Btn, {
+            icon: P.check, label: '全部切换', variant: 'primary',
+            disabled: Boolean(busy) || switchBranch.trim() === '' || repos.length === 0,
+            title: switchCarry
+              ? 'git switch --merge：把本地改动也带过去，冲突留在工作区里逐个解决'
+              : 'git switch：有未提交改动会拒绝，且不改变任何东西',
+            onClick: () => void runBulkSwitch(),
+          }),
+        ]),
+        h('label', { className: 'gr-row', style: { gap: 6, cursor: 'pointer', alignItems: 'flex-start' } }, [
+          h('input', {
+            type: 'checkbox', checked: switchCarry,
+            onChange: (event) => setSwitchCarry(event.target.checked),
+          }),
+          h('span', { className: 'gr-dim', style: { fontSize: 11, lineHeight: '15px' } },
+            '把未提交的改动一起带过去（git switch --merge）。不带的话，有改动的仓库会拒绝切换、什么都不会变；'
+            + '带过去时如果同一个文件两边都改了，冲突会留在工作区，到「变更」页签逐个解决后提交——那种冲突没有可放弃的合并。'),
+        ]),
+        switchRows.length === 0
+          ? h('div', { className: 'gr-dim', style: { fontSize: 11, paddingTop: 2 } },
+            '先点「预检」：会列出每个仓库当前分支、是否有目标分支、有几个未提交文件')
+          : h('div', { key: 'check' }, [
+            h('div', { className: 'gr-sectionTitle' }, `预检结果 · ${switchCheck.branch}`),
+            ...switchRows.map((row) => h('div', {
+              className: 'gr-row', key: row.root, style: { padding: '2px 0' },
+            }, [
+              h('span', { key: 'n', className: 'gr-grow gr-ellipsis gr-mono gr-dim', title: row.root },
+                String(row.root).split(/[\\/]/).pop() || row.root),
+              row.ok !== true
+                ? h('span', { key: 'e', className: 'gr-chip', style: { color: 'var(--dsw-alias-state-error-primary)' } }, '读不出来')
+                : h('span', { key: 'b', className: 'gr-chip gr-chip--branch' }, row.branch || '(无提交)'),
+              row.ok !== true
+                ? null
+                : row.hasBranch === false
+                  ? h('span', { key: 'm', className: 'gr-chip', style: { color: 'var(--dsw-alias-state-error-primary)' } }, '没有此分支')
+                  : h('span', { key: 'h', className: 'gr-chip', style: { color: 'var(--dsw-alias-state-success-primary)' } }, '可切换'),
+              row.ok !== true || (row.load?.changed ?? 0) === 0
+                ? null
+                : h('span', {
+                  key: 'd', className: 'gr-chip',
+                  style: { color: 'var(--dsw-alias-state-warning-primary,#b7791f)' },
+                  title: `未提交 ${row.load.changed} 个，其中未跟踪 ${row.load.untracked} 个`,
+                }, `脏 ${row.load.changed}`),
+              row.ok !== true || !row.operation || row.operation.kind === 'none'
+                ? null
+                : h('span', {
+                  key: 'o', className: 'gr-chip',
+                  style: { color: 'var(--dsw-alias-state-warning-primary,#b7791f)' },
+                }, operationText(row.operation)),
+            ])),
+            h('div', { key: 'note', className: 'gr-dim', style: { fontSize: 11, paddingTop: 2 } },
+              '「没有此分支」的仓库会在批量里单独报错，不影响其它仓库；切换完看一眼列表里每行的分支标识，那决定了下一次批量推送去哪儿'),
+          ]),
+      ])
+
       const branchesTab = h('div', { className: 'gr-content' }, [
+        bulkSwitchSection,
         h('div', { className: 'gr-section', key: 'integrate' }, [
           h('div', { className: 'gr-sectionTitle' }, '合并 / rebase'),
           h('div', { className: 'gr-row', key: 'merge' }, [
@@ -1401,7 +1586,7 @@ window.__ModuleLoader__.load({
         ...banners,
         h('div', { className: 'gr-body', key: 'body' }, [
           scan,
-          h('div', { className: 'gr-detail', key: 'detail' }, [detailHeader, operationBar, tabStrip, content]),
+          h('div', { className: 'gr-detail', key: 'detail' }, [detailHeader, switchConflictBar, operationBar, tabStrip, content]),
         ]),
       ])
     }

@@ -1051,6 +1051,85 @@ export async function checkout(root, branch, options = {}) {
 }
 
 /**
+ * Switch branches, optionally carrying local changes across.
+ *
+ * Two behaviours, and the difference matters for a bulk action:
+ *
+ * - plain `switch` **refuses** when local changes would be overwritten, and
+ *   changes nothing at all. Untracked files that the target branch also has are
+ *   refused the same way, which is why this is the default: `--merge` over an
+ *   untracked collision is how a workbench loses files.
+ * - `--merge` performs a real three-way merge of the local changes with the
+ *   target, so a genuine clash comes back as conflict entries in the working
+ *   tree — the same shape a merge conflict has, resolved file by file in the
+ *   changes tab, and abandoned with `mergeAbort`.
+ *
+ * @param root - repo root.
+ * @param branch - branch to switch to.
+ * @param options - `merge` carries local changes; `createFrom` cuts a new branch.
+ * @returns how the switch ended.
+ */
+export async function switchBranch(root, branch, options = {}) {
+  const name = assertRefName(branch, 'branch')
+  const args = ['switch']
+  if (options.createFrom !== undefined) args.push('-c', name, assertRefName(options.createFrom, 'start point'))
+  else args.push(name)
+  if (options.merge === true) args.push('--merge')
+  try {
+    const output = await git(root, args, { timeoutMs: 60_000 })
+    // A merge-backed switch can exit **0** and still leave conflicted entries:
+    // git reports the merge in the index, not through the exit code. Reading the
+    // index is therefore the only honest way to say how the switch ended, and a
+    // caller that trusted the exit code would report "switched" over a working
+    // tree that needs resolving.
+    const conflicts = await conflictedPaths(root)
+    if (conflicts.length > 0) {
+      return { ok: false, outcome: 'conflict', branch: name, conflicts, output }
+    }
+    return { ok: true, outcome: 'switched', branch: name, conflicts: [], output }
+  } catch (error) {
+    const conflicts = await conflictedPaths(root)
+    if (conflicts.length > 0) {
+      return { ok: false, outcome: 'conflict', branch: name, conflicts, output: error.stderr.trim() || error.message }
+    }
+    return { ok: false, outcome: 'failed', branch: name, conflicts: [], output: error.stderr.trim() || error.message }
+  }
+}
+
+/**
+ * The local branch names in a repository.
+ *
+ * Read through `for-each-ref` rather than `git branch` so the answer is the same
+ * machine-stable shape the rest of this module parses.
+ *
+ * @param root - repo root.
+ * @returns branch names.
+ */
+export async function localBranchNames(root) {
+  const raw = await git(root, ['for-each-ref', '--format=%(refname:short)', 'refs/heads'], { timeoutMs: 10_000 })
+  return raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+}
+
+/**
+ * How much uncommitted work a repository is carrying.
+ *
+ * Used as the pre-flight for a bulk branch switch: a switch that carries changes
+ * forward can stop on a conflict, and on a workbench of twenty checkouts the
+ * person about to run one should be able to see which ones are dirty first.
+ *
+ * @param root - repo root.
+ * @returns `{ changed, untracked, conflicted }`.
+ */
+export async function workingTreeLoad(root) {
+  const state = await status(root)
+  return {
+    changed: state.counts.changed,
+    untracked: state.counts.untracked,
+    conflicted: state.counts.conflicted,
+  }
+}
+
+/**
  * Delete a local branch.
  *
  * @param root - repo root.

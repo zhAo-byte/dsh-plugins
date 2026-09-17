@@ -386,6 +386,78 @@ function buildMethods(ctx, config) {
      */
     'repo.bulk': async (payload) => bulk(ctx, config, payload, payload.action, net),
 
+    /**
+     * Pre-flight for a bulk branch switch, across many repositories.
+     *
+     * Read-only on purpose, and deliberately a separate call: on a workbench of
+     * twenty checkouts the useful question before switching them all is not "does
+     * this repository have the branch" but "which of them are dirty, and would
+     * this refuse there" — and that answer belongs on screen *before* the action,
+     * not in a failure list afterwards.
+     */
+    'repo.bulkLoad': async (payload) => {
+      const roots = await allowedRoots(ctx, config)
+      const requested = Array.isArray(payload.roots) ? payload.roots : []
+      if (requested.length === 0) throw new HttpError(400, 'roots must name at least one repository')
+      const requestedBranch = typeof payload.branch === 'string' ? payload.branch.trim() : ''
+      const targets = []
+      for (const candidate of requested) targets.push(await assertContained(candidate, roots, 'roots[]'))
+
+      const results = await mapLimit(targets, 6, async (root) => {
+        try {
+          const [state, load, names] = await Promise.all([
+            gitEngine.status(root, read),
+            gitEngine.workingTreeLoad(root),
+            requestedBranch === '' ? Promise.resolve([]) : gitEngine.localBranchNames(root).catch(() => []),
+          ])
+          return {
+            root,
+            ok: true,
+            branch: state.branch,
+            detached: state.detached === true,
+            load,
+            hasBranch: requestedBranch === '' ? undefined : names.includes(requestedBranch),
+            operation: state.operation,
+          }
+        } catch (error) {
+          return { root, ok: false, error: error?.message ?? String(error) }
+        }
+      })
+      return { results }
+    },
+
+    /**
+     * Switch many repositories to one branch.
+     *
+     * The target is validated by the engine's ref rules, so every worker parses
+     * the same name. `merge` decides whether local changes are carried across:
+     * without it a dirty repository refuses and is reported as `blocked`, with it
+     * the switch performs a three-way merge and a clash comes back as `conflict`
+     * with the files listed — the repository is left holding those conflicts for
+     * the changes tab, exactly like a stopped merge.
+     */
+    'repo.bulkSwitch': async (payload) => {
+      const branch = typeof payload.branch === 'string' ? payload.branch.trim() : ''
+      if (branch === '') throw new HttpError(400, 'branch is required')
+      try {
+        gitEngine.assertRefName(branch, 'branch')
+      } catch (error) {
+        throw new HttpError(400, error.message)
+      }
+      const roots = await allowedRoots(ctx, config)
+      const requested = Array.isArray(payload.roots) ? payload.roots : []
+      if (requested.length === 0) throw new HttpError(400, 'roots must name at least one repository')
+      const merge = payload.merge === true
+      const targets = []
+      for (const candidate of requested) targets.push(await assertContained(candidate, roots, 'roots[]'))
+
+      const results = await mapLimit(targets, 4, async (root) => {
+        const result = await gitEngine.switchBranch(root, branch, { merge })
+        return { root, ...result }
+      })
+      return { branch, merge, results }
+    },
+
     /** The merge/rebase/cherry-pick/revert state that owns this working tree, if any. */
     'repo.operation': async (payload) => ({
       operation: await gitEngine.operationState(await repo(payload)),
