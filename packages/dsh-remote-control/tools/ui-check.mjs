@@ -565,7 +565,28 @@ try {
       prompt: command.prompt,
       workspace: command.workspace,
       sessionId: 'remote-seeded',
-      text: '今天把中转协议抽成了独立的一层，并补齐了四个自检。',
+      // The answer is Markdown on purpose: this is what a DSH agent actually
+      // writes, and it is the only way the page's rendering is exercised. The
+      // trailing tag is not decoration — the page renders text a model produced,
+      // so the check below asserts it stays text.
+      text: [
+        '今天把中转协议抽成了独立的一层，并补齐了四个自检。',
+        '',
+        '- **relay**：长轮询不再丢命令',
+        '- `node`：多了回落',
+        '',
+        '```ts',
+        'const ok: boolean = true',
+        '```',
+        '',
+        '| 文件 | 变化 |',
+        '| --- | ---: |',
+        '| relay/server.js | +40 |',
+        '',
+        '见 [relay 那一层](https://example.com/relay?x=1)，以及 [别点这个](javascript:alert(1))。',
+        '',
+        '<script>window.__mdInjected = true</script>'
+      ].join('\n'),
       durationMs: 1500
     }
   })
@@ -576,6 +597,61 @@ try {
     15_000
   )
   check('the node’s answer appears on the page without a reload', rendered, 'the SSE transcript push never reached the page')
+
+  // ── the answer is Markdown, and rendering it cannot execute it ───────────
+  // Agents answer in Markdown, and two things have to hold at once. The
+  // constructs must become real elements — a fenced block is the difference
+  // between a readable answer and one long wrapped line, which is the whole
+  // complaint this rendering answers. And none of the text may become markup:
+  // the page renders what a model wrote, so a tag in an answer has to stay
+  // visible characters. A `textContent`+`innerHTML` renderer passes the first
+  // and fails the second, which is why both are asserted in one place.
+  const markdown = JSON.parse(String(await devtools.evaluate(sessionId, `(() => {
+    const row = [...document.querySelectorAll('#log .a')].find((el) => el.textContent.includes('今天把中转协议抽成了独立的一层'));
+    if (row === undefined) return '{}';
+    const body = row.querySelector('.a-text');
+    return JSON.stringify({
+      rendered: body.classList.contains('md'),
+      code: [...body.querySelectorAll('pre code')].map((el) => el.textContent).join('\\n'),
+      lang: body.querySelector('.md-lang')?.textContent ?? '',
+      strong: [...body.querySelectorAll('strong')].map((el) => el.textContent).join('|'),
+      inline: [...body.querySelectorAll('code')].filter((el) => el.closest('pre') === null).map((el) => el.textContent).join('|'),
+      items: [...body.querySelectorAll('li')].map((el) => el.textContent).join('|'),
+      cells: [...body.querySelectorAll('th')].map((el) => el.textContent + ':' + el.style.textAlign).join('|'),
+      links: [...body.querySelectorAll('a')].map((el) => el.textContent + ':' + el.getAttribute('href')).join('|'),
+      refused: [...body.querySelectorAll('a')].some((el) => (el.getAttribute('href') ?? '').startsWith('javascript:')),
+      refusedLiteral: body.textContent.includes('[别点这个](javascript:alert(1))'),
+      paragraphs: body.querySelectorAll('p').length,
+      script: body.querySelector('script') !== null,
+      injected: window.__mdInjected === true,
+      literal: body.textContent.includes('<script>window.__mdInjected = true</script>')
+    });
+  })()`)))
+  check(
+    'an answer is rendered as markdown, not as one pre-wrapped string',
+    markdown.rendered === true && markdown.paragraphs >= 2,
+    JSON.stringify(markdown)
+  )
+  check('a fenced code block keeps its own lines', markdown.code === 'const ok: boolean = true', JSON.stringify(markdown.code))
+  check('a fence language is labelled', markdown.lang === 'ts', JSON.stringify(markdown))
+  check('emphasis becomes markup', markdown.strong === 'relay', JSON.stringify(markdown.strong))
+  check('an inline code span becomes an element', markdown.inline === 'node', JSON.stringify(markdown.inline))
+  check('a list becomes list items', markdown.items === 'relay：长轮询不再丢命令|node：多了回落', JSON.stringify(markdown.items))
+  check('a pipe table becomes a table, with its alignment', markdown.cells === '文件:left|变化:right', JSON.stringify(markdown.cells))
+  check('a link becomes an anchor with its label', markdown.links === 'relay 那一层:https://example.com/relay?x=1', JSON.stringify(markdown.links))
+  // `[x](javascript:…)` is valid Markdown and this page renders model output, so
+  // the refused scheme has to end up as visible text rather than as an href.
+  check(
+    'a link with a refused scheme stays literal, with no anchor',
+    markdown.refused === false && markdown.refusedLiteral === true,
+    JSON.stringify(markdown)
+  )
+  check(
+    'markup inside an answer stays text and never executes',
+    markdown.script === false && markdown.injected === false && markdown.literal === true,
+    JSON.stringify(markdown)
+  )
+
   const finalShot = join(workdir, '03-answered.png')
   const finalImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, sessionId)
   await writeFile(finalShot, Buffer.from(finalImage.data, 'base64'))
@@ -744,7 +820,9 @@ try {
         {
           id: 'scope',
           header: '范围',
-          question: '这次回顾要覆盖哪一部分？',
+          // A question is model-written text too, and a backticked path in it is
+          // the normal case; the card has to render it rather than print it.
+          question: '这次回顾要覆盖哪一部分？\n\n只看 `relay/public` 还是整个包？',
           options: [
             { label: '全部改动 (Recommended)', description: '从上一个版本开始算。' },
             { label: '仅这个工作台' }
@@ -780,6 +858,7 @@ try {
     return JSON.stringify({
       turnText: turn === null ? '' : turn.textContent,
       options: card.querySelectorAll('.ask-opt').length,
+      askCode: card.querySelector('.ask-text code')?.textContent ?? '',
       submitDisabled: card.querySelector('.ask-foot .btn').disabled,
       inViewport: (() => { const r = card.getBoundingClientRect(); return r.width > 0 && r.top >= 0 && r.bottom <= window.innerHeight + 1 })()
     });
@@ -789,6 +868,7 @@ try {
     String(cardState.turnText).includes('帮我回顾一下这次的改动'),
     JSON.stringify(cardState.turnText)
   )
+  check('the question card renders the model’s markdown', cardState.askCode === 'relay/public', JSON.stringify(cardState.askCode))
   check('the card offers every option the model sent', cardState.options === 2, JSON.stringify(cardState))
   // Submitting before choosing would answer nothing, so the button has to start
   // disabled rather than let the page post an empty batch.

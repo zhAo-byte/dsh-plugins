@@ -332,6 +332,61 @@
   .a:hover .copy, .copy:focus-visible { opacity: 1; }
   .copy:hover { color: var(--fg); border-color: var(--line-2); }
 
+  /* ── markdown inside a transcript row ────────────────────────────────
+     An answer is a document a model wrote, not a line of chat, and it reads as
+     one only if fenced code, lists and tables get their own boxes. `pre-wrap` is
+     kept for failures — those are plain strings — while `.md` lays out real
+     blocks and therefore owns its own spacing. */
+  .md { white-space: normal; line-height: 1.65; }
+  /* The row above the text may set margins; the first and last block must not,
+     or a one-line answer stops lining up with its own avatar. */
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 0 0 10px; }
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+    margin: 15px 0 7px; font-size: 14.5px; font-weight: 650; line-height: 1.45;
+  }
+  .md h1 { font-size: 17px; }
+  .md h2 { font-size: 15.5px; }
+  .md h4, .md h5, .md h6 { font-size: 13.5px; color: var(--fg-dim); }
+  .md ul, .md ol { margin: 0 0 10px; padding-left: 21px; }
+  .md li { margin: 3px 0; }
+  .md li > ul, .md li > ol { margin: 3px 0 0; }
+  .md blockquote {
+    margin: 0 0 10px; padding: 1px 0 1px 12px;
+    border-left: 3px solid var(--line-2); color: var(--fg-dim);
+  }
+  .md hr { height: 1px; margin: 14px 0; border: 0; background: var(--line-2); }
+  .md a { color: var(--accent-2); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
+  .md a:hover { color: #fff; }
+  .md code {
+    font-family: var(--mono); font-size: 12.5px;
+    padding: 1.5px 5px; border-radius: 5px;
+    background: rgba(255, 255, 255, .07); border: 1px solid var(--line);
+  }
+  /* The code block is the reason this renderer exists: a diff or a command read
+     as one wrapped line is where "纯文本看着费劲" comes from. It scrolls sideways
+     rather than wrapping, because a broken shell command is worse than a scroll. */
+  .md .md-code {
+    position: relative; margin: 0 0 10px; border-radius: var(--radius-sm);
+    background: #0a0d13; border: 1px solid var(--line-2); overflow: hidden;
+  }
+  .md .md-code pre { margin: 0; padding: 11px 13px; overflow-x: auto; }
+  .md .md-code code {
+    padding: 0; background: none; border: 0; font-size: 12.5px; line-height: 1.6;
+    white-space: pre;
+  }
+  .md .md-lang {
+    position: absolute; top: 6px; right: 11px; z-index: 1;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--fg-faint);
+  }
+  .md .md-table { margin: 0 0 10px; overflow-x: auto; }
+  .md table { border-collapse: collapse; font-size: 12.5px; }
+  .md th, .md td { padding: 5px 10px; border: 1px solid var(--line); text-align: left; }
+  .md th { background: var(--accent-soft); font-weight: 650; }
+  .md tbody tr:nth-child(even) td { background: rgba(255, 255, 255, .022); }
+
   .a.pending .a-body { display: flex; flex-direction: column; }
   .pending-text { color: var(--fg-faint); font-style: italic; font-size: 13px; }
   .typing { display: inline-flex; gap: 4px; margin-top: 10px; }
@@ -555,8 +610,11 @@
     .q { max-width: 92%; }
     .tabs { padding: 8px 10px 0; }
     .tab { max-width: 185px; }
-    // Icon-only broadcast on a phone: the label is in the title, and the pixels
-    // it frees are the difference between a one-line composer and a wrapped one.
+    /* Icon-only broadcast on a phone: the label is in the title, and the pixels
+       it frees are the difference between a one-line composer and a wrapped one.
+       This block used `//` comments, which CSS does not have: the rule was parsed
+       as part of an invalid selector and silently dropped, so the padding never
+       applied. */
     #broadcast { padding: 10px 11px; }
     #broadcast .label { display: none; }
     /* A phone has no ⇧ and no ⌘, so the shortcut line is noise that costs a row. */
@@ -1261,6 +1319,586 @@ function renderTabs() {
   }
 }
 
+// ── markdown ───────────────────────────────────────────────────────────────
+
+/**
+ * A small Markdown renderer for what an agent wrote.
+ *
+ * The transcript is the model's own prose, and models write Markdown: fenced
+ * code, lists, tables, links. Assigning that to `textContent` is lossless and
+ * unreadable — a diff arrives as one pre-wrapped paragraph, and a phone has no
+ * horizontal room to recover from it.
+ *
+ * Three decisions shape this block:
+ *
+ * 1. **Nodes, never HTML strings.** Every construct is built with
+ *    `createElement` and every character of text goes in through `textContent`.
+ *    The page renders text a model produced, so the cheapest correct answer to
+ *    "what if it contains markup" is to have no string-to-markup step at all.
+ *    The single value that reaches an attribute is a link's `href`, and that is
+ *    scheme-checked below.
+ * 2. **It covers what agents emit, and lets the rest fall through as text.** No
+ *    reference links, no footnotes, no HTML blocks, no images (an `<img>` on a
+ *    control page is a beacon, not a feature). Anything unrecognised stays
+ *    visible exactly as written, which is the failure mode a reader can work
+ *    with.
+ * 3. **The raw source survives.** Only the rendering is pretty; the `复制`
+ *    button still hands over the original Markdown, so pasting an answer into an
+ *    editor or a commit message does not carry the page's styling with it.
+ *
+ * The composer bubble deliberately stays verbatim: it is what *you* typed, and
+ * silently reflowing a person's own words is a surprise, not a rendering.
+ */
+
+/** Fence line: ``` or ~~~, with an optional language. */
+const MD_FENCE = /^ {0,3}(`{3,}|~{3,})[ \t]*([A-Za-z0-9_+#.-]*)[ \t]*$/
+/** ATX heading; a closing run of `#` is decoration and gets stripped. */
+const MD_HEADING = /^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/
+/** Thematic break. Checked before tables, because `---` is both. */
+const MD_RULE = /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/
+/** Blockquote line, with the marker's own optional space removed. */
+const MD_QUOTE = /^ {0,3}>[ \t]?(.*)$/
+/** One list item: indentation, marker, content. */
+const MD_ITEM = /^([ \t]*)([-*+]|\d{1,9}[.)])[ \t]+(.*)$/
+/** A table's delimiter row. At least one inner pipe, or it is just a rule. */
+const MD_TABLE_SEP = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$/
+
+/**
+ * Inline Markdown, as one alternation.
+ *
+ * Order is the whole trick: a code span has to win over the emphasis inside it,
+ * and `**` over `*`. Each alternative is captured by name so the handler below
+ * reads as a list of constructs rather than as a column of group numbers.
+ */
+const MD_INLINE_SOURCE = [
+  '(?<tick>`+)(?<code>[\\s\\S]*?)\\k<tick>',
+  '\\*\\*(?<strong>[\\s\\S]+?)\\*\\*',
+  '__(?<strong2>[\\s\\S]+?)__',
+  '~~(?<strike>[\\s\\S]+?)~~',
+  '\\*(?<em>[^*\\n]+?)\\*',
+  '_(?<em2>[^_\\n]+?)_',
+  // Wrapped in a group of its own so the handler can tell a link from a bare
+  // URL: `!?` and the label are optional, so the match has to be named.
+  '(?<link>!?\\[(?<label>[^\\]\\n]*)\\]\\((?<href>[^()\\s]+)(?:[ \\t]+"[^"]*")?\\))',
+  '<(?<auto>(?:https?://|mailto:)[^>\\s]+)>',
+  '(?<bare>https?://[^\\s<>()\\[\\]]*[^\\s<>()\\[\\].,;:])',
+  '\\\\(?<escape>[\\\\`*_{}\\[\\]()#+\\-.!~>])'
+].join('|')
+
+/**
+ * A URL the page is willing to navigate to.
+ *
+ * `[x](javascript:…)` is valid Markdown, and this page renders whatever a model
+ * wrote. Only the schemes that mean "go somewhere" are honoured; anything else
+ * is handed back to the caller as literal text.
+ *
+ * @param {string} raw - the href as written.
+ * @returns {string|null} the resolved URL, or null when it is refused.
+ */
+function safeHref(raw) {
+  try {
+    const url = new URL(raw)
+    return url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'mailto:' ? url.href : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * One inline construct as a node.
+ *
+ * @param {object} groups - named groups from the alternation.
+ * @param {number} depth - current nesting depth.
+ * @returns {Node|null} the node, or null when the match should stay literal.
+ */
+function inlineNode(groups, depth) {
+  if (groups.code !== undefined) {
+    const code = document.createElement('code')
+    // One space of padding on each side is how a code span can begin or end
+    // with a backtick; CommonMark drops it, so this does too.
+    code.textContent = groups.code.replace(/^ (.*) $/, '$1')
+    return code
+  }
+  if (groups.strong !== undefined || groups.strong2 !== undefined) {
+    return wrapInline('strong', groups.strong ?? groups.strong2, depth)
+  }
+  if (groups.strike !== undefined) return wrapInline('del', groups.strike, depth)
+  if (groups.em !== undefined || groups.em2 !== undefined) {
+    return wrapInline('em', groups.em ?? groups.em2, depth)
+  }
+  if (groups.link !== undefined) {
+    const href = safeHref(groups.href)
+    if (href === null) return null
+    const link = anchor(href)
+    inlineInto(link, groups.label === '' ? groups.href : groups.label, depth + 1)
+    return link
+  }
+  if (groups.auto !== undefined) return autoLink(groups.auto)
+  if (groups.bare !== undefined) return autoLink(groups.bare)
+  if (groups.escape !== undefined) return document.createTextNode(groups.escape)
+  return null
+}
+
+/**
+ * Wrap inline content in one element.
+ *
+ * @param {string} tag - element name.
+ * @param {string} text - the inner Markdown.
+ * @param {number} depth - current nesting depth.
+ * @returns {HTMLElement} the element.
+ */
+function wrapInline(tag, text, depth) {
+  const element = document.createElement(tag)
+  inlineInto(element, text, depth + 1)
+  return element
+}
+
+/**
+ * An anchor with the page's link policy applied.
+ *
+ * @param {string} href - an already-validated URL.
+ * @returns {HTMLAnchorElement} the anchor.
+ */
+function anchor(href) {
+  const link = document.createElement('a')
+  link.href = href
+  link.target = '_blank'
+  link.rel = 'noopener noreferrer'
+  return link
+}
+
+/**
+ * A link whose text is its own URL.
+ *
+ * A bare URL and an autolink are the same thing once they are matched: the
+ * difference is only in the source syntax.
+ *
+ * @param {string} href - the URL.
+ * @returns {HTMLAnchorElement} the anchor.
+ */
+function autoLink(href) {
+  const link = anchor(href)
+  link.textContent = href
+  return link
+}
+
+/**
+ * Whether an underscore-delimited match really is emphasis.
+ *
+ * `snake_case_name` is not italic text, and CommonMark agrees. Without this the
+ * page italicises half of every identifier an agent prints.
+ *
+ * @param {object} groups - named groups from the alternation.
+ * @param {string} text - the line being scanned.
+ * @param {number} start - match start offset.
+ * @param {number} end - match end offset.
+ * @returns {boolean} whether the match is a construct.
+ */
+function emphasisAllowed(groups, text, start, end) {
+  if (groups.em2 === undefined && groups.strong2 === undefined) return true
+  const before = start === 0 ? '' : text.charAt(start - 1)
+  const after = end >= text.length ? '' : text.charAt(end)
+  return !/\w/.test(before) && !/\w/.test(after)
+}
+
+/**
+ * Append one run of inline Markdown to a node.
+ *
+ * A match that cannot be honoured — `snake_case` read as emphasis, a link to a
+ * scheme the page refuses — is skipped rather than deleted, so the source text
+ * stays visible.
+ *
+ * @param {Node} parent - receives the nodes.
+ * @param {string} text - the text to scan.
+ * @param {number} depth - nesting depth; a pathological input stops recursing.
+ */
+function inlineInto(parent, text, depth) {
+  if (text === '') return
+  if (depth > 4) {
+    parent.append(document.createTextNode(text))
+    return
+  }
+  const pattern = new RegExp(MD_INLINE_SOURCE, 'g')
+  let end = 0
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    const groups = match.groups
+    const node = inlineNode(groups, depth)
+    if (node === null || !emphasisAllowed(groups, text, match.index, pattern.lastIndex)) {
+      // Not a construct after all. Step one character past the match so the loop
+      // still makes progress, and let the text be picked up by the next commit.
+      pattern.lastIndex = match.index + 1
+      continue
+    }
+    parent.append(document.createTextNode(text.slice(end, match.index)), node)
+    end = pattern.lastIndex
+  }
+  parent.append(document.createTextNode(text.slice(end)))
+}
+
+/**
+ * Render Markdown into a fragment.
+ *
+ * @param {string} source - the Markdown text.
+ * @returns {DocumentFragment} the rendered nodes.
+ */
+function markdownFragment(source) {
+  return markdownBlocks(String(source ?? '').replace(/\r\n?/g, '\n').split('\n'))
+}
+
+/**
+ * Render block constructs.
+ *
+ * @param {string[]} lines - the source, split on newlines.
+ * @returns {DocumentFragment} the rendered blocks.
+ */
+function markdownBlocks(lines) {
+  const fragment = document.createDocumentFragment()
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    if (line.trim() === '') {
+      index += 1
+      continue
+    }
+    const fence = MD_FENCE.exec(line)
+    if (fence !== null) {
+      index = appendCodeBlock(fragment, lines, index, fence)
+      continue
+    }
+    if (MD_RULE.test(line)) {
+      fragment.append(document.createElement('hr'))
+      index += 1
+      continue
+    }
+    const heading = MD_HEADING.exec(line)
+    if (heading !== null) {
+      const element = document.createElement('h' + String(Math.min(heading[1].length, 6)))
+      inlineInto(element, heading[2], 0)
+      fragment.append(element)
+      index += 1
+      continue
+    }
+    if (MD_QUOTE.test(line)) {
+      index = appendQuote(fragment, lines, index)
+      continue
+    }
+    const afterTable = appendTable(fragment, lines, index)
+    if (afterTable !== -1) {
+      index = afterTable
+      continue
+    }
+    if (MD_ITEM.test(line)) {
+      index = appendList(fragment, lines, index)
+      continue
+    }
+    index = appendParagraph(fragment, lines, index)
+  }
+  return fragment
+}
+
+/**
+ * A fenced code block, language label included.
+ *
+ * An unterminated fence runs to the end of the text, which is what a reader
+ * watching a streamed answer wants anyway.
+ *
+ * @param {DocumentFragment} fragment - output.
+ * @param {string[]} lines - source lines.
+ * @param {number} start - index of the opening fence.
+ * @param {RegExpExecArray} fence - the opening fence match.
+ * @returns {number} the line index after the block.
+ */
+function appendCodeBlock(fragment, lines, start, fence) {
+  const ticks = fence[1]
+  const closing = new RegExp(
+    '^ {0,3}' + (ticks.charAt(0) === '`' ? '`' : '~') + '{' + String(ticks.length) + ',}[ \\t]*$'
+  )
+  const body = []
+  let index = start + 1
+  while (index < lines.length) {
+    if (closing.test(lines[index])) {
+      index += 1
+      break
+    }
+    body.push(lines[index])
+    index += 1
+  }
+  const box = document.createElement('div')
+  box.className = 'md-code'
+  if (fence[2] !== '') {
+    const lang = document.createElement('span')
+    lang.className = 'md-lang'
+    lang.textContent = fence[2]
+    box.append(lang)
+  }
+  const pre = document.createElement('pre')
+  const code = document.createElement('code')
+  code.textContent = body.join('\n')
+  pre.append(code)
+  box.append(pre)
+  fragment.append(box)
+  return index
+}
+
+/**
+ * A blockquote, rendered as the blocks it contains.
+ *
+ * @param {DocumentFragment} fragment - output.
+ * @param {string[]} lines - source lines.
+ * @param {number} start - index of the first quoted line.
+ * @returns {number} the line index after the quote.
+ */
+function appendQuote(fragment, lines, start) {
+  const body = []
+  let index = start
+  while (index < lines.length) {
+    const quoted = MD_QUOTE.exec(lines[index])
+    if (quoted === null) break
+    body.push(quoted[1])
+    index += 1
+  }
+  const quote = document.createElement('blockquote')
+  quote.append(markdownBlocks(body))
+  fragment.append(quote)
+  return index
+}
+
+/**
+ * Split one table row into cells.
+ *
+ * @param {string} line - the row.
+ * @returns {string[]|null} the cells, or null when the line is not a row.
+ */
+function splitTableRow(line) {
+  const trimmed = line.trim()
+  if (!trimmed.includes('|')) return null
+  const cells = []
+  let buffer = ''
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed.charAt(index)
+    if (char === '\\' && trimmed.charAt(index + 1) === '|') {
+      buffer += '|'
+      index += 1
+      continue
+    }
+    if (char === '|') {
+      cells.push(buffer)
+      buffer = ''
+      continue
+    }
+    buffer += char
+  }
+  cells.push(buffer)
+  // A leading or trailing pipe is the table's border, not an empty column.
+  if (cells.length > 0 && cells[0].trim() === '') cells.shift()
+  if (cells.length > 0 && cells[cells.length - 1].trim() === '') cells.pop()
+  return cells
+}
+
+/**
+ * The alignment a delimiter cell asks for.
+ *
+ * @param {string} cell - one cell of the delimiter row.
+ * @returns {'left'|'center'|'right'} the alignment.
+ */
+function cellAlignment(cell) {
+  const value = cell.trim()
+  if (value.startsWith(':') && value.endsWith(':')) return 'center'
+  if (value.endsWith(':')) return 'right'
+  return 'left'
+}
+
+/**
+ * A table, if the lines at `start` begin one.
+ *
+ * @param {DocumentFragment} fragment - output.
+ * @param {string[]} lines - source lines.
+ * @param {number} start - candidate header line.
+ * @returns {number} the line index after the table, or -1 when there is none.
+ */
+function appendTable(fragment, lines, start) {
+  const header = splitTableRow(lines[start])
+  if (header === null || start + 1 >= lines.length) return -1
+  if (!MD_TABLE_SEP.test(lines[start + 1])) return -1
+  const alignments = (splitTableRow(lines[start + 1]) ?? []).map(cellAlignment)
+
+  const wrap = document.createElement('div')
+  // The wrapper scrolls, not the page: a wide table on a phone must not push the
+  // whole transcript sideways.
+  wrap.className = 'md-table'
+  const table = document.createElement('table')
+  const head = table.createTHead()
+  const headRow = head.insertRow()
+  header.forEach((cell, column) => {
+    const th = document.createElement('th')
+    th.style.textAlign = alignments[column] ?? 'left'
+    inlineInto(th, cell.trim(), 0)
+    headRow.append(th)
+  })
+  const body = table.createTBody()
+  let index = start + 2
+  while (index < lines.length) {
+    const row = splitTableRow(lines[index])
+    if (row === null) break
+    const tr = body.insertRow()
+    for (let column = 0; column < header.length; column += 1) {
+      const td = tr.insertCell()
+      td.style.textAlign = alignments[column] ?? 'left'
+      inlineInto(td, (row[column] ?? '').trim(), 0)
+    }
+    index += 1
+  }
+  wrap.append(table)
+  fragment.append(wrap)
+  return index
+}
+
+/**
+ * A bullet or ordered list, nested by indentation.
+ *
+ * The stack holds every list currently open: an item indented past the one above
+ * it opens a nested list *inside* that item, and a less-indented item closes
+ * lists until it finds its level. That is the difference between an outline and
+ * a flat pile of every line the agent wrote.
+ *
+ * @param {DocumentFragment} fragment - output.
+ * @param {string[]} lines - source lines.
+ * @param {number} start - index of the first item.
+ * @returns {number} the line index after the list.
+ */
+function appendList(fragment, lines, start) {
+  const first = MD_ITEM.exec(lines[start])
+  const root = makeList(first[2])
+  fragment.append(root)
+  /** @type {{list: HTMLElement, indent: number, item: HTMLElement|null}[]} */
+  const open = [{ list: root, indent: indentWidth(first[1]), item: null }]
+  let index = start
+  while (index < lines.length) {
+    const match = MD_ITEM.exec(lines[index])
+    if (match === null) {
+      const current = open[open.length - 1]
+      const continuation = lines[index]
+      // A wrapped or lazily continued line belongs to the item above it when it
+      // is indented past that item's marker.
+      if (
+        current.item !== null &&
+        continuation.trim() !== '' &&
+        !startsBlock(continuation) &&
+        indentWidth(continuation) > current.indent
+      ) {
+        current.item.append(document.createElement('br'))
+        inlineInto(current.item, continuation.trim(), 0)
+        index += 1
+        continue
+      }
+      break
+    }
+    const indent = indentWidth(match[1])
+    let current = open[open.length - 1]
+    if (indent > current.indent && current.item !== null) {
+      const nested = makeList(match[2])
+      current.item.append(nested)
+      current = { list: nested, indent, item: null }
+      open.push(current)
+    } else {
+      while (open.length > 1 && indent < open[open.length - 1].indent) open.pop()
+      current = open[open.length - 1]
+      // `- a` followed by `1. b` is two lists, not an `<ol>` inside a `<ul>`.
+      if ((current.list.tagName === 'OL') !== /^\d/.test(match[2])) {
+        const replacement = makeList(match[2])
+        current.list.replaceWith(replacement)
+        current.list = replacement
+        current.item = null
+      }
+    }
+    const item = document.createElement('li')
+    inlineInto(item, match[3], 0)
+    current.list.append(item)
+    current.item = item
+    index += 1
+  }
+  return index
+}
+
+/**
+ * A list element for one marker.
+ *
+ * @param {string} marker - the item marker, e.g. `-` or `3.`.
+ * @returns {HTMLElement} a `ul`, or an `ol` that starts at the marker's number.
+ */
+function makeList(marker) {
+  if (!/^\d/.test(marker)) return document.createElement('ul')
+  const list = document.createElement('ol')
+  const start = Number.parseInt(marker, 10)
+  if (Number.isFinite(start) && start > 1) list.start = start
+  return list
+}
+
+/**
+ * Render a paragraph: consecutive plain lines, one line break each.
+ *
+ * A single newline is kept as a break rather than folded into a space. This is a
+ * transcript next to a composer, not a document: when an agent writes two lines
+ * it means two lines.
+ *
+ * @param {DocumentFragment} fragment - output.
+ * @param {string[]} lines - source lines.
+ * @param {number} start - index of the first line.
+ * @returns {number} the line index after the paragraph.
+ */
+function appendParagraph(fragment, lines, start) {
+  const body = []
+  let index = start
+  while (index < lines.length) {
+    const line = lines[index]
+    if (line.trim() === '' || startsBlock(line) || MD_ITEM.test(line)) break
+    // A table can open mid-paragraph; without this its header would be swallowed
+    // into the sentence above it.
+    if (index > start && isTableHead(lines, index)) break
+    body.push(line.trim())
+    index += 1
+  }
+  const paragraph = document.createElement('p')
+  body.forEach((line, position) => {
+    if (position > 0) paragraph.append(document.createElement('br'))
+    inlineInto(paragraph, line, 0)
+  })
+  fragment.append(paragraph)
+  return index
+}
+
+/**
+ * Whether a line opens a block of its own.
+ *
+ * @param {string} line - the line.
+ * @returns {boolean} whether it does.
+ */
+function startsBlock(line) {
+  return MD_FENCE.test(line) || MD_RULE.test(line) || MD_HEADING.test(line) || MD_QUOTE.test(line)
+}
+
+/**
+ * Whether a table starts at `index`.
+ *
+ * @param {string[]} lines - source lines.
+ * @param {number} index - candidate header line.
+ * @returns {boolean} whether the next line is a delimiter row.
+ */
+function isTableHead(lines, index) {
+  return index + 1 < lines.length && splitTableRow(lines[index]) !== null && MD_TABLE_SEP.test(lines[index + 1])
+}
+
+/**
+ * The width of an indentation run, tabs counted as four columns.
+ *
+ * @param {string} prefix - the leading whitespace.
+ * @returns {number} its width.
+ */
+function indentWidth(prefix) {
+  return prefix.replace(/\t/g, '    ').length
+}
+
 /**
  * Render one answer (or failure) row.
  * @param {object} answer - a transcript entry that is not a question.
@@ -1280,8 +1918,12 @@ function answerNode(answer) {
   who.className = 'who'
   who.textContent = failed ? '失败' : 'DSH'
   const content = document.createElement('div')
-  content.className = 'a-text'
-  content.textContent = text
+  // A failure is a plain string from the relay and stays verbatim; an answer is
+  // Markdown. The copy button below is handed the raw source either way, so what
+  // lands on the clipboard is what the agent wrote, not this page's rendering.
+  content.className = failed ? 'a-text' : 'a-text md'
+  if (failed) content.textContent = text
+  else content.append(markdownFragment(text))
   body.append(who, content)
 
   const foot = document.createElement('div')
@@ -1400,8 +2042,10 @@ function questionCard(entry) {
       group.append(kicker)
     }
     const text = document.createElement('div')
-    text.className = 'ask-text'
-    text.textContent = question.question
+    // The question is the model's own words too, and it is exactly where a
+    // backticked path or a two-line choice shows up.
+    text.className = 'ask-text md'
+    text.append(markdownFragment(question.question))
     group.append(text)
 
     const options = Array.isArray(question.options) ? question.options : []
