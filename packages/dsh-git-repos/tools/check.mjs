@@ -13,7 +13,7 @@
  * assertion so it can gate a change to `lib/git.js`.
  */
 
-import { DEFAULT_MAX_DEPTH, discoverRepositories, discoverRepositoriesDetailed, findRepoRoot, status, branches, log, remotes, worktrees, stashes, summary, parseRemoteUrl, operationState, merge, mergeAbort, mergeContinue, rebaseOnto, rebaseAbort, rebaseContinue, switchBranch, localBranchNames, workingTreeLoad } from '../lib/git.js'
+import { DEFAULT_MAX_DEPTH, discoverRepositories, discoverRepositoriesDetailed, findRepoRoot, status, branches, log, remotes, worktrees, stashes, summary, parseRemoteUrl, operationState, merge, mergeAbort, mergeContinue, rebaseOnto, rebaseAbort, rebaseContinue, switchBranch, localBranchNames, workingTreeLoad, parseConflictBlocks, resolveConflictText, findConflictMarker, looksBinary, keepTrailingNewline } from '../lib/git.js'
 import { describeRemote, webUrl } from '../lib/gitlab.js'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { spawnSync } from 'node:child_process'
@@ -303,6 +303,67 @@ function fixtureGit(cwd, args) {
       rejected = error?.code === 'bad-argument'
     }
     check('an option-shaped merge target is refused', rejected)
+
+    // ── the conflict parser, on inputs a repository cannot easily produce ───
+    // The fixture below has one conflict; these cases are the ones that are hard
+    // to build and easy to get wrong: the diff3 base section, two blocks in one
+    // file, a line of equals signs that is content, and text around the markers.
+    {
+      const two = ['top', '<<<<<<< HEAD', 'mine', '=======', 'yours', '>>>>>>> side', 'bottom', ''].join('\n')
+      const parsed = parseConflictBlocks(two)
+      check('a two-way conflict becomes one block',
+        parsed.blocks.length === 1 && parsed.parts.length === 3, JSON.stringify(parsed.parts.map((part) => part.kind)))
+      check('the two sides are captured',
+        parsed.blocks[0].ours.join('\n') === 'mine' && parsed.blocks[0].theirs.join('\n') === 'yours')
+      check('the surrounding text is preserved',
+        parsed.parts[0].text === 'top' && parsed.parts[2].text === 'bottom\n', JSON.stringify(parsed.parts.map((p) => p.text)))
+      check('rebuilding with the local side drops the markers',
+        resolveConflictText(parsed, { c0: 'ours' }) === 'top\nmine\nbottom\n')
+      check('rebuilding with both keeps local first',
+        resolveConflictText(parsed, { c0: 'both' }) === 'top\nmine\nyours\nbottom\n')
+
+      const diff3 = ['a', '<<<<<<< HEAD', 'M', '||||||| base', 'B', '=======', 'T', '>>>>>>> x', 'z', ''].join('\n')
+      const parsed3 = parseConflictBlocks(diff3)
+      check('a diff3 conflict keeps the common ancestor',
+        parsed3.blocks[0].base.join('\n') === 'B' && parsed3.blocks[0].ours.join('\n') === 'M'
+        && parsed3.blocks[0].theirs.join('\n') === 'T', JSON.stringify(parsed3.blocks[0]))
+
+      const multi = ['<<<<<<< a', '1', '=======', 'one', '>>>>>>> b', 'mid', '<<<<<<< a', '2', '=======', 'two', '>>>>>>> b', ''].join('\n')
+      const parsedMulti = parseConflictBlocks(multi)
+      check('two conflicts in one file are two blocks', parsedMulti.blocks.length === 2,
+        JSON.stringify(parsedMulti.blocks.map((block) => block.id)))
+      check('each block rebuilds independently',
+        resolveConflictText(parsedMulti, { c0: 'ours', c1: 'theirs' }) === '1\nmid\ntwo\n',
+        JSON.stringify(resolveConflictText(parsedMulti, { c0: 'ours', c1: 'theirs' })))
+      let refused = false
+      try {
+        resolveConflictText(parsedMulti, { c0: 'ours' })
+      } catch (error) {
+        refused = error?.code === 'unresolved-blocks'
+      }
+      check('an undecided block refuses to build a file', refused)
+
+      // A line of equals signs inside content must not be read as a separator.
+      const embedded = ['<<<<<<< a', 'x', '=======', 'y', '=======', 'z', '>>>>>>> b', ''].join('\n')
+      const parsedEmbedded = parseConflictBlocks(embedded)
+      check('equals signs inside the other side are content',
+        parsedEmbedded.blocks[0].theirs.join('\n') === 'y\n=======\nz',
+        JSON.stringify(parsedEmbedded.blocks[0].theirs))
+
+      // A resolution must not add or remove the file's trailing newline: that
+      // would put a spurious "no newline at end of file" hunk into the very diff
+      // the user is about to commit.
+      check('a trailing newline survives a resolution',
+        keepTrailingNewline('a\nb\n', 'a\nb') === 'a\nb\n')
+      check('a missing trailing newline stays missing',
+        keepTrailingNewline('a\nb', 'a\nb\n') === 'a\nb')
+      check('the newline is untouched when it already matches',
+        keepTrailingNewline('a\n', 'a\n') === 'a\n')
+
+      check('a marker at line start is detected', findConflictMarker('<<<<<<< x') === '<<<<<<<')
+      check('ordinary text has no marker', findConflictMarker('a ===== b\n>>>> not at start') === undefined)
+      check('binary content is recognised', looksBinary('a\u0000b') === true && looksBinary('plain') === false)
+    }
 
     // ── branch switching, including carrying changes across ─────────────────
     // This is the operation whose failure modes differ the most between its two

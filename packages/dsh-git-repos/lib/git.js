@@ -16,9 +16,9 @@
  */
 
 import { spawn } from 'node:child_process'
-import { access, readdir, realpath } from 'node:fs/promises'
+import { access, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
-import { isAbsolute, join, normalize, relative, sep } from 'node:path'
+import { dirname, isAbsolute, join, normalize, relative, sep } from 'node:path'
 
 /** Field separator inside one `for-each-ref`/`log` record. */
 const US = '\u001f'
@@ -1128,6 +1128,322 @@ export async function workingTreeLoad(root) {
     conflicted: state.counts.conflicted,
   }
 }
+
+/* ── Conflict resolution ──────────────────────────────────────────────────────
+ * A conflicted file is a file with markers in it, so "resolving" it is really
+ * two separate jobs: reading the three versions git kept in the index, and
+ * rewriting the working-tree file without the markers. Both live here because
+ * both are git operations — the caller supplies a repo root and a repo-relative
+ * path, never an absolute one.
+ */
+
+/** The three index stages git keeps for a conflicted path. */
+const STAGE = { base: 1, ours: 2, theirs: 3 }
+
+/**
+ * Read one file's blob out of a specific index stage.
+ *
+ * An absent stage is a real state, not an error: a file deleted on one side of a
+ * delete/modify conflict has no `:3:` blob at all, and the resolver has to show
+ * that as "deleted on their side" rather than failing.
+ *
+ * @param root - repo root.
+ * @param path - repo-relative path.
+ * @param stage - 1 (base), 2 (ours), or 3 (theirs).
+ * @returns the blob text, or null when that stage does not exist.
+ */
+export async function conflictStage(root, path, stage) {
+  const file = assertRepoPath(path)
+  const spec = `:${String(stage)}:${file}`
+  try {
+    const raw = await runGit(root, ['show', spec], { timeoutMs: 20_000, maxBytes: 16 * 1024 * 1024 })
+    if (raw.code !== 0) return null
+    return raw.stdout
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Detect whether a buffer is binary.
+ *
+ * A conflict in a binary file cannot be resolved by editing text, so the panel
+ * needs to know before it offers an editor: a NUL byte in the first 8000 is the
+ * same heuristic git itself uses.
+ *
+ * @param text - decoded file content.
+ * @returns true when the content should be treated as binary.
+ */
+export function looksBinary(text) {
+  return String(text ?? '').slice(0, 8000).includes('\u0000')
+}
+
+/**
+ * Split a conflicted file into its literal parts.
+ *
+ * Handles both marker styles: the default two-way form and the `diff3` form,
+ * which inserts a `|||||||` section holding the common ancestor. The labels after
+ * the markers are ignored — they are prose ("HEAD", a short hash, a branch name)
+ * and carry no structure.
+ *
+ * Text outside any block is kept as `{ kind: 'text' }` parts so that rebuilding
+ * the file is a pure concatenation of what was parsed; a resolver that dropped
+ * the untouched lines would silently truncate the file.
+ *
+ * @param text - the conflicted file's content.
+ * @returns `{ parts, blocks }`; `blocks` are the conflict regions in order.
+ */
+export function parseConflictBlocks(text) {
+  const lines = String(text ?? '').split('\n')
+  const parts = []
+  const blocks = []
+  let buffer = []
+  let index = 0
+  let open = null
+
+  const flushText = () => {
+    if (buffer.length > 0) {
+      parts.push({ kind: 'text', text: buffer.join('\n') })
+      buffer = []
+    }
+  }
+
+  while (index < lines.length) {
+    const line = lines[index]
+    if (open === null && line.startsWith('<<<<<<<')) {
+      flushText()
+      const block = {
+        id: `c${blocks.length}`,
+        startLine: index + 1,
+        endLine: index + 1,
+        ours: [],
+        base: undefined,
+        theirs: [],
+        oursLabel: line.slice(7).trim(),
+        theirsLabel: '',
+        baseLabel: '',
+      }
+      open = block
+      index += 1
+      continue
+    }
+    if (open !== null) {
+      if (line.startsWith('|||||||') && open.base === undefined && open.theirs.length === 0) {
+        open.baseLabel = line.slice(7).trim()
+        open.base = []
+        index += 1
+        continue
+      }
+      // The `=======` separator only counts before the theirs side has begun: a
+      // line of equals signs inside the conflicting content is content.
+      if (line.startsWith('=======') && open.inTheirs !== true) {
+        open.inTheirs = true
+        index += 1
+        continue
+      }
+      if (line.startsWith('>>>>>>>')) {
+        open.theirsLabel = line.slice(7).trim()
+        open.endLine = index + 1
+        delete open.inTheirs
+        blocks.push(open)
+        parts.push({ kind: 'block', block: open })
+        open = null
+        index += 1
+        continue
+      }
+      if (open.base !== undefined && open.inTheirs !== true) open.base.push(line)
+      else if (open.inTheirs === true) open.theirs.push(line)
+      else open.ours.push(line)
+      index += 1
+      continue
+    }
+    buffer.push(line)
+    index += 1
+  }
+  // An unterminated block means the file was hand-edited badly; keeping the
+  // remainder as text is better than throwing away the user's content.
+  flushText()
+  return { parts, blocks }
+}
+
+/**
+ * Build the resolved content from a set of block choices.
+ *
+ * @param parsed - output of {@link parseConflictBlocks}.
+ * @param choices - `{ [blockId]: 'ours' | 'theirs' | 'both' | string }`; a string
+ *   other than those three words is used verbatim as the replacement text.
+ * @returns the rebuilt file content.
+ * @throws {GitError} when a block was left undecided, because writing a file that
+ *   still has a conflict in it under a "resolved" label is the failure this
+ *   whole feature exists to prevent.
+ */
+export function resolveConflictText(parsed, choices = {}) {
+  const chunks = []
+  const undecided = []
+  for (const part of parsed.parts) {
+    if (part.kind === 'text') {
+      chunks.push(part.text)
+      continue
+    }
+    const block = part.block
+    const choice = choices[block.id]
+    if (choice === undefined || choice === null || choice === '') {
+      undecided.push(block.id)
+      continue
+    }
+    const ours = block.ours.join('\n')
+    const theirs = block.theirs.join('\n')
+    if (choice === 'ours') chunks.push(ours)
+    else if (choice === 'theirs') chunks.push(theirs)
+    else if (choice === 'both') {
+      // "Both" keeps the local side first: it is the version the person reading
+      // the panel already has in mind when they ask for both.
+      chunks.push([ours, theirs].filter((part) => part !== '').join('\n'))
+    } else {
+      chunks.push(String(choice))
+    }
+  }
+  if (undecided.length > 0) {
+    throw new GitError(`these conflicts have no decision yet: ${undecided.join(', ')}`, { code: 'unresolved-blocks' })
+  }
+  return chunks.join('\n')
+}
+
+/**
+ * Rebuild a resolved file without changing its ending.
+ *
+ * `split('\n')` puts the empty remainder of a trailing newline into the last
+ * element, so joining the parts back together drops it. Left alone, every
+ * resolution would add a "no newline at end of file" diff to a file the user did
+ * not touch that way — noise in the very commit they are composing.
+ *
+ * @param original - the conflicted file's content, as read.
+ * @param rebuilt - the content produced by {@link resolveConflictText}.
+ * @returns the rebuilt content with the original's trailing-newline habit.
+ */
+export function keepTrailingNewline(original, rebuilt) {
+  const text = String(rebuilt ?? '')
+  const wantsNewline = String(original ?? '').endsWith('\n')
+  if (wantsNewline && !text.endsWith('\n')) return `${text}\n`
+  if (!wantsNewline && text.endsWith('\n')) return text.slice(0, -1)
+  return text
+}
+
+/**
+ * Whether content still contains a conflict marker at the start of a line.
+ *
+ * The last gate before a write. It cannot prove the resolution is correct, but it
+ * does catch the one mistake that is both easy and expensive: committing a file
+ * that still has `<<<<<<<` in it.
+ *
+ * @param text - candidate content.
+ * @returns the offending marker, or undefined.
+ */
+export function findConflictMarker(text) {
+  for (const line of String(text ?? '').split('\n')) {
+    for (const marker of ['<<<<<<<', '=======', '>>>>>>>', '|||||||']) {
+      if (line.startsWith(marker)) return marker
+    }
+  }
+  return undefined
+}
+
+/**
+ * Write resolved content to a repository file.
+ *
+ * Two guards, because this is the one place the plugin writes a file the user
+ * owns. The repo-relative path is validated by {@link assertRepoPath}, and the
+ * *resolved* absolute path is then checked to still be inside the repository —
+ * a symlink pointing out of the tree would otherwise turn "write my conflicted
+ * file" into "write something outside the checkout".
+ *
+ * @param root - repo root.
+ * @param path - repo-relative path.
+ * @param content - the resolved content.
+ * @returns the absolute path written and its byte length.
+ * @throws {GitError} when the path escapes the repository.
+ */
+export async function writeRepoFile(root, path, content) {
+  const file = assertRepoPath(path)
+  const base = await realpath(root)
+  const target = join(base, file)
+  // The parent directory must exist inside the repo; realpath on it also
+  // resolves a symlinked directory before the containment test.
+  const parent = await realpath(dirname(target)).catch(() => undefined)
+  if (parent === undefined || !(parent === base || parent.startsWith(base + sep))) {
+    throw new GitError(`refusing to write outside the repository: ${file}`, { code: 'path-escapes-repo' })
+  }
+  const text = String(content ?? '')
+  await writeFile(target, text, 'utf8')
+  return { path: target, bytes: Buffer.byteLength(text, 'utf8') }
+}
+
+/**
+ * Delete a repository file, refusing anything outside the checkout.
+ *
+ * The counterpart to {@link writeRepoFile}, and guarded the same way: taking the
+ * side of a delete/modify conflict means the file has to go, and that is the one
+ * resolution that destroys content the user can still see in the panel.
+ *
+ * @param root - repo root.
+ * @param path - repo-relative path.
+ * @returns the absolute path removed.
+ * @throws {GitError} when the path escapes the repository.
+ */
+export async function removeRepoFile(root, path) {
+  const file = assertRepoPath(path)
+  const base = await realpath(root)
+  const target = join(base, file)
+  const parent = await realpath(dirname(target)).catch(() => undefined)
+  if (parent === undefined || !(parent === base || parent.startsWith(base + sep))) {
+    throw new GitError(`refusing to delete outside the repository: ${file}`, { code: 'path-escapes-repo' })
+  }
+  await rm(target, { force: true })
+  return target
+}
+
+/**
+ * Read a conflicted file and everything needed to resolve it.
+ *
+ * @param root - repo root.
+ * @param path - repo-relative path.
+ * @returns the working-tree text, parsed blocks, and which stages exist.
+ */
+export async function conflictDetail(root, path) {
+  const file = assertRepoPath(path)
+  const [working, base, ours, theirs] = await Promise.all([
+    readFile(join(await realpath(root), file), 'utf8').catch((error) => {
+      if (error?.code === 'ENOENT') return ''
+      throw error
+    }),
+    conflictStage(root, file, STAGE.base),
+    conflictStage(root, file, STAGE.ours),
+    conflictStage(root, file, STAGE.theirs),
+  ])
+  const parsed = parseConflictBlocks(working)
+  return {
+    path: file,
+    text: working,
+    binary: looksBinary(working),
+    blocks: parsed.blocks,
+    // The literal parts are what the panel rebuilds the file from, so the
+    // preview it shows is the file it is about to write rather than a
+    // reconstruction that merely resembles it.
+    parts: parsed.parts.map((part) => (part.kind === 'text'
+      ? { kind: 'text', text: part.text }
+      : { kind: 'block', blockId: part.block.id })),
+    blockParts: Object.fromEntries(parsed.blocks.map((block) => [block.id, block])),
+    stages: {
+      base: base !== null,
+      ours: ours !== null,
+      theirs: theirs !== null,
+    },
+    // A delete/modify conflict is the case the panel cannot resolve by editing
+    // text, so the missing side is named instead of shown empty.
+    deletedOn: theirs === null && ours !== null ? 'theirs' : ours === null && theirs !== null ? 'ours' : null,
+  }
+}
+
 
 /**
  * Delete a local branch.

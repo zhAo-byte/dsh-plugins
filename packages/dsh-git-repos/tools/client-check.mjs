@@ -162,7 +162,7 @@ check('body shows the empty state before any data', JSON.stringify(tree).include
   || JSON.stringify(tree).includes('等待会话工作目录'))
 
 console.log('\n# helpers')
-const { asArray, unpackDetail, statusLetter, splitPath, diffLineClass, renderChanges, renderDiff, gitlabUrl, pipelineStyle, formatDate, operationText, bulkOutcomeText } = moduleExports.internals
+const { asArray, unpackDetail, statusLetter, splitPath, diffLineClass, renderChanges, renderDiff, gitlabUrl, pipelineStyle, formatDate, operationText, bulkOutcomeText, renderConflictPanel, conflictText } = moduleExports.internals
 
 // The two new surfaces are pure label maps, so they are asserted here rather
 // than through a rendered tree: the banner and the row chips both decide what to
@@ -237,6 +237,65 @@ check('unstaged group counts tracked changes', flat.includes('未暂存 (2)'))
 check('clean tree shows the empty message', JSON.stringify(renderChanges({
   status: { entries: [] }, busy: false, onOpen: noop, onStage: noop, onUnstage: noop, onDiscard: noop,
 })).includes('工作区是干净的'))
+
+console.log('\n# conflict resolver')
+// The resolver's two side-by-side versions and its per-block decision are the
+// whole feature: a panel that rendered the wrong side, or let a half-decided file
+// be saved, would be worse than the marker text it replaces.
+const conflictDetailSample = {
+  path: 'src/app.ts',
+  text: 'keep\n<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> side\nend\n',
+  binary: false,
+  blocks: [{
+    id: 'c0', startLine: 2, endLine: 6, ours: ['mine'], theirs: ['theirs'], base: undefined,
+    oursLabel: 'HEAD', theirsLabel: 'side', baseLabel: '',
+  }],
+  parts: [
+    { kind: 'text', text: 'keep' },
+    { kind: 'block', blockId: 'c0' },
+    { kind: 'text', text: 'end\n' },
+  ],
+  blockParts: {
+    c0: { id: 'c0', ours: ['mine'], theirs: ['theirs'], base: undefined, oursLabel: 'HEAD', theirsLabel: 'side', baseLabel: '' },
+  },
+  stages: { base: true, ours: true, theirs: true },
+  deletedOn: null,
+}
+const conflictNodes = JSON.stringify(renderConflictPanel({
+  conflict: { path: 'src/app.ts', detail: conflictDetailSample, draft: { c0: 'ours' }, busy: false, error: null },
+  onDecide: noop, onClose: noop, onSave: noop, onTakeWhole: noop, onCopy: noop,
+}))
+check('the resolver shows the local side', conflictNodes.includes('mine'), 'ours missing')
+check('the resolver shows the other side', conflictNodes.includes('theirs'), 'theirs missing')
+check('the resolver offers all three choices',
+  conflictNodes.includes('采用我的') && conflictNodes.includes('采用他们的') && conflictNodes.includes('两个都要'))
+check('the resolver offers whole-file shortcuts',
+  conflictNodes.includes('整文件采用我的') && conflictNodes.includes('整文件采用他们的'))
+check('the resolver shows the block position', conflictNodes.includes('第 2–6 行'), conflictNodes.slice(0, 200))
+check('the resolver always shows the result preview', conflictNodes.includes('结果预览'))
+
+// A binary conflict must not pretend an editor would help.
+const binaryNodes = JSON.stringify(renderConflictPanel({
+  conflict: { path: 'logo.png', detail: { ...conflictDetailSample, binary: true, blocks: [], parts: [], blockParts: {} }, draft: {}, busy: false },
+  onDecide: noop, onClose: noop, onSave: noop, onTakeWhole: noop, onCopy: noop,
+}))
+check('a binary conflict says the editor cannot help', binaryNodes.includes('二进制文件'), binaryNodes.slice(0, 160))
+
+// A delete/modify conflict names the missing side instead of showing it empty.
+const deletedNodes = JSON.stringify(renderConflictPanel({
+  conflict: { path: 'gone.txt', detail: { ...conflictDetailSample, deletedOn: 'theirs' }, draft: { c0: 'ours' }, busy: false },
+  onDecide: noop, onClose: noop, onSave: noop, onTakeWhole: noop, onCopy: noop,
+}))
+check('a delete/modify conflict names the missing side', deletedNodes.includes('被删除'), deletedNodes.slice(0, 160))
+
+// The named choices and free text are both decisions, and they must not be
+// confused: this is the same mapping the host applies when it writes.
+const sampleBlock = { ours: ['a', 'b'], theirs: ['c'] }
+check('choosing ours keeps the local block', conflictText(sampleBlock, 'ours') === 'a\nb')
+check('choosing theirs takes the other block', conflictText(sampleBlock, 'theirs') === 'c')
+check('choosing both concatenates local first', conflictText(sampleBlock, 'both') === 'a\nb\nc')
+check('an undecided block falls back to local', conflictText(sampleBlock, undefined) === 'a\nb')
+check('free text is the decision', conflictText(sampleBlock, 'hand written') === 'hand written')
 
 console.log('\n# diff rendering')
 const diffSample = 'diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n'

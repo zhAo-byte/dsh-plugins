@@ -60,6 +60,27 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The content one decision produces for a conflict block.
+     *
+     * Mirrors the host's `resolveConflictText` for the three named choices; any
+     * other value is the user's own text, used verbatim. It is duplicated rather
+     * than fetched because the panel previews on every keystroke, and the host
+     * stays the authority: it recomputes the same mapping before writing.
+     *
+     * @param block - one parsed conflict block.
+     * @param decision - `ours`, `theirs`, `both`, or literal replacement text.
+     * @returns the block's contribution to the file.
+     */
+    function conflictText(block, decision) {
+      const ours = (block.ours ?? []).join('\n')
+      const theirs = (block.theirs ?? []).join('\n')
+      if (decision === 'theirs') return theirs
+      if (decision === 'both') return [ours, theirs].filter((part) => part !== '').join('\n')
+      if (decision === 'ours' || decision === undefined || decision === null) return ours
+      return String(decision)
+    }
+
+    /**
      * Short verdict for one bulk outcome.
      *
      * @param outcome - one `repo.bulk` result's `outcome`.
@@ -172,6 +193,25 @@ window.__ModuleLoader__.load({
 .gr-spin{animation:gr-spin 1s linear infinite;transform-origin:50% 50%}
 @keyframes gr-spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 .gr-split{display:flex;gap:6px;align-items:center}
+.gr-root{position:relative}
+.gr-cfOverlay{position:absolute;inset:0;z-index:6;display:flex;align-items:stretch;justify-content:center;padding:10px;background:rgba(0,0,0,.42)}
+.gr-cfCard{display:flex;flex-direction:column;flex:1;min-width:0;max-width:1000px;border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-base,#fff);border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.3));box-shadow:0 18px 48px -18px rgba(0,0,0,.55)}
+.gr-cfHead{flex:none;display:flex;align-items:center;gap:7px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18));font-weight:600}
+.gr-cfBody{flex:1;min-height:0;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:10px}
+.gr-cfEmpty{padding:12px;color:var(--dsw-alias-label-tertiary);font-size:11.5px}
+.gr-cfBlock{border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.26));border-radius:9px;overflow:hidden}
+.gr-cfBlockHead{display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.06));border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.16))}
+.gr-cfSides{display:flex;gap:8px;padding:8px}
+.gr-cfSide{flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.16));border-radius:7px;overflow:hidden}
+.gr-cfSideHead{padding:3px 7px;font-size:10.5px;font-weight:600;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.06))}
+.gr-cfCode{margin:0;padding:6px 8px;max-height:160px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:var(--ds-font-family-code,ui-monospace,Menlo,monospace);font-size:11px;line-height:16px}
+.gr-cfCode--full{max-height:280px}
+.gr-cfBase{padding:0 8px 8px}
+.gr-cfEdit{margin:0 8px 8px;width:calc(100% - 16px);min-height:56px;font-family:var(--ds-font-family-code,ui-monospace,Menlo,monospace);font-size:11.5px}
+.gr-cfPreview{padding:0 8px 8px;font-size:11.5px}
+.gr-cfPreview summary{cursor:pointer;color:var(--dsw-alias-label-secondary)}
+.gr-cfFoot{flex:none;display:flex;align-items:center;gap:7px;padding:8px 10px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18))}
+.gr-cfErr{color:var(--dsw-alias-state-error-primary,#d8503f);font-size:11.5px}
 `
 
     /** Install the stylesheet once per document, idempotent across HMR reloads. */
@@ -455,6 +495,15 @@ window.__ModuleLoader__.load({
       const [switchBranch, setSwitchBranch] = React.useState('')
       const [switchCarry, setSwitchCarry] = React.useState(false)
       const [switchCheck, setSwitchCheck] = React.useState(null)
+      /**
+       * The conflict resolver, when open.
+       *
+       * `draft` holds one decision per block: one of `ours`/`theirs`/`both`, or
+       * the literal replacement text once the user edits the result box. Keeping
+       * the text as the decision (rather than a flag plus separate text) means
+       * there is exactly one source of truth for what will be written.
+       */
+      const [conflict, setConflict] = React.useState(null)
 
       const stateRef = React.useRef({})
       stateRef.current = { root, activeRoot, busy, tab, visible }
@@ -473,6 +522,8 @@ window.__ModuleLoader__.load({
       switchCarryRef.current = switchCarry
       const switchCheckRef = React.useRef(null)
       switchCheckRef.current = switchCheck
+      const conflictRef = React.useRef(null)
+      conflictRef.current = conflict
 
       // The session directory is the default root; a manual pick wins until the
       // session itself changes.
@@ -729,6 +780,74 @@ window.__ModuleLoader__.load({
           setBusy(null)
         }
       }, [loadDetail, loadList])
+
+      /** Open the conflict resolver for one path. */
+      const openConflict = React.useCallback(async (path) => {
+        const root = stateRef.current.activeRoot
+        if (root === null || !path) return
+        setConflict({ path, loading: true, draft: {}, busy: false, error: null })
+        try {
+          const detail = await rpc('repo.conflict', { root, path })
+          const draft = {}
+          for (const block of asArray(detail?.blocks)) draft[block.id] = 'ours'
+          setConflict({ path, detail, draft, busy: false, error: null })
+        } catch (failure) {
+          setConflict({ path, error: failure.message, loading: false, draft: {}, busy: false })
+        }
+      }, [])
+
+      /**
+       * Rebuild the whole file from the current decisions.
+       *
+       * Driven by the host's literal parts rather than by the blocks alone, so
+       * the untouched lines between conflicts are in the preview too — a preview
+       * that dropped them would be reassuring about a file it is not showing.
+       */
+      const conflictPreview = (detail, draft) => {
+        const byId = detail?.blockParts ?? {}
+        const parts = asArray(detail?.parts)
+        if (parts.length === 0) return ''
+        return parts
+          .map((part) => {
+            if (part.kind === 'text') return part.text
+            const block = byId[part.blockId]
+            return block === undefined ? '' : conflictText(block, draft[part.blockId])
+          })
+          .join('\n')
+      }
+
+      /** Save the resolver's decisions and stage the file. */
+      const saveConflict = React.useCallback(async () => {
+        const current = conflictRef.current
+        const root = stateRef.current.activeRoot
+        if (!current?.detail || root === null) return
+        setConflict((value) => ({ ...value, busy: true, error: null }))
+        try {
+          await rpc('repo.conflictSave', { root, path: current.detail.path, choices: current.draft })
+          setConflict(null)
+          setNotice(`已解决 ${current.detail.path} 并暂存`)
+          await loadDetail(root, { quiet: true })
+          if (stateRef.current.root) await loadList(stateRef.current.root, { quiet: true })
+        } catch (failure) {
+          setConflict((value) => ({ ...value, busy: false, error: failure.message }))
+        }
+      }, [loadDetail, loadList])
+
+      /**
+       * Resolve the whole file by taking one side.
+       *
+       * Uses the per-block path when the side exists: taking a side is exactly
+       * "every block chooses that side", and routing it through the same write
+       * keeps one code path for what reaches the file.
+       */
+      const takeSideWhole = React.useCallback(async (side) => {
+        const current = conflictRef.current
+        if (!current?.detail) return
+        const draft = {}
+        for (const block of asArray(current.detail.blocks)) draft[block.id] = side
+        setConflict({ ...current, draft })
+        await saveConflict()
+      }, [saveConflict])
 
       /**
        * Finish or abandon the merge/rebase that owns this working tree.
@@ -1155,6 +1274,13 @@ window.__ModuleLoader__.load({
           activePath: diff?.path,
           busy,
           onOpen: async (entry, staged) => {
+            // A conflicted file opens the resolver instead of the diff: the diff
+            // of a conflicted file is the marker text, which is the thing the
+            // resolver exists to remove.
+            if (entry.conflicted === true) {
+              void openConflict(entry.path)
+              return
+            }
             const untracked = entry.untracked === true
             setTab('diff')
             setDiff({ path: entry.path, staged, untracked, loading: true, text: '' })
@@ -1587,6 +1713,18 @@ window.__ModuleLoader__.load({
         h('div', { className: 'gr-body', key: 'body' }, [
           scan,
           h('div', { className: 'gr-detail', key: 'detail' }, [detailHeader, switchConflictBar, operationBar, tabStrip, content]),
+          conflict === null
+            ? null
+            : renderConflictPanel({
+              conflict,
+              onDecide: (blockId, value) => setConflict((current) => (
+                current === null ? current : { ...current, draft: { ...current.draft, [blockId]: value }, error: null }
+              )),
+              onClose: () => setConflict(null),
+              onSave: () => void saveConflict(),
+              onTakeWhole: (side) => void takeSideWhole(side),
+              onCopy: (text) => { try { void navigator.clipboard?.writeText?.(text) } catch { /* insecure origin */ } },
+            }),
         ]),
       ])
     }
@@ -1647,6 +1785,149 @@ window.__ModuleLoader__.load({
       if (unstaged.length > 0) children.push(...unstaged.map((entry) => row(entry, 'unstaged')))
       else if (entries.length === 0) children.push(h('div', { className: 'gr-empty', key: 'clean' }, '工作区是干净的'))
       return children
+    }
+
+    /**
+     * Build the conflict resolver.
+     *
+     * Every block gets its own three choices plus an editable result, because the
+     * realistic conflict is "these two changes are both wanted, in this order" —
+     * a whole-file choice cannot express that, and a three-pane editor is a much
+     * larger thing to build for the same answer.
+     *
+     * @param options - `{ conflict, onDecide, onClose, onSave, onTakeWhole, onCopy }`.
+     * @returns the overlay element.
+     */
+    function renderConflictPanel(options) {
+      const { conflict, onDecide, onClose, onSave, onTakeWhole, onCopy } = options
+      const detail = conflict?.detail
+      const blocks = Array.isArray(detail?.blocks) ? detail.blocks : []
+      const decided = blocks.filter((block) => {
+        const value = conflict.draft?.[block.id]
+        return value !== undefined && value !== null && value !== ''
+      }).length
+
+      const head = h('div', { className: 'gr-cfHead' }, [
+        h(Glyph, { path: P.commit, key: 'i', size: 14 }),
+        h('span', { key: 't', className: 'gr-grow gr-ellipsis', title: detail?.path ?? conflict?.path },
+          `解决冲突 · ${detail?.path ?? conflict?.path ?? ''}`),
+        h('span', { key: 'n', className: 'gr-chip' }, `${blocks.length} 个冲突块`),
+        h(Btn, { key: 'close', icon: P.minus, title: '关闭', variant: 'ghost', onClick: onClose }),
+      ])
+
+      if (conflict?.loading === true) {
+        return h('div', { className: 'gr-cfOverlay' }, [
+          h('div', { className: 'gr-cfCard', key: 'card' }, [head, h('div', { className: 'gr-cfEmpty' }, '读取冲突…')]),
+        ])
+      }
+      if (conflict?.detail === undefined) {
+        return h('div', { className: 'gr-cfOverlay' }, [
+          h('div', { className: 'gr-cfCard', key: 'card' }, [
+            head,
+            h('div', { className: 'gr-cfEmpty' }, conflict?.error ?? '读不出这个文件的冲突'),
+          ]),
+        ])
+      }
+
+      const bodyChildren = []
+      if (detail.binary === true) {
+        bodyChildren.push(h('div', { className: 'gr-cfEmpty', key: 'bin' },
+          '这是一个二进制文件，不能在面板里按文本解决。用「整文件采用」选一边，或者到外部工具处理。'))
+      }
+      if (detail.deletedOn) {
+        bodyChildren.push(h('div', { className: 'gr-cfEmpty', key: 'del' },
+          `这个文件在「${detail.deletedOn === 'theirs' ? '他们' : '我'}」那边被删除了：采用删除的那一边会删掉这个文件。`))
+      }
+
+      blocks.forEach((block, index) => {
+        const decision = conflict.draft?.[block.id]
+        const named = decision === 'ours' || decision === 'theirs' || decision === 'both'
+        const preview = decision === undefined ? '' : (named ? '' : String(decision))
+        const choiceBtn = (key, label, value, title) => h(Btn, {
+          key, label, title, variant: decision === value ? 'primary' : 'ghost',
+          onClick: () => onDecide(block.id, value),
+        })
+        bodyChildren.push(h('div', { className: 'gr-cfBlock', key: block.id }, [
+          h('div', { className: 'gr-cfBlockHead' }, [
+            h('span', { key: 'i', className: 'gr-dim' }, `#${index + 1}`),
+            h('span', { key: 'l', className: 'gr-dim gr-mono' }, `第 ${block.startLine}–${block.endLine} 行`),
+            h('span', { key: 's', className: 'gr-grow' }),
+            choiceBtn('ours', '采用我的', 'ours', '我的这一边（HEAD）'),
+            choiceBtn('theirs', '采用他们的', 'theirs', '他们那一边（被合并进来的分支）'),
+            choiceBtn('both', '两个都要', 'both', '先我的、后他们的，拼接在一起'),
+          ]),
+          h('div', { className: 'gr-cfSides' }, [
+            h('div', { className: 'gr-cfSide', key: 'ours' }, [
+              h('div', { className: 'gr-cfSideHead' }, `我的${block.oursLabel ? ` · ${block.oursLabel}` : ''}`),
+              h('pre', { className: 'gr-cfCode' }, block.ours.length === 0 ? '(这一侧没有内容)' : block.ours.join('\n')),
+            ]),
+            h('div', { className: 'gr-cfSide', key: 'theirs' }, [
+              h('div', { className: 'gr-cfSideHead' }, `他们的${block.theirsLabel ? ` · ${block.theirsLabel}` : ''}`),
+              h('pre', { className: 'gr-cfCode' }, block.theirs.length === 0 ? '(这一侧没有内容)' : block.theirs.join('\n')),
+            ]),
+          ]),
+          block.base === undefined
+            ? null
+            : h('div', { className: 'gr-cfBase', key: 'base' }, [
+              h('div', { className: 'gr-cfSideHead' }, `共同祖先${block.baseLabel ? ` · ${block.baseLabel}` : ''}`),
+              h('pre', { className: 'gr-cfCode' }, block.base.join('\n')),
+            ]),
+          h('textarea', {
+            className: 'gr-textarea gr-cfEdit', value: preview,
+            placeholder: named ? '结果预览（直接编辑这里就会改用你写的内容）' : '你写的内容',
+            onChange: (event) => onDecide(block.id, event.target.value),
+          }),
+        ]))
+      })
+
+      const preview = (() => {
+        const parts = Array.isArray(detail.parts) ? detail.parts : []
+        if (parts.length === 0) return ''
+        const byId = detail.blockParts ?? {}
+        return parts.map((part) => {
+          if (part.kind === 'text') return part.text
+          const block = byId[part.blockId]
+          if (block === undefined) return ''
+          const value = conflict.draft?.[part.blockId]
+          const ours = block.ours.join('\n')
+          const theirs = block.theirs.join('\n')
+          if (value === 'theirs') return theirs
+          if (value === 'both') return [ours, theirs].filter((piece) => piece !== '').join('\n')
+          if (value === undefined || value === 'ours') return ours
+          return String(value)
+        }).join('\n')
+      })()
+
+      bodyChildren.push(h('details', { className: 'gr-cfPreview', key: 'preview' }, [
+        h('summary', {}, `结果预览（${preview.split('\n').length} 行）`),
+        h('pre', { className: 'gr-cfCode gr-cfCode--full' }, preview === '' ? '(空)' : preview),
+      ]))
+
+      const foot = h('div', { className: 'gr-cfFoot' }, [
+        conflict.error ? h('span', { key: 'e', className: 'gr-cfErr gr-grow' }, conflict.error) : h('span', { key: 'e', className: 'gr-grow gr-dim' },
+          `已决定 ${decided}/${blocks.length} 块 · 保存后写入文件并 git add`),
+        h(Btn, {
+          key: 'ours', label: '整文件采用我的', variant: 'ghost', disabled: Boolean(conflict.busy),
+          onClick: () => onTakeWhole('ours'),
+        }),
+        h(Btn, {
+          key: 'theirs', label: '整文件采用他们的', variant: 'ghost', disabled: Boolean(conflict.busy),
+          onClick: () => onTakeWhole('theirs'),
+        }),
+        h(Btn, {
+          key: 'copy', label: '复制结果', variant: 'ghost',
+          onClick: () => onCopy(preview),
+        }),
+        h(Btn, {
+          key: 'save', label: conflict.busy ? '保存中…' : '保存并暂存', variant: 'primary',
+          disabled: Boolean(conflict.busy) || decided !== blocks.length || blocks.length === 0,
+          onClick: onSave,
+        }),
+      ])
+
+      return h('div', { className: 'gr-cfOverlay' }, [
+        h('div', { className: 'gr-cfCard', key: 'card' }, [head, h('div', { className: 'gr-cfBody' }, bodyChildren), foot]),
+      ])
     }
 
     /**
@@ -1808,6 +2089,8 @@ window.__ModuleLoader__.load({
       shortPath,
       operationText,
       bulkOutcomeText,
+      renderConflictPanel,
+      conflictText,
     }
     return module.exports
   },

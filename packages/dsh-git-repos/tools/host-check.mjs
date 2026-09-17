@@ -452,6 +452,114 @@ try {
     String(missing.body?.value?.results?.[0]?.output ?? '').includes('no-such-branch')
     || String(missing.body?.value?.results?.[0]?.output ?? '').length > 0, JSON.stringify(missing.body?.value?.results?.[0]))
 
+  // ── conflict resolution: read the three stages, resolve block by block ─────
+  // The merge above was already abandoned, so this section starts from the
+  // committed tree and builds its own conflict: the same file changed on both
+  // sides, merged for real and left stopped.
+  fixtureGit(bob, ['reset', '-q', '--hard', 'HEAD'])
+  fixtureGit(bob, ['fetch', 'origin'])
+  await writeFile(join(alice, 'file.txt'), 'alice conflict side\n')
+  fixtureGit(alice, ['commit', '-am', 'alice conflict side'])
+  fixtureGit(alice, ['push'])
+  await writeFile(join(bob, 'file.txt'), 'bob conflict side\n')
+  fixtureGit(bob, ['commit', '-am', 'bob conflict side'])
+  fixtureGit(bob, ['fetch', 'origin'])
+  const seeded = await call('repo.merge', { root: bob, target: 'origin/main' })
+  check('the resolver fixture is actually conflicted', seeded.body?.value?.merged === 'conflict',
+    JSON.stringify(seeded.body?.value))
+
+  const detail = await call('repo.conflict', { root: bob, path: 'file.txt' })
+  check('repo.conflict answers for a conflicted file',
+    detail.status === 200 && Array.isArray(detail.body?.value?.blocks), JSON.stringify(detail.body).slice(0, 200))
+  const detailValue = detail.body?.value ?? {}
+  check('the conflict is parsed into one block', detailValue.blocks?.length === 1, JSON.stringify(detailValue.blocks))
+  check('both sides are captured',
+    detailValue.blocks?.[0]?.ours?.join('') === 'bob conflict side'
+    && detailValue.blocks?.[0]?.theirs?.join('') === 'alice conflict side',
+    JSON.stringify(detailValue.blocks?.[0]))
+  check('all three stages exist for a modify/modify conflict',
+    detailValue.stages?.base === true && detailValue.stages?.ours === true && detailValue.stages?.theirs === true,
+    JSON.stringify(detailValue.stages))
+  check('the working tree still has its markers', String(detailValue.text).includes('<<<<<<<'))
+
+  // Per-block choice: take theirs, which must rewrite the file and clear the
+  // conflict from the index.
+  const blockId = detailValue.blocks[0].id
+
+  // The guards run first, while the file is still conflicted: a save whose text
+  // puts a marker back must be refused, and so must a save with no decision at
+  // all. Writing a half-resolved file under a "resolved" label is how a conflict
+  // marker ends up committed.
+  const reintroduce = await call('repo.conflictSave', {
+    root: bob, path: 'file.txt', choices: { [blockId]: '<<<<<<< oops\n=======\n>>>>>>> oops' },
+  })
+  check('a resolution that still contains a marker is refused', reintroduce.status === 409,
+    `${reintroduce.status} ${JSON.stringify(reintroduce.body)}`)
+  const partial = await call('repo.conflictSave', { root: bob, path: 'file.txt', choices: {} })
+  check('a save with no decision is refused', partial.status === 409,
+    `${partial.status} ${JSON.stringify(partial.body)}`)
+  check('the refused saves left the conflict in place',
+    (await call('repo.status', { root: bob })).body?.value?.counts?.conflicted === 1,
+    JSON.stringify((await call('repo.status', { root: bob })).body?.value?.counts))
+
+  const saved = await call('repo.conflictSave', {
+    root: bob, path: 'file.txt', choices: { [blockId]: 'theirs' },
+  })
+  check('saving a resolution answers', saved.status === 200, JSON.stringify(saved.body).slice(0, 200))
+  const resolved = fixtureGit(bob, ['show', ':0:file.txt'])
+  check('the resolved file has no conflict markers', !resolved.includes('<<<<<<<'), JSON.stringify(resolved))
+  check('the chosen side is the content', resolved.trim() === 'alice conflict side', JSON.stringify(resolved))
+  const clearedAfter = await call('repo.operation', { root: bob })
+  check('the file is no longer conflicted',
+    (await call('repo.status', { root: bob })).body?.value?.counts?.conflicted === 0,
+    JSON.stringify(clearedAfter.body?.value))
+
+  // ── whole-file take, including the side that deleted the file ──────────────
+  // Its own repository, because this case needs a specific history — the file
+  // present at the merge base, deleted on one side and edited on the other — and
+  // reusing the fixture above kept inheriting whatever the last section left
+  // staged.
+  const dave = join(fixture, 'dave')
+  fixtureGit(fixture, ['init', '-q', '-b', 'main', dave])
+  fixtureGit(dave, ['config', 'user.email', 'check@example.com'])
+  fixtureGit(dave, ['config', 'user.name', 'Check'])
+  await writeFile(join(dave, 'base.txt'), 'base\n')
+  await writeFile(join(dave, 'shared-delete.txt'), 'shared base\n')
+  fixtureGit(dave, ['add', '-A'])
+  fixtureGit(dave, ['commit', '-m', 'base with the shared file'])
+  fixtureGit(dave, ['switch', '-qc', 'victim-side'])
+  fixtureGit(dave, ['rm', '-q', 'shared-delete.txt'])
+  fixtureGit(dave, ['commit', '-m', 'side deletes it'])
+  fixtureGit(dave, ['switch', '-q', 'main'])
+  await writeFile(join(dave, 'shared-delete.txt'), 'main edits it meanwhile\n')
+  fixtureGit(dave, ['commit', '-am', 'main edits the file'])
+
+  const deleteConflict = await call('repo.merge', { root: dave, target: 'victim-side' })
+  check('a delete/modify conflict is reported', deleteConflict.body?.value?.merged === 'conflict',
+    JSON.stringify(deleteConflict.body?.value))
+  const victimDetail = await call('repo.conflict', { root: dave, path: 'shared-delete.txt' })
+  check('a delete/modify conflict has no theirs stage',
+    victimDetail.body?.value?.stages?.theirs === false, JSON.stringify(victimDetail.body?.value?.stages))
+  check('the missing side is named', victimDetail.body?.value?.deletedOn === 'theirs',
+    JSON.stringify(victimDetail.body?.value?.deletedOn))
+  check('the surviving side is still shown as content',
+    String(victimDetail.body?.value?.text ?? '').includes('main edits it meanwhile'),
+    JSON.stringify(victimDetail.body?.value?.text))
+  const takeMissing = await call('repo.conflictTake', { root: dave, path: 'shared-delete.txt', side: 'theirs' })
+  check('taking a side that deleted the file is refused without the delete flag',
+    takeMissing.status === 409, `${takeMissing.status} ${JSON.stringify(takeMissing.body)}`)
+  const takeDelete = await call('repo.conflictTake', {
+    root: dave, path: 'shared-delete.txt', side: 'theirs', deleteMissing: true,
+  })
+  check('taking the deleting side removes the file', takeDelete.body?.value?.deleted === true,
+    JSON.stringify(takeDelete.body?.value))
+  check('the removed file is no longer conflicted',
+    (await call('repo.status', { root: dave })).body?.value?.counts?.conflicted === 0,
+    JSON.stringify((await call('repo.status', { root: dave })).body?.value?.counts))
+  const badSide = await call('repo.conflictTake', { root: dave, path: 'base.txt', side: 'nonsense' })
+  check('an unknown side is refused', badSide.status === 400, `${badSide.status} ${JSON.stringify(badSide.body)}`)
+  fixtureGit(dave, ['merge', '--abort'])
+
   // Argument guards the route must enforce before git sees anything.
   const badAction = await call('repo.bulk', { roots: [bob], action: 'rebase-everything' })
   check('an unknown bulk action is refused', badAction.status === 400, `${badAction.status} ${JSON.stringify(badAction.body)}`)

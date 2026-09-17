@@ -458,6 +458,70 @@ function buildMethods(ctx, config) {
       return { branch, merge, results }
     },
 
+    /**
+     * Everything needed to resolve one conflicted file.
+     *
+     * Read-only, and deliberately whole-file: the panel shows every block at once
+     * rather than paging, because a conflict is usually a handful of hunks and
+     * the decisions interact.
+     */
+    'repo.conflict': async (payload) => await gitEngine.conflictDetail(await repo(payload), payload.path),
+
+    /**
+     * Write one file's resolution and stage it.
+     *
+     * The markers are checked again here, after the choices are applied: refusing
+     * to stage a file that still contains `<<<<<<<` is the one guarantee that
+     * makes "resolved" mean something. `git add` is what actually clears the
+     * conflict from the index — writing the file alone leaves it unmerged.
+     */
+    'repo.conflictSave': async (payload) => {
+      const root = await repo(payload)
+      const detail = await gitEngine.conflictDetail(root, payload.path)
+      if (detail.binary) throw new HttpError(409, 'binary conflicts cannot be resolved by editing text')
+      const parsed = gitEngine.parseConflictBlocks(detail.text)
+      const text = gitEngine.keepTrailingNewline(
+        detail.text,
+        gitEngine.resolveConflictText(parsed, payload.choices ?? {}),
+      )
+      const marker = gitEngine.findConflictMarker(text)
+      if (marker !== undefined) throw new HttpError(409, `the resolved content still contains ${marker}`)
+      const written = await gitEngine.writeRepoFile(root, detail.path, text)
+      await gitEngine.stage(root, [detail.path])
+      return { path: detail.path, bytes: written.bytes, blocks: parsed.blocks.length }
+    },
+
+    /**
+     * Resolve a whole file by taking one side.
+     *
+     * `git restore --source=:2:` is the engine's way to say "take our version",
+     * and it fails cleanly for a side that does not exist — which is exactly the
+     * delete/modify case, where the honest answer is an error rather than an
+     * empty file.
+     */
+    'repo.conflictTake': async (payload) => {
+      const root = await repo(payload)
+      const side = payload.side
+      if (side !== 'ours' && side !== 'theirs') throw new HttpError(400, 'side must be ours or theirs')
+      const path = gitEngine.assertRepoPath(payload.path)
+      const stage = side === 'ours' ? 2 : 3
+      const content = await gitEngine.conflictStage(root, path, stage)
+      if (content === null) {
+        // Deleting the file is the correct resolution when the side being taken
+        // is the side that deleted it, and it is the only case where "take that
+        // side" means anything other than a write.
+        if (payload.deleteMissing === true) {
+          await gitEngine.removeRepoFile(root, path)
+          await gitEngine.stage(root, [path])
+          return { path, side, deleted: true }
+        }
+        throw new HttpError(409, `the ${side} side has no version of this file (it was deleted there)`)
+      }
+      const written = await gitEngine.writeRepoFile(root, path, content)
+      await gitEngine.stage(root, [path])
+      return { path, side, deleted: false, bytes: written.bytes }
+    },
+
     /** The merge/rebase/cherry-pick/revert state that owns this working tree, if any. */
     'repo.operation': async (payload) => ({
       operation: await gitEngine.operationState(await repo(payload)),
