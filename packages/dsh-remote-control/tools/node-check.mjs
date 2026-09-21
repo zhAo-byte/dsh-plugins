@@ -587,6 +587,33 @@ try {
   responder = () => ({ status: 200, body: { command: null } })
   check('poll maps "no work" to null', (await client.poll({ nodeId: 'n1' }, 1500)) === null)
 
+  // ── minting an invite code ───────────────────────────────────────────────
+  // The settings card's button goes through this call, so the two things worth
+  // pinning are the wire shape (the relay's agent route, with the node's token) and
+  // that a refusal reaches the caller with the relay's own words rather than as a
+  // bare status code.
+  {
+    responder = () => ({ status: 200, body: { code: 'K7M4-2QXP', nodeId: 'n1', expiresAt: 1, ttlMs: 900_000 } })
+    const invite = await client.createInvite('n1')
+    check('createInvite returns the code', invite?.code === 'K7M4-2QXP', JSON.stringify(invite))
+    const call1 = seen.at(-1)
+    check('createInvite posts to the relay invite route', call1.path === '/harness/api/agent/invite', call1.path)
+    check('createInvite presents the node token', call1.auth === 'Bearer node-secret')
+    check('createInvite names the machine the invite is for', call1.body?.nodeId === 'n1', JSON.stringify(call1.body))
+
+    responder = () => ({ status: 409, body: { error: 'node n1 has no guest door open' } })
+    const refused = await rejects('a refused invite is retryable-but-reported', () => client.createInvite('n1'), RelayUnreachableError)
+    check(
+      'the relay’s own explanation survives into the error',
+      String(refused?.message).includes('no guest door open'),
+      String(refused?.message)
+    )
+
+    responder = () => ({ status: 401, body: { error: 'unauthorized' } })
+    await rejects('a rejected token is an auth failure, not a retry', () => client.createInvite('n1'), RelayAuthError)
+  }
+
+
   responder = () => ({ status: 200, body: { ok: true } })
   await client.report({ nodeId: 'n1', status: 'busy', detail: 'x' })
   check('report posts the status', seen.at(-1).body?.status === 'busy')

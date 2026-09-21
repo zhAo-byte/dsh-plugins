@@ -98,8 +98,13 @@ function handleRelay(req, res) {
       relayState.holding = res
       return
     }
+    let answer = { ok: true }
+    if (req.url === '/relay/api/agent/hello') answer = { nodeId: body?.nodeId, pollHoldMs: relayState.holdMs, offlineAfterMs: 45_000 }
+    // The invite route has to answer with a code, or the card's button would have
+    // nothing to show and this check would be proving an empty object.
+    if (req.url === '/relay/api/agent/invite') answer = { code: 'LIVE-CHECK-CODE', nodeId: body?.nodeId, expiresAt: Date.now() + 900_000, ttlMs: 900_000 }
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify(req.url === '/relay/api/agent/hello' ? { nodeId: body?.nodeId, pollHoldMs: relayState.holdMs } : { ok: true }))
+    res.end(JSON.stringify(answer))
   })
 }
 
@@ -388,6 +393,41 @@ try {
     String(guestOutcome?.body?.result?.error)
   )
   check('the guest turn is reported as a guest turn', guestOutcome?.body?.result?.role === 'guest', JSON.stringify(guestOutcome?.body?.result?.role))
+
+  // ── the card's button, through the plugin's own route on the web server ──
+  // This is the one path the relay checks cannot see: the settings card asks the
+  // *node* (this route), the node asks the relay, and the relay mints. It exists so
+  // that inviting somebody is a button in the Harness rather than an ssh session,
+  // which makes it worth asserting end to end.
+  {
+    const urlLine = log.split('\n').find((line) => line.includes('dsh web: http')) ?? ''
+    const origin = urlLine.match(/https?:\/\/127\.0\.0\.1:\d+/)?.[0]
+    check('the backend announced its own web origin', typeof origin === 'string', urlLine.slice(0, 120))
+    if (origin !== undefined) {
+      const health = await fetch(`${origin}/dsh-remote-control/api/health`)
+      const healthBody = await health.json().catch(() => ({}))
+      check(
+        'the invite route is mounted on the harness web server',
+        health.status === 200 && healthBody?.value?.connected === true,
+        `HTTP ${String(health.status)} ${JSON.stringify(healthBody).slice(0, 160)}`
+      )
+      const invited = await fetch(`${origin}/dsh-remote-control/api/invite`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}'
+      })
+      const invitedBody = await invited.json().catch(() => ({}))
+      check(
+        'the card can get an invite code without leaving the harness',
+        invited.status === 200 && invitedBody?.value?.code === 'LIVE-CHECK-CODE',
+        `HTTP ${String(invited.status)} ${JSON.stringify(invitedBody).slice(0, 160)}`
+      )
+      const wrong = await fetch(`${origin}/dsh-remote-control/api/nonsense`, { method: 'POST', body: '{}' })
+      check('an unknown method on that route is a 404', wrong.status === 404, `HTTP ${String(wrong.status)}`)
+      const wrongVerb = await fetch(`${origin}/dsh-remote-control/api/invite`)
+      check('and the invite route only accepts POST', wrongVerb.status === 405, `HTTP ${String(wrongVerb.status)}`)
+    }
+  }
 
   // ── a broken guest config must not take the operator down ───────────────
   // `guestEnabled: true` with no directories is the mistake the settings card makes

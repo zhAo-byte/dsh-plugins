@@ -45,6 +45,11 @@ Environment=DSH_REMOTE_RELAY_PORT=8787
 #   DSH_REMOTE_GUEST_MAX_PROMPT         longest guest question, in characters (8000)
 #   DSH_REMOTE_GUEST_TOKEN_TTL_MS       idle lifetime of an identity (12h)
 #   DSH_REMOTE_GUEST_ENTERS_PER_HOUR    identities one address may mint per hour (20)
+#   DSH_REMOTE_GUEST_TOKEN_TTL_MS       how long a visitor identity stays valid (30 days)
+#   DSH_REMOTE_GUEST_INVITE             `off` = no invite code needed, the link is enough
+#   DSH_REMOTE_GUEST_INVITE_TTL_MS      how long an invite code lives (15 minutes)
+#   DSH_REMOTE_GUEST_CODE_ATTEMPTS      wrong codes per address per hour (10)
+#   DSH_REMOTE_GUEST_COOKIE             the cookie holding the visitor identity (dsh_rc_guest)
 
 ExecStart=/usr/bin/node /opt/dsh-remote-control/relay/server.js
 

@@ -390,6 +390,22 @@ try {
   }
 
   /**
+   * Mint an invite code the way the settings card does.
+   *
+   * The card asks the node (through the plugin's own route on the Harness), the
+   * node asks the relay with its agent token, and the relay is the one that decides
+   * whether a code is good. This drives the same relay call the node makes.
+   *
+   * @param {string} [nodeId] - the machine to invite to.
+   * @returns {Promise<{ code: string, expiresAt: number }>} the code.
+   */
+  const invite = async (nodeId = 'mac-1') => {
+    const issued = await asNode('/api/agent/invite', { nodeId })
+    check('the relay mints an invite code for the machine', typeof issued?.code === 'string', JSON.stringify(issued))
+    return issued
+  }
+
+  /**
    * Call the relay as the browser page.
    *
    * @param {string} path - path.
@@ -967,20 +983,57 @@ try {
 
   // ── the visitor's door, in a real browser ────────────────────────────────
   // The relay checks above prove the protocol; this proves the *page* a stranger
-  // actually lands on. Three things have to be true at once: nobody is asked for a
-  // password, the visitor is told which door they came in through, and the machine
-  // offers only the directories it opened to visitors.
+  // actually lands on. What has to hold: a code is asked for and nothing else, a
+  // wrong one is explained, a good one gets in, the browser then remembers the
+  // visitor (so the same page reloads straight in), and the machine offers only the
+  // directories it opened to visitors.
   {
     const guestPage = await devtools.createPage()
     await devtools.navigate(guestPage, `${relayUrl}/guest`)
-    const entered = await waitFor(
-      () => devtools.evaluate(guestPage, `document.body.classList.contains('booting') || document.getElementById('app').classList.contains('on')`),
+    const asked = await waitFor(
+      () => devtools.evaluate(guestPage, `getComputedStyle(document.getElementById('gate-guest')).display !== 'none'`),
       (value) => value === true,
       15_000
     )
-    check('the guest page enters without being asked for anything', entered)
+    check('a visitor with nothing stored is asked for an invite code', asked)
+    check(
+      'and is not asked for a password',
+      await devtools.evaluate(guestPage, `getComputedStyle(document.getElementById('gate-owner')).display === 'none'`)
+    )
+
+    // A wrong code has to say which kind of wrong it is: "invalid" and "used" send
+    // the visitor to different places, and only one of them is worth retyping.
+    await devtools.evaluate(guestPage, `(() => {
+      const input = document.getElementById('gate-code');
+      input.value = 'ZZZZ-ZZZZ';
+      document.getElementById('gate-submit').click();
+    })()`)
+    const wrongMessage = await waitFor(
+      () => devtools.evaluate(guestPage, `document.getElementById('gate-err').textContent`),
+      (text) => String(text).includes('不存在'),
+      10_000
+    )
+    check('a code that does not exist is explained, not swallowed', wrongMessage)
+
+    const issued = await invite('mac-1')
+    await devtools.evaluate(guestPage, `(() => {
+      const input = document.getElementById('gate-code');
+      input.value = ${JSON.stringify(issued.code)};
+      document.getElementById('gate-submit').click();
+    })()`)
+    const entered = await waitFor(
+      () => devtools.evaluate(guestPage, `document.getElementById('app').classList.contains('on')`),
+      (value) => value === true,
+      15_000
+    )
+    check('a valid invite code gets the visitor in', entered)
     const gateShown = await devtools.evaluate(guestPage, `getComputedStyle(document.getElementById('gate')).display !== 'none'`)
-    check('no login card is left on screen for a visitor', gateShown === false, 'the gate is still visible on /guest')
+    check('the gate is gone once inside', gateShown === false)
+    check(
+      'the identity is kept out of the page’s own storage',
+      (await devtools.evaluate(guestPage, `localStorage.getItem('dsh-remote-control-guest-token')`)) === null,
+      'the guest identity is still readable by any script in the page'
+    )
     const badge = await devtools.evaluate(guestPage, `(() => {
       const el = document.getElementById('mode-badge');
       return JSON.stringify({ hidden: el.hidden, text: el.textContent });
@@ -1029,10 +1082,9 @@ try {
     const guestImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, guestPage)
     await writeFile(guestShot, Buffer.from(guestImage.data, 'base64'))
 
-    // A visitor arrives with a stored identity that the relay no longer knows —
-    // it expired, or the relay restarted — which is the ordinary case rather than
-    // an error case. The page must quietly mint a new one instead of showing the
-    // visitor a credential failure for something they never had.
+    // A visitor arrives with a stored token the relay no longer knows — it expired,
+    // or the relay forgot it on restart. The page must not report that as a failure
+    // of anything the visitor did: it asks for a code, with the field ready.
     const stalePage = await devtools.createPage()
     await devtools.send(
       'Page.addScriptToEvaluateOnNewDocument',
@@ -1041,13 +1093,33 @@ try {
     )
     await devtools.navigate(stalePage, `${relayUrl}/guest`)
     const recovered = await waitFor(
-      () => devtools.evaluate(stalePage, `document.getElementById('app').classList.contains('on')`),
+      () => devtools.evaluate(stalePage, `getComputedStyle(document.getElementById('gate-guest')).display !== 'none'`),
       (value) => value === true,
       15_000
     )
-    check('a stale visitor identity is replaced rather than reported as an error', recovered)
-    const recoveryError = await devtools.evaluate(stalePage, `document.getElementById('gate-err').textContent`)
-    check('and no error is left on screen for it', String(recoveryError) === '', String(recoveryError))
+    check('a visitor whose stored identity is gone is asked for a code', recovered)
+    check(
+      'and is not shown a credential error',
+      String(await devtools.evaluate(stalePage, `document.getElementById('gate-err').textContent`)) === '',
+      String(await devtools.evaluate(stalePage, `document.getElementById('gate-err').textContent`))
+    )
+
+    // The visitor who already got in comes back without a code: that is the whole
+    // promise of "15 minutes, once, and then the browser remembers you".
+    await devtools.navigate(guestPage, `${relayUrl}/guest`)
+    const straightIn = await waitFor(
+      () => devtools.evaluate(guestPage, `document.getElementById('app').classList.contains('on')`),
+      (value) => value === true,
+      15_000
+    )
+    check('a visitor who was already let in is not asked again', straightIn)
+    check(
+      'and the entry card is not on screen at all',
+      // The gate, not the card inside it: a hidden ancestor leaves the child's own
+      // computed display untouched, so asking about the child would pass even with
+      // the card staring the visitor in the face.
+      await devtools.evaluate(guestPage, `getComputedStyle(document.getElementById('gate')).display === 'none'`)
+    )
 
     // The operator's own page is where the door is discoverable, so the link has
     // to be there and has to point at the mount point this page was served from.

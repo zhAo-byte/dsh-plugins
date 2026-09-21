@@ -98,7 +98,11 @@ const child = spawnGuarded(process.execPath, [SERVER], {
     // Small enough to exercise the mint limit inside one check run, and explicit
     // so the assertion does not depend on the shipped default staying 20.
     DSH_REMOTE_GUEST_ENTERS_PER_HOUR: '3',
-    DSH_REMOTE_GUEST_MAX_PROMPT: '200'
+    DSH_REMOTE_GUEST_MAX_PROMPT: '200',
+    // Short enough to watch a code expire inside one check run, and explicit so the
+    // assertion does not depend on the shipped fifteen minutes.
+    DSH_REMOTE_GUEST_INVITE_TTL_MS: '1500',
+    DSH_REMOTE_GUEST_CODE_ATTEMPTS: '3'
   },
   stdio: ['ignore', 'pipe', 'pipe']
 })
@@ -513,20 +517,114 @@ try {
     }
   })
 
+  /**
+   * Mint an invite code exactly the way the settings card does.
+   *
+   * @param {string} [nodeId] - the machine the invite is for.
+   * @param {object} [options] - `{ token }` to prove the route needs the agent token.
+   * @returns {Promise<{ status: number, body: any }>} the relay's answer.
+   */
+  const mintInvite = (nodeId = 'mac-1', options = {}) =>
+    call('/api/agent/invite', { token: options.token ?? AGENT_TOKEN, body: { nodeId } })
+
+  /**
+   * Trade a fresh code for a visitor identity.
+   *
+   * @param {object} [options] - `{ nodeId }`.
+   * @returns {Promise<{ status: number, body: any, headers: Headers, code: string }>} the entry.
+   */
+  const enterGuest = async (options = {}) => {
+    const invite = await mintInvite(options.nodeId ?? 'mac-1')
+    const entry = await call('/api/guest/enter', { method: 'POST', body: { code: invite.body?.code } })
+    return { ...entry, code: invite.body?.code }
+  }
+
   const guestPage = await call('/guest')
   check('the guest page is served without a token', guestPage.status === 200 && String(guestPage.body).includes('DSH Remote Control'))
 
   const guestStateNoToken = await call('/api/guest/state')
   check('a guest route still needs an identity', guestStateNoToken.status === 401, `got ${String(guestStateNoToken.status)}`)
 
-  const enter = await call('/api/guest/enter', { method: 'POST', body: {} })
-  check('a visitor mints an identity', enter.status === 200 && typeof enter.body?.token === 'string', JSON.stringify(enter.body))
-  const guestToken = enter.body.token
-  check('the identity names the visitor', typeof enter.body?.guestId === 'string' && enter.body.guestId.startsWith('guest-'), String(enter.body?.guestId))
-  const second = await call('/api/guest/enter', { method: 'POST', body: {} })
+  // ── the invite code is the door's only key ───────────────────────────────
+  // Everything below needs a code, which is the point: the relay mints them for a
+  // machine, they last fifteen minutes, and each one works exactly once.
+  const noCode = await call('/api/guest/enter', { method: 'POST', body: {} })
+  check(
+    'a visitor with no code is asked for one',
+    noCode.status === 401 && noCode.body?.error === 'invite_required',
+    JSON.stringify(noCode.body)
+  )
+  check(
+    'minting a code needs the machine token',
+    (await mintInvite('mac-1', { token: CONTROL_TOKEN })).status === 401
+  )
+  check('minting a code for an unknown machine is refused', (await mintInvite('nope')).status === 404)
+  {
+    // A code for a machine with no door would buy an empty page, so the relay says
+    // so at mint time rather than letting somebody hand out a useless code.
+    await call('/api/agent/hello', { token: AGENT_TOKEN, body: { nodeId: 'mac-3', name: 'Shut Box', workspaces: [{ name: 'x', path: '/Users/dev/x' }] } })
+    const shut = await mintInvite('mac-3')
+    check('minting a code for a machine with no door is refused', shut.status === 409, JSON.stringify(shut.body))
+  }
+
+  const entered = await enterGuest()
+  check('a valid code mints an identity', entered.status === 200 && typeof entered.body?.token === 'string', JSON.stringify(entered.body))
+  const guestToken = entered.body.token
+  check('the identity names the visitor', typeof entered.body?.guestId === 'string' && entered.body.guestId.startsWith('guest-'), String(entered.body?.guestId))
+  check('the identity is bound to the invited machine', entered.body?.nodeId === 'mac-1', JSON.stringify(entered.body?.nodeId))
+
+  // The cookie is the whole reason a visitor never types a code twice.
+  const cookie = String(entered.headers?.get?.('set-cookie') ?? '')
+  check('the identity is handed over as a cookie, not to the page', cookie.includes('dsh_rc_guest='), cookie)
+  check('the cookie cannot be read by a script', cookie.includes('HttpOnly'), cookie)
+  check('the cookie is not sent on cross-site posts', cookie.includes('SameSite=Lax'), cookie)
+  check('the cookie outlives the tab', /Max-Age=\d{4,}/.test(cookie), cookie)
+  check('the cookie is scoped to the relay mount, not the whole domain', cookie.includes('Path=/'), cookie)
+
+  const wrongCode = await call('/api/guest/enter', { method: 'POST', body: { code: 'ZZZZ-ZZZZ' } })
+  check(
+    'a code that does not exist is refused, and says why',
+    wrongCode.status === 403 && wrongCode.body?.error === 'invite_invalid',
+    JSON.stringify(wrongCode.body)
+  )
+  const reused = await call('/api/guest/enter', { method: 'POST', body: { code: entered.code } })
+  check(
+    'a code that was used is refused, and says which failure it was',
+    reused.status === 409 && reused.body?.error === 'invite_used',
+    JSON.stringify(reused.body)
+  )
+  {
+    const expiring = await mintInvite('mac-1')
+    await sleep(2000)
+    const late = await call('/api/guest/enter', { method: 'POST', body: { code: expiring.body?.code } })
+    check('a code past its 15 minutes is refused as expired', late.status === 410 && late.body?.error === 'invite_expired', JSON.stringify(late.body))
+  }
+  {
+    // The cookie alone has to be enough: that is what "the browser remembers you"
+    // means, and the page sends no token at all in that case.
+    const cookieOnly = await call('/api/guest/state', { headers: { cookie: `dsh_rc_guest=${guestToken}` } })
+    check('the cookie alone authenticates a visitor', cookieOnly.status === 200, `got ${String(cookieOnly.status)}`)
+    check('and the browser is handed no Authorization work to do', cookieOnly.body?.guest?.mode === 'guest', JSON.stringify(cookieOnly.body?.guest))
+    check(
+      'the snapshot says the cookie was the credential',
+      cookieOnly.body?.identity === 'cookie',
+      JSON.stringify(cookieOnly.body?.identity)
+    )
+    // The other half of the same fact: a visitor still using a stored token is told
+    // so, which is what stops the page deleting a token before the cookie works.
+    const tokenOnly = await call('/api/guest/state', { token: guestToken })
+    check('a visitor authenticating by token is told that instead', tokenOnly.body?.identity === 'token', JSON.stringify(tokenOnly.body?.identity))
+    check(
+      'and that response hands them the cookie',
+      String(tokenOnly.headers?.get?.('set-cookie') ?? '').includes('dsh_rc_guest='),
+      String(tokenOnly.headers?.get?.('set-cookie') ?? '')
+    )
+  }
+
+  const second = await enterGuest()
   const otherToken = second.body.token
   const otherGuestId = second.body.guestId
-  check('a second visitor gets a different identity', otherToken !== guestToken && otherGuestId !== enter.body.guestId)
+  check('a second visitor gets a different identity', otherToken !== guestToken && otherGuestId !== entered.body.guestId)
 
   // The two trust domains stay separate in both directions.
   check(
@@ -548,7 +646,11 @@ try {
 
   const guestSnap = await call('/api/guest/state', { token: guestToken })
   const guestNodes = guestSnap.body?.nodes ?? []
-  check('a visitor sees only machines with a door', guestNodes.length === 1 && guestNodes[0]?.nodeId === 'mac-1', JSON.stringify(guestNodes.map((node) => node.nodeId)))
+  check(
+    'a visitor sees only the machine their code was for',
+    guestNodes.length === 1 && guestNodes[0]?.nodeId === 'mac-1',
+    JSON.stringify(guestNodes.map((node) => node.nodeId))
+  )
   check(
     'a visitor sees only the directories it was offered',
     guestNodes[0]?.workspaces?.length === 1 && guestNodes[0]?.workspaces?.[0]?.path === GUEST_WORKSPACE,
@@ -564,7 +666,11 @@ try {
   )
   check('a visitor is not told the platform or version', guestNodes[0]?.platform === undefined && guestNodes[0]?.version === undefined)
   check('the visitor sees the door marked as such', guestNodes[0]?.guest === true)
-  check('the operator still sees both machines', (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.length === 2)
+  check(
+    'the operator still sees every machine',
+    (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.length === 3,
+    JSON.stringify((await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.map((node) => node.nodeId))
+  )
   check(
     'the operator snapshot reports the door state',
     (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.find((node) => node.nodeId === 'mac-1')?.guest?.enabled === true
@@ -629,7 +735,7 @@ try {
   )
   check(
     'the node is given the visitor the turn came from',
-    guestDelivered.body?.command?.principal === enter.body.guestId,
+    guestDelivered.body?.command?.principal === entered.body.guestId,
     JSON.stringify(guestDelivered.body?.command?.principal)
   )
   check(
@@ -824,8 +930,13 @@ try {
   // The mint route is the one with no credential, so it is the one worth metering.
   const rateLimited = []
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    const invite = await mintInvite('mac-1')
     rateLimited.push(
-      await call('/api/guest/enter', { method: 'POST', body: {}, headers: { 'x-forwarded-for': '203.0.113.9' } })
+      await call('/api/guest/enter', {
+        method: 'POST',
+        body: { code: invite.body?.code },
+        headers: { 'x-forwarded-for': '203.0.113.9' }
+      })
     )
   }
   check(
@@ -834,6 +945,46 @@ try {
     JSON.stringify(rateLimited.map((response) => response.status))
   )
   check('the earlier mints from that address were accepted', rateLimited[0]?.status === 200)
+
+  // ── guessing codes, and the way out ──────────────────────────────────────
+  {
+    // Three wrong codes an hour per address (the check sets the budget), counted
+    // separately from successful entries so a legitimate visitor is not punished
+    // for somebody else's guessing.
+    const guesses = []
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      guesses.push(
+        await call('/api/guest/enter', {
+          method: 'POST',
+          body: { code: `AAAA-AAA${String(attempt)}` },
+          headers: { 'x-forwarded-for': '198.51.100.7' }
+        })
+      )
+    }
+    check(
+      'wrong codes are refused',
+      guesses[0]?.status === 403,
+      JSON.stringify(guesses.map((response) => response.status))
+    )
+    check(
+      'and guessing is turned off rather than left unlimited',
+      guesses.at(-1)?.status === 429,
+      JSON.stringify(guesses.map((response) => response.status))
+    )
+  }
+  {
+    const leaving = await call('/api/guest/leave', { method: 'POST', body: {}, token: otherToken })
+    check('a visitor can drop their identity', leaving.status === 200 && leaving.body?.forgot === true, JSON.stringify(leaving.body))
+    check(
+      'and the browser is told to forget the cookie',
+      /Max-Age=0/.test(String(leaving.headers?.get?.('set-cookie') ?? '')),
+      String(leaving.headers?.get?.('set-cookie') ?? '')
+    )
+    check(
+      'the dropped identity stops working',
+      (await call('/api/guest/state', { token: otherToken })).status === 401
+    )
+  }
 
   // ── the relay's kill switch ──────────────────────────────────────────────
   // Closing the door has to work without any node's cooperation, so it is checked

@@ -76,6 +76,14 @@ window.__ModuleLoader__.load({
   border: 1px solid var(--dsw-alias-border, rgba(127,127,127,.30));
 }
 .rc-check { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.rc-invite { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; border-top: 1px solid var(--dsw-alias-border, rgba(127,127,127,.30)); }
+.rc-invite-title { font-size: 12px; font-weight: 600; }
+.rc-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 20px; font-weight: 700;
+  letter-spacing: .14em; padding: 8px 12px; border-radius: 8px; text-align: center;
+  background: var(--dsw-alias-bg-input, rgba(127,127,127,.10));
+  border: 1px solid var(--dsw-alias-border, rgba(127,127,127,.30));
+}
 `
     /** Inject the stylesheet once, keyed so a reload does not stack copies. */
     function installStyles() {
@@ -170,6 +178,151 @@ window.__ModuleLoader__.load({
           return entries.length === 0 ? { kind: 'clear' } : { kind: 'set', value: entries }
         }
       }
+    }
+
+    /** Where the invite route lives: the host half of this same package. */
+    const INVITE_ROUTE = '/dsh-remote-control/api/invite'
+
+    /**
+     * The invite-code block: ask for a code, show it, count it down.
+     *
+     * Invite codes are minted by the relay because the relay is the only party a
+     * visitor talks to, so it has to be the one that can accept or refuse one. The
+     * card's job is to make that a button: without it, inviting somebody would mean
+     * `ssh`-ing to a server, which is not a thing the person holding the door
+     * should have to do.
+     *
+     * Three details are deliberate:
+     *
+     * - **A code is useless while the door is shut**, so the button says that
+     *   instead of letting the relay refuse after a round trip.
+     * - **The countdown is the point of the code.** "15 minutes" is a promise the
+     *   card has to keep showing, or the operator sends a code that quietly died.
+     * - **The full guest URL is shown with it**, because the code is useless without
+     *   somewhere to type it, and the person being invited should not have to be
+     *   told two things.
+     *
+     * @param {object} props - `{ relayUrl, doorOpen, writable }`.
+     * @returns {object} the React element.
+     */
+    function InviteSection(props) {
+      const [invite, setInvite] = react.useState(undefined)
+      const [error, setError] = react.useState('')
+      const [busy, setBusy] = react.useState(false)
+      const [now, setNow] = react.useState(Date.now())
+
+      // One ticker for the countdown, and only while a code is live: a timer that
+      // runs for the lifetime of the settings page is a timer nobody asked for.
+      react.useEffect(() => {
+        if (invite === undefined) return undefined
+        const timer = setInterval(() => setNow(Date.now()), 1000)
+        return () => clearInterval(timer)
+      }, [invite])
+
+      const guestUrl = (() => {
+        const relay = typeof props.relayUrl === 'string' ? props.relayUrl.trim().replace(/\/+$/, '') : ''
+        return relay === '' ? '/guest（先填上面的中转台地址）' : `${relay}/guest`
+      })()
+
+      const remaining = invite === undefined ? 0 : Math.max(0, Math.floor((invite.expiresAt - now) / 1000))
+      const expired = invite !== undefined && remaining === 0
+      const clock = `${String(Math.floor(remaining / 60)).padStart(2, '0')}:${String(remaining % 60).padStart(2, '0')}`
+
+      const generate = async () => {
+        setBusy(true)
+        setError('')
+        try {
+          const response = await fetch(INVITE_ROUTE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: '{}'
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || payload?.ok !== true) {
+            throw new Error(payload?.error?.message ?? `HTTP ${response.status}`)
+          }
+          setInvite({ code: payload.value.code, expiresAt: payload.value.expiresAt })
+          setNow(Date.now())
+        } catch (problem) {
+          setInvite(undefined)
+          setError(problem?.message ?? String(problem))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const copy = async (text, button) => {
+        let ok = true
+        try {
+          if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text)
+          else ok = false
+        } catch { ok = false }
+        button.textContent = ok ? '已复制' : '复制失败'
+        setTimeout(() => { button.textContent = '复制邀请码' }, 1500)
+      }
+
+      const children = [
+        react.createElement('div', { key: 'title', className: 'rc-invite-title' }, '游客邀请码'),
+        react.createElement(
+          'div',
+          { key: 'lede', className: 'rc-note' },
+          '给要邀请的人一串码：他打开下面的链接，输入这串码，就能用游客身份进来。' +
+            '每串码 15 分钟内有效、只能用一次；用过之后那台浏览器会被记住，不用再输。'
+        ),
+        react.createElement('div', { key: 'url', className: 'rc-hint' }, `游客链接：${guestUrl}`)
+      ]
+
+      if (invite !== undefined) {
+        children.push(react.createElement('div', { key: 'code', className: 'rc-code' }, invite.code))
+        children.push(
+          react.createElement(
+            'div',
+            { key: 'state', className: expired ? 'rc-warn' : 'rc-ok' },
+            expired ? '这串码已经过期了，重新生成一个。' : `还有 ${clock} 失效 · 只能用一次`
+          )
+        )
+      }
+      if (error !== '') children.push(react.createElement('div', { key: 'err', className: 'rc-err' }, error))
+
+      const actions = [
+        react.createElement(
+          'button',
+          {
+            key: 'gen',
+            type: 'button',
+            className: 'rc-btn',
+            disabled: busy || !props.doorOpen || props.writable === false,
+            onClick: () => void generate()
+          },
+          busy ? '生成中…' : invite === undefined ? '生成邀请码' : '再生成一个'
+        )
+      ]
+      if (invite !== undefined) {
+        actions.push(
+          react.createElement(
+            'button',
+            {
+              key: 'copy',
+              type: 'button',
+              className: 'rc-btn rc-ghost',
+              onClick: (event) => void copy(invite.code, event.currentTarget)
+            },
+            '复制邀请码'
+          )
+        )
+      }
+      children.push(react.createElement('div', { key: 'row', className: 'rc-row' }, actions))
+      if (!props.doorOpen) {
+        children.push(
+          react.createElement(
+            'div',
+            { key: 'shut', className: 'rc-hint' },
+            '上面的「开放游客入口」还没打开，所以现在生成的码没有地方可用。'
+          )
+        )
+      }
+
+      return react.createElement('div', { className: 'rc-invite' }, children)
     }
 
     /**
@@ -481,6 +634,13 @@ window.__ModuleLoader__.load({
           ])
         )
       }
+
+      children.push(react.createElement(InviteSection, {
+        key: 'invite',
+        relayUrl: value.relayUrl,
+        doorOpen: value.guestEnabled === true,
+        writable
+      }))
 
       children.push(
         react.createElement('div', { key: 'actions', className: 'rc-row' }, [

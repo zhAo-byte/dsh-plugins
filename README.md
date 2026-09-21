@@ -101,7 +101,8 @@ ln -sfn "$PWD/packages/dsh-codex-bridge/client" ~/.dsh/profiles/web/node_modules
 - **relay 中转台**：零依赖，一个进程，只做在线表 + 信箱 + 问答页。
   不跑 DSH、不跑模型、不存模型凭据。
 
-**游客模式**（可选，默认关）：给每台机器开一扇**不需要密码**的公开门 `/guest`——
+**游客模式**（可选，默认关）：给每台机器开一扇 `/guest` 门，进门用**邀请码**（在 Harness 的设置卡片里
+一键生成，15 分钟有效、只能用一次，用过的浏览器之后就免输）——
 `guestEnabled: true` 之后，拿到链接的人就能用。范围被两道互不信任的检查限死
 （只能访问这台机器明确开出来的那几个工作台），身份是**一人一个匿名 id**
 （看不到操作者、也看不到别的游客的对话），而且默认跑的是随插件一起安装的
@@ -146,9 +147,9 @@ bundle 通道已经带了这一行，重复 id 会让 profile 启动失败。
 
 | 入口 | 需要什么 | 内容 |
 | --- | --- | --- |
-| `npm test` | **只要 Node** | relay 113 · node 137 · 自带预设安装 35 · 提问接管 12 |
-| `npm run test:harness` | 磁盘上有真 Harness | runner 115 · live 43 · 设置 11 · 配置卡片 12 |
-| `npm run test:ui` | 一个 Chromium | 问答页 + 游客页 64 |
+| `npm test` | **只要 Node** | relay 136 · node 144 · 自带预设安装 35 · 提问接管 12 |
+| `npm run test:harness` | 磁盘上有真 Harness | runner 115 · live 48 · 设置 11 · 配置卡片 12 |
+| `npm run test:ui` | 一个 Chromium | 问答页 + 游客页 71 |
 
 ```sh
 cd packages/dsh-remote-control

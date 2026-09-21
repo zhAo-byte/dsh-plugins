@@ -229,6 +229,7 @@ workspaces: registry
 | 启用这台机器的远程控制 | 开关，立即生效 |
 | 开放游客入口 | 开关，立即生效；打开后中转台 `/guest` 谁都能进（见 五·五） |
 | 随插件安装自带的 agent 预设 | 默认开；关掉就得自己装 `reader` |
+| 游客邀请码 | 一个按钮：点一下生成一串 15 分钟、一次有效的码，卡片上直接显示码、倒计时、游客链接，并可一键复制 |
 
 保存后节点会用新配置重新连上中转台，**不用再重启**。改完刷新
 <https://icyu.online/harness/> 就能看到这台机器。开了游客门的机器，操作者页面左下角会
@@ -349,6 +350,7 @@ DSH 的会话**只有一个写者**：一个打开的写句柄会用内核 flock
 | POST | `/api/agent/report` | 上报状态（`busy`/`idle`）与命令结果 |
 | POST | `/api/agent/ask` | 长轮询挂住一个提问；页面回答后返回 `{ questionId, answers }`，超时返回 `{ questionId, settled: true }` |
 | POST | `/api/agent/question/settled` | 告诉中转台这个问题不用再等了，撤掉页面上的卡 |
+| POST | `/api/agent/invite` | 为**这台机器**生成一串邀请码（15 分钟、一次有效），返回 `{ code, expiresAt, ttlMs }` |
 
 ### 页面侧（`Authorization: Bearer <DSH_REMOTE_CONTROL_TOKEN>`）
 
@@ -368,7 +370,8 @@ DSH 的会话**只有一个写者**：一个打开的写句柄会用内核 flock
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/guest` | 游客页（同一个 `index.html`，按自身路径判断走哪扇门）；不需要任何凭据 |
-| POST | `/api/guest/enter` | **唯一不需要凭据的路由**：领一个匿名身份 `{ token, guestId, expiresInMs }` |
+| POST | `/api/guest/enter` | **唯一不需要凭据的路由**：用邀请码换身份 `{ code }`，身份以 `HttpOnly` cookie 下发；`invite_required` / `invite_invalid` / `invite_used` / `invite_expired` / `invite_stale` 分别对应"还没输码 / 码不存在 / 码已用 / 码过期 / 码对应的门关了" |
+| POST | `/api/guest/leave` | 忘掉这个游客身份并回一个 `Max-Age=0` 的 cookie |
 | GET | `/api/guest/state[?nodeId=]` | 只含开了游客门的机器；工作台只有游客列表；对话记录只有**自己**的 |
 | GET | `/api/guest/events?token=` | 同上，SSE；按订阅者过滤，操作者的提问不会进这条流 |
 | POST | `/api/guest/command` | 提交 `{ nodeId, workspace, prompt, sessionId? }`：用游客工作台、游客预设、游客权限 |
@@ -494,6 +497,52 @@ DSH 的会话**只有一个写者**：一个打开的写句柄会用内核 flock
 | `DSH_REMOTE_GUEST_MAX_PROMPT` | 8000 | 一条游客提问的长度上限（节点侧同样有一道） |
 | `DSH_REMOTE_GUEST_TOKEN_TTL_MS` | 12h | 匿名身份闲置多久作废；身份作废时页面会**自己再领一个**，不是弹错误 |
 | `DSH_REMOTE_GUEST_ENTERS_PER_HOUR` | 20 | 同一个来源地址每小时最多领几个身份（尽力而为：地址取自 `X-Forwarded-For`） |
+
+### 五·六、邀请码：门上的锁
+
+免密码公开链接适合演示，但不适合"我只想让他一个人进来试一下"。所以门上加了邀请码：
+
+**怎么用（三步，都不用碰服务器）**
+
+1. 在**设置 → 远程控制**卡片里点「生成邀请码」——码是在 Harness 里生成的；
+2. 把码和卡片上显示的游客链接一起发出去；
+3. 对方打开链接、输入码、进去。**之后他那台浏览器就不用再输了。**
+
+**码的规矩**
+
+| 规矩 | 实现 |
+| --- | --- |
+| 15 分钟有效 | 生成时带上过期时间，到期后按**已过期**拒（不是"不存在"——这两个提示会把人引向不同的动作） |
+| 只能用一次 | 用掉的码在过期前一直留着并标记"已用"，所以第二个人得到的回答是「已经被用过了」 |
+| 一串码只对一台机器有效 | 码绑定生成它的那台机器，拿到码的人只会看到那一台的门，不会看到你其他机器的门 |
+| 猜不出来 | 8 位、去掉 `0/O/1/I/L` 的 32 字符表（约 1.1e12 种），并且**每个来源地址每小时只能猜 10 次** |
+| 门关了就没意义 | 生成时机器必须开着游客门，否则中转台直接拒绝，不会发出一串用不上的码 |
+
+**已经进来的访客不受影响。** 邀请码只决定"能不能拿到身份"；身份一旦拿到，就是他那台浏览器上的通行证。
+所以加这个功能不会把已经进来的人关在门外——包括这次改动之前就已经进来的：他们浏览器里存的是旧格式的
+令牌，页面照旧带着它请求，中转台会**顺手把它换成 cookie**，他什么都不会感觉到。
+
+**关联开关**：`DSH_REMOTE_GUEST_INVITE=off`（中转台环境变量）把邀请码整个关掉，回到"有链接就能进"。
+
+### 五·七、浏览器里到底存了什么
+
+访客的身份放在 **cookie** 里，不是 `localStorage`，而且只有一项：
+
+| 名字 | 值 | 属性 | 为什么 |
+| --- | --- | --- | --- |
+| `dsh_rc_guest` | 一串不透明随机身份（服务端换成 `guestId`） | `HttpOnly` | 页面里被注入的脚本**读不到**它——这正是从 `localStorage` 挪过来的理由 |
+| | | `Secure`（走 HTTPS 时） | 明文 HTTP 上不会被发出去；本机/自检走 HTTP 时自动不加，否则 cookie 会被浏览器直接丢掉 |
+| | | `SameSite=Lax` | 别的网站没法拿你的身份去发指令（跨站 POST 不带 cookie） |
+| | | `Path=/harness` | 只发给这个挂载点，同域名的其他站点收不到 |
+| | | `Max-Age=30 天` | 关掉浏览器再回来还算数；这也是"不用再输邀请码"的全部实现 |
+
+**为什么不放 `localStorage`**：那玩意儿任何脚本都能读，一个 XSS 就等于把身份送人。cookie 还有一个顺带的好处：
+事件流（SSE）是靠 cookie 自动带的，所以**身份不必出现在 URL 里**——URL 会进访问日志。旧格式的令牌还在的
+时候，页面会继续带它，等中转台明确回报"这次是 cookie 认的"（快照里的 `identity: 'cookie'`）之后才把它删掉，
+免得浏览器禁用 cookie 的人被清空到什么都没有。
+
+**点「退出」会怎样**：页面调 `/api/guest/leave`，中转台**删掉这个身份**并回一个 `Max-Age=0` 的 cookie。
+在共享电脑上这一步是必须的，否则下一个用这台机器的人会继承上一个人的游客身份。
 
 **配错了会怎样：门关上，节点照常跑。** `guestEnabled: true` 但 `guestWorkspaces` 是空的（或者
 写了一个操作者自己都没开的工作台）是最容易犯的错——两个键在设置卡片里挨着，只有一个长得像开关。
@@ -834,15 +883,15 @@ href）。手写渲染器最典型的 bug 正好落在这两条之间：它可�
 当前实况：
 
 ```
-relay-check     113/113
-node-check      137/137
+relay-check     136/136
+node-check      144/144
 presets-check    35/35
 questions-check  12/12
 runner-check    115/115
-live-check       43/43
+live-check       48/48
 settings-check   11/11
 card-check       12/12
-ui-check         64/64
+ui-check         71/71
 ```
 
 提问转发这一层在三个检查里各自被钉住一角，因为它们能看见的东西不同：
@@ -923,8 +972,12 @@ remote-control:
 | `DSH_REMOTE_GUEST_MAX_OUTSTANDING` | `2` | 一个游客在同一台机器上最多压几条 |
 | `DSH_REMOTE_GUEST_MAX_QUEUE` | `4` | 一台机器上游客命令的队列深度 |
 | `DSH_REMOTE_GUEST_MAX_PROMPT` | `8000` | 一条游客提问的长度上限 |
-| `DSH_REMOTE_GUEST_TOKEN_TTL_MS` | `43200000` | 匿名身份闲置作废时长（12 小时） |
-| `DSH_REMOTE_GUEST_ENTERS_PER_HOUR` | `20` | 每个来源地址每小时的领号上限 |
+| `DSH_REMOTE_GUEST_TOKEN_TTL_MS` | `2592000000` | 匿名身份闲置作废时长（30 天；邀请码只能领一次身份，所以身份要活得比一次访问长） |
+| `DSH_REMOTE_GUEST_ENTERS_PER_HOUR` | `20` | 每个来源地址每小时的成功领号上限 |
+| `DSH_REMOTE_GUEST_INVITE` | 未设 = 必须邀请码 | `off` = 回到"有链接就能进" |
+| `DSH_REMOTE_GUEST_INVITE_TTL_MS` | `900000` | 邀请码有效期（15 分钟） |
+| `DSH_REMOTE_GUEST_CODE_ATTEMPTS` | `10` | 每个来源地址每小时最多猜几次错码 |
+| `DSH_REMOTE_GUEST_COOKIE` | `dsh_rc_guest` | 承载游客身份的 cookie 名 |
 
 ---
 

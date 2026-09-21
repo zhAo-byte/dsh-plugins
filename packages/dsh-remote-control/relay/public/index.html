@@ -154,6 +154,11 @@
   .err { margin-top: 10px; font-size: 12.5px; color: var(--err); }
   .err:empty { display: none; }
   .gate-actions { margin-top: 16px; }
+  /* The code is read off a chat message and retyped, so it gets a monospace face
+     and generous letter spacing: an invitation that fails because of a font is a
+     failed invitation for the wrong reason. */
+  .input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; text-transform: uppercase; }
+  .foot-note { margin: 10px 0 0; font-size: 11.5px; line-height: 1.6; color: var(--fg-faint); }
   .gate-actions .btn { width: 100%; padding: 11px 15px; }
   .gate-foot {
     margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line);
@@ -669,9 +674,16 @@
       round trip would flash.
     -->
     <div id="gate-guest" hidden>
-      <h1>游客模式</h1>
-      <p>这是一个<b>无需密码</b>的公开入口。你会用一台机器上的<b>只读分析 agent</b>，
-         只能访问它明确开放的工作台，改不了任何文件。</p>
+      <h1>请输入邀请码</h1>
+      <p>这是一个<b>不需要账号</b>的入口：一串邀请码换一次进入，进去之后用一台机器上的
+         <b>只读分析 agent</b>，只能访问它明确开放的工作台，改不了任何文件。</p>
+      <div class="field">
+        <label for="gate-code">邀请码</label>
+        <input id="gate-code" class="input mono" type="text" placeholder="XXXX-XXXX"
+               autocomplete="one-time-code" spellcheck="false" autocapitalize="characters" maxlength="12" autofocus>
+      </div>
+      <p class="foot-note">邀请码由机器的主人在 DSH 里生成，<b>15 分钟内有效、只能用一次</b>。
+         进入之后这台浏览器会记住你，下次不用再输。</p>
     </div>
     <div class="err" id="gate-err" role="alert"></div>
     <div class="gate-actions">
@@ -900,7 +912,14 @@ function endpoint(path) {
  * @returns {Promise<object>} parsed JSON body.
  */
 async function api(path, options = {}) {
-  const init = { method: options.method ?? 'GET', headers: { authorization: `Bearer ${state.token}` } }
+  const init = { method: options.method ?? 'GET', headers: {} }
+  // A visitor's identity lives in an `HttpOnly` cookie, which the browser attaches
+  // by itself — so on `/guest` there is usually no token here at all, and adding an
+  // empty `Bearer ` header would only be a lie the relay has to reject. The stored
+  // token is still sent when one exists, because that is how the visitors who were
+  // already inside before cookies existed keep their identity (and how the relay
+  // adopts it into a cookie).
+  if (state.token !== '') init.headers.authorization = `Bearer ${state.token}`
   if (options.body !== undefined) {
     init.method = 'POST'
     init.headers['content-type'] = 'application/json'
@@ -908,10 +927,16 @@ async function api(path, options = {}) {
   }
   const res = await fetch(endpoint(path), init)
   const text = await res.text()
-  if (res.status === 401) throw new Error('令牌无效或已过期')
   let payload = {}
   try { payload = text === '' ? {} : JSON.parse(text) } catch { payload = { error: text } }
-  if (!res.ok) throw new Error(payload.error ?? `HTTP ${res.status}`)
+  if (!res.ok) {
+    const error = new Error(payload.error ?? `HTTP ${res.status}`)
+    // The relay's machine-readable reason (`invite_required`, `invite_used`, …) is
+    // what lets the page ask for a code instead of reporting a failure.
+    error.reason = payload.error
+    error.status = res.status
+    throw error
+  }
   return payload
 }
 
@@ -2604,7 +2629,12 @@ function connect() {
   if (state.source) state.source.close()
   if (typeof EventSource === 'undefined') { startPolling(); return }
   setLive('busy', '连接中…')
-  const source = new EventSource(`${endpoint('/events')}?token=${encodeURIComponent(state.token)}`)
+  // The query token exists only for the bearer path (`EventSource` cannot set
+  // headers). A cookie-authenticated visitor needs no token here — and that is the
+  // better half of the cookie trade: an identity in a URL ends up in access logs.
+  const source = new EventSource(
+    state.token === '' ? endpoint('/events') : `${endpoint('/events')}?token=${encodeURIComponent(state.token)}`
+  )
   state.source = source
   source.onopen = () => setLive('online', '实时同步')
   source.onmessage = (event) => {
@@ -2625,6 +2655,7 @@ function connect() {
 async function refresh() {
   try {
     const snap = await api('/state' + (state.active === null ? '' : `?nodeId=${encodeURIComponent(activeTarget()?.nodeId ?? '')}`))
+    noteIdentityStorage(snap)
     applyRoster(snap.nodes)
     if (state.active !== null && Array.isArray(snap.transcript)) {
       const target = activeTarget()
@@ -2639,7 +2670,7 @@ async function refresh() {
     // restart, and neither is anything the visitor did. Silently going stale is the
     // worst answer for a page whose whole job is showing live state, so the page
     // mints a new identity once rather than sitting there frozen.
-    if (GUEST && isAuthFailure(error)) void reenterAsGuest()
+    if (GUEST && isAuthFailure(error)) void recoverGuestIdentity()
   }
 }
 
@@ -2657,28 +2688,48 @@ function isAuthFailure(error) {
   return String(error?.message ?? '').includes('令牌')
 }
 
-/** Guards the recovery so a refused mint is not retried on every poll tick. */
+/** Guards the recovery so a lost identity is handled once per page load. */
 let guestRecoveryAttempted = false
 
 /**
- * Mint a fresh visitor identity and reconnect, once.
+ * Handle a visitor identity the relay no longer knows, once.
  *
- * If the relay refuses (the door was closed while the page was open, or the address
- * is over its mint limit), the visitor is told why instead of the page going quiet
- * — and the attempt is not repeated, because that refusal is an answer rather than
- * a transient failure.
+ * With cookies this is rare — the identity only goes away when it has been idle for
+ * a month or cleared with the browser's site data — and when it happens the honest
+ * answer is a code, not a silent re-mint: without an identity there is nothing left
+ * on this browser that says "this person was invited". The attempt happens once, so
+ * a relay that keeps refusing cannot turn the poll loop into a retry storm.
  *
  * @returns {Promise<void>} resolves once recovery settled.
  */
-async function reenterAsGuest() {
+async function recoverGuestIdentity() {
   if (guestRecoveryAttempted) return
   guestRecoveryAttempted = true
+  state.token = ''
+  try { localStorage.removeItem(TOKEN_KEY) } catch {}
   try {
-    await enterAsGuest(null)
-    guestRecoveryAttempted = false
+    if ((await enterAsGuest()) === 'needs-code') showGate('你的游客身份已失效（太久没用或清理过浏览器数据），请输入一个新的邀请码。')
   } catch (error) {
-    toast(`游客身份需要重新领取：${error.message}`, 'err')
+    showGate(`连不上中转台：${error.message}`)
   }
+}
+
+/**
+ * Retire a visitor's token from page storage once the cookie has taken over.
+ *
+ * `localStorage` is readable by any script on the page; an `HttpOnly` cookie is
+ * not. Visitors who were already inside before the cookie existed keep their
+ * identity in the former, so the relay adopts it into the latter on their next call
+ * and reports `identity: 'cookie'` — which is the signal, and the only one, that it
+ * is now safe to delete the old copy. Waiting for that signal is what keeps a
+ * browser with cookies disabled from being left with nothing at all.
+ *
+ * @param {object} snap - one state snapshot.
+ */
+function noteIdentityStorage(snap) {
+  if (!GUEST || snap?.identity !== 'cookie') return
+  try { localStorage.removeItem(TOKEN_KEY) } catch {}
+  state.token = ''
 }
 
 /** Polling fallback for browsers without EventSource. */
@@ -2815,7 +2866,14 @@ function newChat() {
 async function enter(token) {
   state.token = token
   const snap = await api('/state')
-  try { localStorage.setItem(TOKEN_KEY, token) } catch {}
+  noteIdentityStorage(snap)
+  // Only a real token is worth storing. A visitor who authenticated with a cookie
+  // has none, and writing an empty string would leave a key behind that looks like
+  // a credential and is not one.
+  try {
+    if (token === '') localStorage.removeItem(TOKEN_KEY)
+    else localStorage.setItem(TOKEN_KEY, token)
+  } catch {}
   document.body.classList.remove('booting')
   $('gate').style.display = 'none'
   $('app').classList.add('on')
@@ -2824,49 +2882,69 @@ async function enter(token) {
 }
 
 /**
- * Mint a fresh anonymous identity and enter.
+ * The messages the relay's machine-readable refusals turn into.
  *
- * The one request the page makes without a credential, which is why it is POSTed
- * to a single route the relay meters. The body is sent explicitly rather than
- * omitted: some proxies turn a bodyless POST into a GET.
- *
- * @returns {Promise<void>} resolves once the page is in the app or throws.
+ * `invite_required` is not an error at all — it is the ordinary state of a browser
+ * that has never been invited — so it is handled by showing the code field, and
+ * only the rest reach the visitor as text.
  */
-async function enterGuest() {
-  const res = await fetch(API_BASE + '/api/guest/enter', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: '{}'
-  })
-  const text = await res.text()
-  let payload = {}
-  try { payload = text === '' ? {} : JSON.parse(text) } catch { payload = { error: text } }
-  if (!res.ok) throw new Error(payload.error ?? `HTTP ${res.status}`)
-  await enter(payload.token)
+const INVITE_MESSAGES = {
+  invite_invalid: '这个邀请码不存在。检查一下有没有输错。',
+  invite_used: '这个邀请码已经被用过了。每个邀请码只能用一次，请让主人再生成一个。',
+  invite_expired: '这个邀请码过期了（15 分钟有效）。请让主人再生成一个。',
+  invite_stale: '这个邀请码对应的机器现在已经不开放游客入口了。',
+  invite_required: ''
 }
 
 /**
- * Enter as a visitor, replacing a stored identity that no longer works.
+ * Trade an invite code for a visitor identity.
  *
- * A guest token expires and the relay forgets it on restart, and neither is
- * anything the visitor did — so the page mints a new one instead of showing a
- * login error for credentials they never had. A *refusal* from the entry route
- * (the door was closed, or this address is over its limit) is not retried: that
- * is a real answer, and it belongs on the screen.
+ * The relay answers with `Set-Cookie`, so the identity is never handled by this
+ * page: it goes straight into an `HttpOnly` cookie the browser will attach to every
+ * later call. The code itself is sent with the dashes stripped-tolerant form the
+ * relay normalizes anyway.
  *
- * @param {string|null} token - a stored guest token, if any.
- * @returns {Promise<void>} resolves once the page is in the app.
+ * @param {string} code - what the visitor typed.
+ * @returns {Promise<void>} resolves once the page is in the app or throws.
  */
-async function enterAsGuest(token) {
-  if (token !== null && token !== '') {
-    try {
-      await enter(token)
-      return
-    } catch {
+async function submitInviteCode(code) {
+  const payload = await api('/enter', { body: { code } })
+  state.token = ''
+  try { localStorage.removeItem(TOKEN_KEY) } catch {}
+  await enter('')
+  return payload
+}
+
+/**
+ * Get into the app as a visitor, with whatever the browser already has.
+ *
+ * Three ways in, tried in order, and the order is the point:
+ *
+ * 1. **The cookie.** The normal case from the second visit on: nothing to type.
+ * 2. **A stored token.** How everybody who was already inside before cookies
+ *    existed keeps their place — the relay adopts it into a cookie on this very
+ *    request, so they migrate without being asked for a code they never had.
+ * 3. **An invite code.** Only when neither exists, which is exactly what an invite
+ *    code is for.
+ *
+ * @returns {Promise<'entered'|'needs-code'>} whether the page is in, or must ask.
+ */
+async function enterAsGuest() {
+  const stored = (() => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } })()
+  state.token = stored ?? ''
+  try {
+    await enter(state.token)
+    return 'entered'
+  } catch (error) {
+    if (error?.reason === 'invite_required' || error?.status === 401) {
+      // A stored token the relay has forgotten is not the visitor's problem: drop
+      // it and let the code path take over.
+      state.token = ''
       try { localStorage.removeItem(TOKEN_KEY) } catch {}
+      return 'needs-code'
     }
+    throw error
   }
-  await enterGuest()
 }
 
 /**
@@ -2891,8 +2969,8 @@ function configureGate() {
   if (!GUEST) return
   setHidden($('gate-owner'), true)
   setHidden($('gate-guest'), false)
-  $('gate-submit').textContent = '以游客身份进入'
-  $('gate-foot').textContent = '无需密码。你只会看到本机开放的游客工作台，看不到任何其他会话。'
+  $('gate-submit').textContent = '进入'
+  $('gate-foot').textContent = '进入后这台浏览器会记住你，之后不用再输邀请码；只会看到本机开放的游客工作台，看不到任何其他会话。'
   // The token input is hidden, so autofocus on it would scroll a hidden field.
   $('gate-token').removeAttribute('autofocus')
   document.title = 'DSH Remote Control · 游客'
@@ -2905,14 +2983,35 @@ function configureGate() {
   $('prompt').placeholder = '向当前游客工作台提问…'
 }
 
+/**
+ * Put the entry card on screen, optionally saying why.
+ *
+ * @param {string} [message] - a line for the visitor; empty for none.
+ */
+function showGate(message = '') {
+  document.body.classList.remove('booting')
+  $('gate').style.display = 'grid'
+  $('gate-err').textContent = message
+  if (GUEST) $('gate-code').focus()
+}
+
 $('gate-form').addEventListener('submit', async (event) => {
   event.preventDefault()
   $('gate-err').textContent = ''
   if (GUEST) {
+    const input = $('gate-code')
+    const code = input.value.trim()
+    if (code === '') return
+    input.classList.remove('bad')
     try {
-      await enterAsGuest((() => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } })())
+      await submitInviteCode(code)
+      input.value = ''
     } catch (error) {
-      $('gate-err').textContent = error.message
+      // The relay's reason decides the wording, so "used" and "expired" stop
+      // looking like the same failure to somebody holding a piece of paper.
+      $('gate-err').textContent = INVITE_MESSAGES[error?.reason] ?? error.message
+      input.classList.add('bad')
+      input.select()
     }
     return
   }
@@ -2933,6 +3032,15 @@ $('send').addEventListener('click', send)
 $('broadcast').addEventListener('click', broadcast)
 $('newchat').addEventListener('click', newChat)
 $('signout').addEventListener('click', () => {
+  // A visitor's identity is a cookie, so forgetting it has to happen on the relay:
+  // deleting something in the page would leave the browser still carrying it.
+  if (GUEST) {
+    if (state.source) state.source.close()
+    void api('/leave', { body: {} })
+      .catch(() => {})
+      .then(() => location.reload())
+    return
+  }
   try { localStorage.removeItem(TOKEN_KEY) } catch {}
   if (state.source) state.source.close()
   location.reload()
@@ -2976,16 +3084,16 @@ renderAll()
 
 const savedToken = (() => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } })()
 if (GUEST) {
-  // A visitor never types anything: the identity is minted on arrival. The gate
-  // is held back until that settles so the card does not flash for the common
-  // case, and it is left on screen with the relay's own message when the door
-  // refuses (closed, or this address is over its limit).
+  // A visitor types nothing unless they have to: the cookie (or a token stored
+  // before cookies existed) is tried first, and the gate is held back while that
+  // settles so the common case never flashes a form. It appears only when the
+  // browser really has nothing to show — which is exactly when a code is needed.
   document.body.classList.add('booting')
-  enterAsGuest(savedToken).catch((error) => {
-    document.body.classList.remove('booting')
-    $('gate').style.display = 'grid'
-    $('gate-err').textContent = error.message
-  })
+  enterAsGuest()
+    .then((outcome) => {
+      if (outcome === 'needs-code') showGate()
+    })
+    .catch((error) => showGate(`连不上中转台：${error.message}`))
 } else if (savedToken) {
   // Hold the gate back until the stored token has been checked, so a returning
   // visitor never sees the login card at all.

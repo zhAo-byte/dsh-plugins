@@ -221,6 +221,21 @@ export async function apply(ctx, config) {
   }
 
   /**
+   * The route module, loaded the same lazy way.
+   *
+   * Static imports here would drag `./route.js` — and through it `./client.js` — into
+   * the entry point's import graph for no benefit, and the entry point is the one
+   * module that has to import cleanly on a machine with no Harness at all.
+   */
+  let routeModule
+  try {
+    routeModule = await import('./route.js')
+  } catch (error) {
+    routeModule = undefined
+    report(logger, 'warn', `the invite route could not be loaded (${error?.message ?? error})`)
+  }
+
+  /**
    * Where the live configuration comes from.
    *
    * Starts at the composed YAML entry, and is replaced by the settings scope once
@@ -336,6 +351,9 @@ export async function apply(ctx, config) {
    * @param {{ resolved: object, workspaces: Array<object>, identity: object }} prepared - output of `prepare`.
    * @param {object} scoped - context carrying the Harness services the runner needs.
    */
+  /** The running node's relay client and identity, for the invite route. */
+  let currentNode
+
   const start = (prepared, scoped) => {
     const { resolved, identity, guest } = prepared
     // Reported before anything else: the door stayed shut because of a mistake, and
@@ -377,6 +395,7 @@ export async function apply(ctx, config) {
       ...(workspaceProvider === undefined ? {} : { workspaceProvider })
     })
     liveQuestions.add(questions)
+    currentNode = { client, nodeId: identity.nodeId }
 
     /**
      * What the relay may know about the guest door.
@@ -537,6 +556,7 @@ export async function apply(ctx, config) {
       // make a disabled node claim every question of every session it ever
       // created — and it creates none.
       liveQuestions.delete(questions)
+      currentNode = undefined
       stopCurrent = async () => {}
       return
     }
@@ -561,12 +581,26 @@ export async function apply(ctx, config) {
       // teardown must fall through to the local GUI, not wait for a page whose
       // node is gone.
       liveQuestions.delete(questions)
+      // And retire the invite route's handle, so a card used while the node is
+      // down says so instead of asking a connection that is gone.
+      if (currentNode !== undefined && currentNode.client === client) currentNode = undefined
       await runner.dispose()
     }
   }
 
   /** The services the runner needs; declared here so the plugin still loads without them. */
   let scopedContext
+
+  /**
+   * The node the settings card's route should talk to, or undefined while none runs.
+   *
+   * A getter rather than a captured value because a settings edit replaces the node:
+   * a handler holding the old client would keep minting invites through a connection
+   * that was already torn down, and would report failures nobody could explain.
+   *
+   * @type {() => ({ client: object, nodeId: string }|undefined)}
+   */
+  const liveNode = () => (scopedContext === undefined || currentNode === undefined ? undefined : currentNode)
 
   /**
    * Apply one configuration object, replacing whatever is running.
@@ -642,6 +676,27 @@ export async function apply(ctx, config) {
       }
     })
   }
+
+  // ── the invite route, installed independently of the node ────────────────
+  //
+  // The card needs a way to ask for an invite code, and the plugin needs a socket
+  // to answer on. Registered from its own injection, waiting only on `webServer`,
+  // so a composition without that service keeps the plugin (and its reason for not
+  // offering the button) instead of silently losing the row.
+  if (routeModule !== undefined) ctx.inject(['webServer'], (webCtx) => {
+    try {
+      const { ROUTE_PATH, createInviteHandler } = routeModule
+      const handler = createInviteHandler(liveNode)
+      webCtx.effect(() => {
+        const dispose = webCtx.webServer.register({ kind: 'prefix', path: ROUTE_PATH, handler })
+        return () => {
+          if (typeof dispose === 'function') dispose()
+        }
+      }, 'dsh-remote-control: invite route')
+    } catch (error) {
+      report(logger, 'warn', `the invite route is not available (${error?.message ?? error}); generate codes from the relay instead`)
+    }
+  })
 
   // ── the question answerer, installed before any node starts ───────────────
   //

@@ -20,7 +20,7 @@
  */
 
 import { createServer } from 'node:http'
-import { timingSafeEqual, randomUUID } from 'node:crypto'
+import { randomBytes, timingSafeEqual, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
@@ -98,8 +98,16 @@ const config = {
   guestEnabled: process.env.DSH_REMOTE_GUEST !== 'off',
   /** Longest guest question the relay forwards. The node caps it again. */
   guestMaxPromptChars: numberFromEnv('DSH_REMOTE_GUEST_MAX_PROMPT', 8_000),
-  /** How long an unused anonymous guest identity stays valid. */
-  guestTokenTtlMs: numberFromEnv('DSH_REMOTE_GUEST_TOKEN_TTL_MS', 12 * 60 * 60 * 1000),
+  /**
+   * How long an unused guest identity stays valid.
+   *
+   * Thirty days rather than hours, and the invite code is the reason: a code is
+   * single-use, so if the identity it bought expired overnight the visitor would
+   * have to be handed a new one to come back — which defeats the point of
+   * inviting somebody. The identity *is* the "already invited" pass; it is worth
+   * exactly as much as a code, and it lives in an `HttpOnly` cookie.
+   */
+  guestTokenTtlMs: numberFromEnv('DSH_REMOTE_GUEST_TOKEN_TTL_MS', 30 * 24 * 60 * 60 * 1000),
   /** Cap on live guest identities, so an open door cannot grow without bound. */
   guestMaxVisitors: numberFromEnv('DSH_REMOTE_GUEST_MAX_VISITORS', 64),
   /** Commands one visitor may have waiting on one node, in flight or queued. */
@@ -107,7 +115,26 @@ const config = {
   /** Guest entries a single node's queue may hold, across all visitors. */
   guestMaxQueue: numberFromEnv('DSH_REMOTE_GUEST_MAX_QUEUE', 4),
   /** How many guest identities one address may mint per hour. */
-  guestEntersPerHour: numberFromEnv('DSH_REMOTE_GUEST_ENTERS_PER_HOUR', 20)
+  guestEntersPerHour: numberFromEnv('DSH_REMOTE_GUEST_ENTERS_PER_HOUR', 20),
+  /**
+   * Whether a visitor must present an invite code to get in.
+   *
+   * On by default. `off` restores the earlier "anyone with the link" door, which
+   * is still the right shape for a public demo — which is why it stays a switch
+   * rather than being deleted.
+   */
+  guestInviteRequired: process.env.DSH_REMOTE_GUEST_INVITE !== 'off',
+  /** How long a freshly minted invite code is good for. */
+  inviteTtlMs: numberFromEnv('DSH_REMOTE_GUEST_INVITE_TTL_MS', 15 * 60 * 1000),
+  /** Wrong codes one address may try per hour before it is turned away. */
+  guestCodeAttemptsPerHour: numberFromEnv('DSH_REMOTE_GUEST_CODE_ATTEMPTS', 10),
+  /**
+   * The cookie a visitor's identity rides in.
+   *
+   * Prefixed and scoped to the mount point, so it is not sent to anything else
+   * that happens to live on the same domain.
+   */
+  guestCookieName: process.env.DSH_REMOTE_GUEST_COOKIE ?? 'dsh_rc_guest'
 }
 
 // ── state ──────────────────────────────────────────────────────────────────
@@ -179,9 +206,36 @@ const inFlight = new Map()
  * by the relay, never by the node, and it is what the node records on the session
  * it creates.
  *
- * @type {Map<string, {guestId: string, createdAt: number, lastSeenAt: number}>}
+ * @type {Map<string, {guestId: string, nodeId: string, createdAt: number, lastSeenAt: number}>}
  */
 const guestTokens = new Map()
+/**
+ * Invite codes a machine has minted: `code -> record`.
+ *
+ * The code is the *only* thing a visitor needs, so it is deliberately dull: eight
+ * characters from an alphabet with no `0/O` or `1/I`, valid for fifteen minutes,
+ * good for exactly one entry. Consumed codes are kept until they expire rather
+ * than deleted, because "已被使用" and "无效" are different answers and the person
+ * retyping a code deserves to know which one they got.
+ *
+ * The record is bound to the node that minted it, so an invite is an invitation to
+ * *one machine's* door rather than a key to every door this relay knows about.
+ * Nothing here survives a relay restart, which is the same trade the roster and
+ * the transcripts already make: a restart means every outstanding code is dead,
+ * and the operator mints a new one.
+ *
+ * @type {Map<string, { code: string, nodeId: string, createdAt: number, expiresAt: number, consumedAt: number, consumedBy: string }>}
+ */
+const invites = new Map()
+/**
+ * Wrong invite codes tried per client address, in the last hour.
+ *
+ * Guessing is hopeless against eight characters of this alphabet, but a counter
+ * costs nothing and turns a script from "unlimited attempts" into "ten an hour".
+ *
+ * @type {Map<string, number[]>}
+ */
+const codeAttempts = new Map()
 /**
  * Sessions a visitor created: `guestId -> sessionId -> nodeId`.
  *
@@ -265,18 +319,147 @@ function presentedToken(req, url) {
 }
 
 /**
+ * Read one cookie value out of a request.
+ *
+ * Hand-rolled because the relay has no dependencies and the parsing rules that
+ * matter here are two lines: split on `;`, take the first `=`. A browser sends
+ * exactly one cookie of this name; anything more exotic is not this relay's
+ * problem, and a malformed header must yield "no cookie" rather than an error.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request.
+ * @param {string} name - cookie name.
+ * @returns {string|undefined} the value, when present and non-empty.
+ */
+function cookieValue(req, name) {
+  const header = req.headers.cookie
+  if (typeof header !== 'string' || header === '') return undefined
+  for (const part of header.split(';')) {
+    const cut = part.indexOf('=')
+    if (cut < 0) continue
+    if (part.slice(0, cut).trim() !== name) continue
+    const value = part.slice(cut + 1).trim()
+    return value === '' ? undefined : value
+  }
+  return undefined
+}
+
+/**
+ * The visitor identity a request carries, from a cookie or a bearer token.
+ *
+ * Two forms on purpose. The cookie is what a browser uses: `HttpOnly`, so a
+ * script injected into the page cannot read the identity out of it, and sent
+ * automatically, so the page needs no token handling at all (and the SSE stream
+ * needs no token in its URL, where it would land in access logs). The bearer form
+ * stays supported for the checks, for scripts, and for the visitors who already
+ * hold a token in `localStorage` from before the cookie existed — those people
+ * must not be asked for a code they never had.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request.
+ * @param {URL} url - parsed request URL.
+ * @returns {{ viewer: { role: string, guestId: string, nodeId: string }|undefined, token: string|undefined, fromCookie: boolean }} the resolution.
+ */
+function guestCredential(req, url) {
+  const cookie = cookieValue(req, config.guestCookieName)
+  if (cookie !== undefined) {
+    const viewer = guestViewer(cookie)
+    // `viaCookie` rides the viewer so a snapshot can say which credential was used.
+    // The page uses that to drop a token stored before cookies existed — but only
+    // once the cookie has demonstrably worked, so a browser that refuses cookies is
+    // never left with nothing.
+    if (viewer !== undefined) return { viewer: { ...viewer, viaCookie: true }, token: cookie, fromCookie: true }
+  }
+  const bearer = presentedToken(req, url)
+  if (bearer === undefined) return { viewer: undefined, token: undefined, fromCookie: false }
+  return { viewer: guestViewer(bearer), token: bearer, fromCookie: false }
+}
+
+/**
+ * The cookie path for this request: the relay's *public* mount point.
+ *
+ * The relay only ever sees `/` (the reverse proxy strips `/harness`), so the path
+ * has to come from `X-Forwarded-Prefix`, the same header the page's `<base>` is
+ * built from. Scoping the cookie to it keeps the visitor's identity from being
+ * attached to requests for anything else on that domain.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request.
+ * @returns {string} a cookie path.
+ */
+function cookiePath(req) {
+  const prefix = normalizePrefix(req.headers['x-forwarded-prefix'])
+  return prefix === '' ? '/' : prefix
+}
+
+/**
+ * A `Set-Cookie` header that hands a stored token to the browser, when there is one.
+ *
+ * Any guest request authenticated by a bearer token triggers this, which is the
+ * whole migration: before the cookie existed the page kept its identity in
+ * `localStorage`, and everybody already inside holds one of those. On their next
+ * call the relay adopts it into a cookie, and the page can stop keeping the
+ * identity in a place a script can read (`lib/…/index.html` clears the old key once
+ * the cookie works). Nobody is asked for an invite code they never had.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request, for path and TLS.
+ * @param {{ token?: string, fromCookie: boolean }} credential - how the caller authenticated.
+ * @returns {object|undefined} extra response headers, or undefined when there is nothing to adopt.
+ */
+function adoptCookieHeaders(req, credential) {
+  if (typeof credential.token !== 'string' || credential.token === '' || credential.fromCookie) return undefined
+  return {
+    'set-cookie': setCookieHeader({
+      name: config.guestCookieName,
+      value: credential.token,
+      path: cookiePath(req),
+      maxAgeSeconds: Math.floor(config.guestTokenTtlMs / 1000),
+      secure: isSecureRequest(req)
+    })
+  }
+}
+
+/**
+ * Build one `Set-Cookie` header value.
+ *
+ * `Secure` is added only when the request looks like HTTPS, because a `Secure`
+ * cookie is *dropped* on plain HTTP — and the self-checks (and anyone running the
+ * relay locally) talk HTTP to loopback. `SameSite=Lax` is what keeps a hostile
+ * page from making the visitor's browser fire guest commands: it withholds the
+ * cookie from cross-site POSTs, which is exactly the shape of a forged command.
+ *
+ * @param {object} options - `{ name, value, path, maxAgeSeconds, secure }`.
+ * @returns {string} the header value.
+ */
+function setCookieHeader({ name, value, path, maxAgeSeconds, secure }) {
+  const parts = [`${name}=${value}`, `Path=${path}`, `Max-Age=${String(maxAgeSeconds)}`, 'HttpOnly', 'SameSite=Lax']
+  if (secure) parts.push('Secure')
+  return parts.join('; ')
+}
+
+/**
+ * Whether the client reached the relay over HTTPS, as far as it can tell.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request.
+ * @returns {boolean} true when a TLS-terminating proxy said so.
+ */
+function isSecureRequest(req) {
+  const proto = req.headers['x-forwarded-proto']
+  if (typeof proto === 'string' && proto.split(',')[0].trim().toLowerCase() === 'https') return true
+  return req.socket?.encrypted === true
+}
+
+/**
  * Write one JSON response.
  *
  * @param {import('node:http').ServerResponse} res - response.
  * @param {number} status - HTTP status.
  * @param {unknown} body - JSON-serializable body.
  */
-function sendJson(res, status, body) {
+function sendJson(res, status, body, headers = undefined) {
   const payload = JSON.stringify(body)
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
-    'cache-control': 'no-store'
+    'cache-control': 'no-store',
+    ...(headers ?? {})
   })
   res.end(payload)
 }
@@ -395,7 +578,14 @@ function guestDetail(node, viewer) {
 function visibleNodes(viewer) {
   const all = [...nodes.values()]
   if (viewer.role !== 'guest') return all
-  return all.filter((node) => node.guest.enabled && node.guest.workspaces.length > 0)
+  return all.filter((node) => {
+    if (!(node.guest.enabled && node.guest.workspaces.length > 0)) return false
+    // An identity bought with an invite code is scoped to the machine that minted
+    // it. Nobody needs to see a roster of other people's doors, and a code that
+    // opened several machines would be a bigger grant than the operator handed out.
+    if (typeof viewer.nodeId === 'string' && viewer.nodeId !== '') return node.nodeId === viewer.nodeId
+    return true
+  })
 }
 
 /**
@@ -868,7 +1058,10 @@ function stateFor(url, viewer) {
     transcript,
     pollHoldMs: config.pollHoldMs,
     offlineAfterMs: config.offlineAfterMs,
-    guest: { enabled: config.guestEnabled, mode: viewer.role === 'guest' ? 'guest' : 'owner' }
+    guest: { enabled: config.guestEnabled, mode: viewer.role === 'guest' ? 'guest' : 'owner' },
+    // Which credential this request used, for the visitor's own migration path. The
+    // owner has exactly one way in, so this only ever varies for a guest.
+    identity: viewer.role === 'guest' ? (viewer.viaCookie === true ? 'cookie' : 'token') : 'owner'
   }
 }
 
@@ -1065,7 +1258,31 @@ function clientAddress(req) {
   return req.socket.remoteAddress ?? 'unknown'
 }
 
-/** Drop guest identities that have not been used within their lifetime. */
+/** Prune per-address counters down to the last hour, dropping the empty ones. */
+function sweepCounters(store) {
+  const now = Date.now()
+  for (const [address, stamps] of store) {
+    const recent = stamps.filter((at) => now - at < 3_600_000)
+    if (recent.length === 0) store.delete(address)
+    else store.set(address, recent)
+  }
+}
+
+/**
+ * Note one event against a client address and report the count in the last hour.
+ *
+ * @param {Map<string, number[]>} store - the counter store.
+ * @param {string} address - bucket key.
+ * @returns {number} events recorded for that address in the last hour, including this one.
+ */
+function countAgainst(store, address) {
+  const stamps = store.get(address) ?? []
+  stamps.push(Date.now())
+  store.set(address, stamps)
+  return stamps.filter((at) => Date.now() - at < 3_600_000).length
+}
+
+/** Drop guest identities, invite codes, and rate-limit counters that have expired. */
 function sweepGuestTokens() {
   const now = Date.now()
   for (const [token, record] of guestTokens) {
@@ -1074,11 +1291,15 @@ function sweepGuestTokens() {
       guestSessions.delete(record.guestId)
     }
   }
-  for (const [address, stamps] of guestEnters) {
-    const recent = stamps.filter((at) => now - at < 3_600_000)
-    if (recent.length === 0) guestEnters.delete(address)
-    else guestEnters.set(address, recent)
+  for (const [code, record] of invites) {
+    // Expired codes are kept a little longer than they live, so that somebody who
+    // pastes one two minutes late is told it expired rather than that it never
+    // existed. "Invalid" sends them hunting for a typo; "expired" tells them to ask
+    // for another one, which is the only thing that helps.
+    if (now > record.expiresAt + INVITE_MEMORY_MS) invites.delete(code)
   }
+  sweepCounters(guestEnters)
+  sweepCounters(codeAttempts)
 }
 
 /**
@@ -1097,23 +1318,144 @@ function guestViewer(token) {
     return undefined
   }
   record.lastSeenAt = Date.now()
-  return { role: 'guest', guestId: record.guestId }
+  // `nodeId` is the machine the invite was for, or '' for an identity minted
+  // while the door required no code. It is what narrows the visitor's roster.
+  return { role: 'guest', guestId: record.guestId, nodeId: record.nodeId ?? '' }
 }
 
 /**
- * `POST /api/guest/enter` — mint an anonymous visitor identity.
+ * Normalize a code somebody typed.
  *
- * This is the only route with no credential at all, which is the point of the
- * feature and the reason it is also the only route that is metered: without a
- * limit, a script could mint identities without bound, and every identity is a
- * conversation this machine may be asked to run.
+ * People retype codes from a chat message, so the dashes the card displays and any
+ * stray case are noise, not information. Uppercasing and dropping separators means
+ * `k7m4-2qxp` and `K7M42QXP` are the same code.
  *
- * @param {import('node:http').IncomingMessage} req - the request, for its address.
- * @returns {object} `{ token, guestId, expiresInMs }`.
+ * @param {unknown} value - whatever arrived in the body.
+ * @returns {string} the canonical form, or '' when there was nothing usable.
  */
-function guestEnter(req) {
+function normalizeInviteCode(value) {
+  if (typeof value !== 'string') return ''
+  return value.toUpperCase().replace(/[^A-Z0-9]/g, '')
+}
+
+/**
+ * The alphabet invite codes are drawn from.
+ *
+ * `0/O` and `1/I/L` are removed because the code is meant to be read aloud or
+ * retyped, and a code that fails because of a font is a code that failed for the
+ * wrong reason. 32 characters, eight of them: about 1.1e12 possibilities, which is
+ * far more than a fifteen-minute, ten-attempts-an-hour window can search.
+ */
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+
+/**
+ * How long an expired code is remembered, so the refusal can be accurate.
+ *
+ * Nothing about the code still works after it expires; this only decides whether
+ * the relay says "expired" or "no such code".
+ */
+const INVITE_MEMORY_MS = 10 * 60 * 1000
+
+/**
+ * Mint one invite code for a machine.
+ *
+ * @returns {string} a fresh code, formatted `XXXX-XXXX`.
+ */
+function mintInviteCode() {
+  const bytes = randomBytes(8)
+  let code = ''
+  for (const byte of bytes) code += CODE_ALPHABET[byte % CODE_ALPHABET.length]
+  return `${code.slice(0, 4)}-${code.slice(4)}`
+}
+
+/**
+ * `POST /api/agent/invite` — let a machine mint an invite code for its own door.
+ *
+ * The code is minted here rather than on the node because the relay is the only
+ * party a visitor talks to, so it has to be the one that can accept or refuse the
+ * code. The node asks for it with the agent token, and the code is bound to that
+ * node: an invite is an invitation to *this machine*, not a key to every door the
+ * relay knows about.
+ *
+ * @param {object} body - `{ nodeId }`.
+ * @returns {object} `{ code, expiresAt, ttlMs, nodeId }`.
+ */
+function agentInvite(body) {
+  const node = requireNode(body)
+  if (node.guest.enabled !== true) {
+    throw new HttpError(409, `node ${node.nodeId} has no guest door open, so an invite code would lead nowhere`)
+  }
+  sweepGuestTokens()
+  const now = Date.now()
+  const code = mintInviteCode()
+  // Keyed by the *canonical* form, because that is what a visitor's typing is
+  // normalized to. Storing the displayed form and looking up the canonical one was
+  // a real bug: every code came back "invalid" while the operator was holding a
+  // perfectly good one.
+  invites.set(normalizeInviteCode(code), {
+    code,
+    nodeId: node.nodeId,
+    createdAt: now,
+    expiresAt: now + config.inviteTtlMs,
+    consumedAt: 0,
+    consumedBy: ''
+  })
+  return { code, nodeId: node.nodeId, expiresAt: now + config.inviteTtlMs, ttlMs: config.inviteTtlMs }
+}
+
+/**
+ * `POST /api/guest/enter` — trade an invite code for a visitor identity.
+ *
+ * The identity is put in an `HttpOnly` cookie rather than handed to the page, so
+ * the page never holds it: a script injected into the page cannot read it, and the
+ * browser attaches it to every guest call by itself (including the event stream,
+ * whose token would otherwise sit in a URL and land in access logs). The token is
+ * also returned in the body, because a script that cannot use cookies — the
+ * self-checks, a CLI — still has to be able to drive the door.
+ *
+ * Existing visitors never see this route's code path: their identity is already in
+ * a cookie or a stored token, and the page only asks for a code when it has
+ * neither. That is what "already invited people stay invited" means in practice.
+ *
+ * @param {object} body - `{ code?, token? }`.
+ * @param {import('node:http').IncomingMessage} req - the request, for its address and TLS state.
+ * @returns {object} `{ guestId, nodeId, expiresInMs, token }`.
+ */
+function guestEnter(body, req) {
   sweepGuestTokens()
   const address = clientAddress(req)
+  let nodeId = ''
+  if (config.guestInviteRequired) {
+    const code = normalizeInviteCode(body?.code)
+    if (code === '') {
+      // A machine-readable reason, not a failure: the page turns this into the code
+      // field rather than into an error message.
+      throw new HttpError(401, 'invite_required')
+    }
+    const record = invites.get(code)
+    if (record === undefined) {
+      const attempts = countAgainst(codeAttempts, address)
+      if (attempts > config.guestCodeAttemptsPerHour) {
+        throw new HttpError(429, 'too many wrong invite codes from this address; try again later')
+      }
+      throw new HttpError(403, 'invite_invalid')
+    }
+    if (record.consumedAt !== 0) {
+      throw new HttpError(409, 'invite_used')
+    }
+    if (Date.now() > record.expiresAt) {
+      invites.delete(code)
+      throw new HttpError(410, 'invite_expired')
+    }
+    const node = nodes.get(record.nodeId)
+    if (node === undefined || node.guest.enabled !== true || node.guest.workspaces.length === 0) {
+      // The door was open when the code was minted and is not any more, so the code
+      // would buy an empty page. Refusing is kinder than a silent nothing.
+      throw new HttpError(409, 'invite_stale')
+    }
+    record.consumedAt = Date.now()
+    nodeId = record.nodeId
+  }
   const recent = guestEnters.get(address) ?? []
   if (recent.length >= config.guestEntersPerHour) {
     throw new HttpError(429, 'too many guest sessions from this address in the last hour; try again later')
@@ -1121,12 +1463,38 @@ function guestEnter(req) {
   if (guestTokens.size >= config.guestMaxVisitors) {
     throw new HttpError(503, 'this relay is at its guest capacity; try again later')
   }
-  recent.push(Date.now())
-  guestEnters.set(address, recent)
+  countAgainst(guestEnters, address)
   const token = randomUUID()
   const guestId = `guest-${randomUUID().slice(0, 12)}`
-  guestTokens.set(token, { guestId, createdAt: Date.now(), lastSeenAt: Date.now() })
-  return { token, guestId, expiresInMs: config.guestTokenTtlMs }
+  guestTokens.set(token, { guestId, nodeId, createdAt: Date.now(), lastSeenAt: Date.now() })
+  if (nodeId !== '') invites.get(normalizeInviteCode(body?.code)).consumedBy = guestId
+  return { token, guestId, nodeId, expiresInMs: config.guestTokenTtlMs, cookie: config.guestCookieName }
+}
+
+/**
+ * `POST /api/guest/leave` — forget this visitor's identity and clear its cookie.
+ *
+ * Without this the only way out of the door would be clearing site data by hand,
+ * and a shared browser would keep one person's guest identity for the next one.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request.
+ * @param {URL} url - parsed request URL.
+ * @returns {object} `{ ok: true, forgot: boolean }`.
+ */
+function guestLeave(req, url) {
+  const cookie = cookieValue(req, config.guestCookieName)
+  const bearer = presentedToken(req, url)
+  const token = cookie ?? bearer
+  let forgot = false
+  if (typeof token === 'string' && token !== '') {
+    const record = guestTokens.get(token)
+    if (record !== undefined) {
+      guestTokens.delete(token)
+      guestSessions.delete(record.guestId)
+      forgot = true
+    }
+  }
+  return { ok: true, forgot }
 }
 
 /**
@@ -1139,12 +1507,13 @@ function guestEnter(req) {
  * @param {import('node:http').ServerResponse} res - response to hold open.
  * @param {{ role: string, guestId: string }} [viewer] - who is subscribing.
  */
-function controlEvents(res, viewer = OWNER_VIEW) {
+function controlEvents(res, viewer = OWNER_VIEW, headers = undefined) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store',
     connection: 'keep-alive',
-    'x-accel-buffering': 'no'
+    'x-accel-buffering': 'no',
+    ...(headers ?? {})
   })
   res.write('retry: 3000\n\n')
   const subscriber = { res, viewer }
@@ -1241,7 +1610,9 @@ const ROUTE_METHODS = {
   '/api/agent/question/settled': 'POST',
   '/api/command': 'POST',
   '/api/answer': 'POST',
+  '/api/agent/invite': 'POST',
   '/api/guest/enter': 'POST',
+  '/api/guest/leave': 'POST',
   '/api/guest/state': 'GET',
   '/api/guest/events': 'GET',
   '/api/guest/command': 'POST',
@@ -1273,19 +1644,23 @@ const server = createServer((req, res) => {
     /**
      * Who is calling, decided by credential and by route namespace.
      *
-     * `undefined` means the credential was missing or wrong, and the only route
-     * that may proceed without one is the guest entry point — that route mints the
-     * identity every other guest route requires.
+     * `undefined` means the credential was missing or wrong, and the only routes
+     * that may proceed without one are the guest entry point and the guest exit:
+     * entry is what mints an identity, exit is what lets a visitor drop one, and
+     * neither can require the very identity it exists to create or destroy.
      *
-     * @type {{ role: string, guestId: string }|undefined}
+     * @type {{ role: string, guestId: string, nodeId?: string }|undefined}
      */
     let viewer
+    /** How the guest identity was presented, for cookie adoption. */
+    let credential = { viewer: undefined, token: undefined, fromCookie: false }
     if (isAgentRoute) {
       viewer = token !== undefined && secretEquals(token, config.agentToken) ? { role: 'agent', guestId: '' } : undefined
-    } else if (url.pathname === '/api/guest/enter') {
+    } else if (url.pathname === '/api/guest/enter' || url.pathname === '/api/guest/leave') {
       viewer = { role: 'public', guestId: '' }
     } else if (isGuestRoute) {
-      viewer = guestViewer(token)
+      credential = guestCredential(req, url)
+      viewer = credential.viewer
     } else {
       viewer = token !== undefined && secretEquals(token, config.controlToken) ? OWNER_VIEW : undefined
     }
@@ -1294,10 +1669,16 @@ const server = createServer((req, res) => {
       return
     }
 
+    // A visitor who authenticated with a stored token gets the cookie too, on any
+    // guest call. That is the migration path for everybody who was already inside
+    // before cookies existed: nobody has to be asked for a code they never had.
+    const adoption = isGuestRoute ? adoptCookieHeaders(req, credential) : undefined
+
     // The EventSource subscriber cannot send headers, so its token rides the
-    // query string and is the only route that accepts that form.
+    // query string and is the only route that accepts that form. A visitor with a
+    // cookie needs neither: the browser attaches it to the stream by itself.
     if (req.method === 'GET' && url.pathname === '/api/events') {
-      controlEvents(res, viewer)
+      controlEvents(res, viewer, adoption)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
@@ -1305,11 +1686,11 @@ const server = createServer((req, res) => {
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/guest/events') {
-      controlEvents(res, viewer)
+      controlEvents(res, viewer, adoption)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/guest/state') {
-      sendJson(res, 200, guestState(url, viewer))
+      sendJson(res, 200, guestState(url, viewer), adoption)
       return
     }
 
@@ -1354,14 +1735,45 @@ const server = createServer((req, res) => {
       case '/api/answer':
         sendJson(res, 200, controlAnswer(body))
         return
-      case '/api/guest/enter':
-        sendJson(res, 200, guestEnter(req))
+      case '/api/agent/invite':
+        sendJson(res, 200, agentInvite(body))
+        return
+      case '/api/guest/enter': {
+        // Called exactly once: minting is not idempotent (it consumes the invite
+        // code), so the cookie value has to come from this one result rather than
+        // from a second lookup.
+        const entered = guestEnter(body, req)
+        // The identity is handed over in a cookie, not to the page: `HttpOnly`, so
+        // a script in the page cannot read it, and attached automatically, so the
+        // page never has to handle it at all. It is also in the body for callers
+        // that cannot use cookies — the self-checks and any script driving the door.
+        sendJson(res, 200, entered, {
+          'set-cookie': setCookieHeader({
+            name: config.guestCookieName,
+            value: entered.token,
+            path: cookiePath(req),
+            maxAgeSeconds: Math.floor(config.guestTokenTtlMs / 1000),
+            secure: isSecureRequest(req)
+          })
+        })
+        return
+      }
+      case '/api/guest/leave':
+        sendJson(res, 200, guestLeave(req, url), {
+          'set-cookie': setCookieHeader({
+            name: config.guestCookieName,
+            value: '',
+            path: cookiePath(req),
+            maxAgeSeconds: 0,
+            secure: isSecureRequest(req)
+          })
+        })
         return
       case '/api/guest/answer':
-        sendJson(res, 200, guestAnswer(body, viewer))
+        sendJson(res, 200, guestAnswer(body, viewer), adoption)
         return
       case '/api/guest/command':
-        sendJson(res, 200, guestCommand(body, viewer))
+        sendJson(res, 200, guestCommand(body, viewer), adoption)
         return
       default:
         sendJson(res, 200, controlCommand(body))

@@ -107,7 +107,17 @@ export class RelayClient {
       throw new RelayAuthError(`relay rejected this node's token (HTTP ${String(response.status)})`)
     }
     if (!response.ok) {
-      throw new RelayUnreachableError(`${path} answered HTTP ${String(response.status)}`)
+      // The relay's own words are carried through when it sent any: a refusal it
+      // can explain ("this machine has no guest door open") is far more useful to
+      // the person reading the card than "HTTP 409".
+      let detail = ''
+      try {
+        const refusal = await response.json()
+        if (typeof refusal?.error === 'string' && refusal.error !== '') detail = `: ${refusal.error}`
+      } catch {
+        /* a body we cannot read is not worth reporting on top of the status */
+      }
+      throw new RelayUnreachableError(`${path} answered HTTP ${String(response.status)}${detail}`)
     }
     try {
       const payload = await response.json()
@@ -214,6 +224,21 @@ export class RelayClient {
    */
   async settleQuestion(body) {
     await this.post('/api/agent/question/settled', body, { timeoutMs: 15_000 })
+  }
+
+  /**
+   * Ask the relay to mint an invite code for one machine's guest door.
+   *
+   * The code is minted by the relay rather than here, because the relay is the only
+   * party a visitor talks to and therefore the only one that can accept or refuse
+   * the code. The node's part is to ask for it with the agent token and to show it
+   * to the operator.
+   *
+   * @param {string} nodeId - the machine the invite is for.
+   * @returns {Promise<{ code: string, expiresAt: number, ttlMs: number }>} the code.
+   */
+  createInvite(nodeId) {
+    return this.post('/api/agent/invite', { nodeId }, { timeoutMs: 15_000 })
   }
 
   /**
