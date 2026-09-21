@@ -170,6 +170,14 @@ try {
   })
   check('hello is accepted', hello.status === 200, JSON.stringify(hello.body))
   check('hello reports the poll hold', hello.body?.pollHoldMs === 1500, JSON.stringify(hello.body?.pollHoldMs))
+  // The liveness window rides the ack so a node can keep its "still working"
+  // heartbeat inside it. Without this a long turn is reported as an offline
+  // machine, and the relay then refuses the next question instead of queueing it.
+  check(
+    'hello reports the liveness window the heartbeat must fit',
+    hello.body?.offlineAfterMs === 4000,
+    JSON.stringify(hello.body?.offlineAfterMs)
+  )
   check('a workspace without a path is dropped', hello.status === 200)
   check('hello with no nodeId is refused', (await call('/api/agent/hello', { token: AGENT_TOKEN, body: {} })).status === 400)
 
@@ -873,6 +881,22 @@ try {
     } finally {
       await stopGuarded(closed)
     }
+  }
+
+  // ── a busy node stays alive by reporting ─────────────────────────────────
+  // The relay's liveness rule is fed by polls *and* reports, which is what makes a
+  // heartbeat enough. Asserted here on its own because the whole "shown as 离线
+  // while working" bug comes down to whether this is true.
+  {
+    await helloGuest()
+    await sleep(4500)
+    const stale = (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.find((node) => node.nodeId === 'mac-1')
+    check('a silent machine is reported offline', stale?.online === false, JSON.stringify(stale?.status))
+    await call('/api/agent/report', { token: AGENT_TOKEN, body: { nodeId: 'mac-1', status: 'busy', detail: 'a long turn' } })
+    const revived = (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.find((node) => node.nodeId === 'mac-1')
+    check('a status report alone brings it back online', revived?.online === true, JSON.stringify(revived?.status))
+    check('and the page can say what it is doing', revived?.status === 'busy' && revived?.detail === 'a long turn', JSON.stringify(revived))
+    await call('/api/agent/report', { token: AGENT_TOKEN, body: { nodeId: 'mac-1', status: 'idle' } })
   }
 
   // ── the page under a reverse-proxy prefix ────────────────────────────────

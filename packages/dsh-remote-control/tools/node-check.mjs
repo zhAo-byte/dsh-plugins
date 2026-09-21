@@ -61,6 +61,14 @@ async function rejects(what, run, expected) {
   }
 }
 
+/**
+ * Wait, for the checks that have to watch a real timer.
+ *
+ * @param {number} ms - how long to wait.
+ * @returns {Promise<void>} resolves after the wait.
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 /** Recorded requests from the fake relay. */
 const seen = []
 let responder = () => ({ status: 200, body: {} })
@@ -498,6 +506,67 @@ try {
       role: 'guest'
     })
     check('a guest turn without a principal is refused', String(noPrincipal.error).includes('visitor'), JSON.stringify(noPrincipal))
+  }
+
+  // ── the busy heartbeat ───────────────────────────────────────────────────
+  // A turn blocks the poll loop, and the relay reads silence as death, so a turn
+  // longer than the liveness window showed the machine as 离线 and made the relay
+  // refuse new questions. These are the two halves that matter: the interval is
+  // derived from what the relay said its window is, and a beat can never affect
+  // the turn it is covering.
+  {
+    const { DEFAULT_HEARTBEAT_MS, heartbeatMsFor, startBusyHeartbeat } = await import('../lib/heartbeat.js')
+
+    check('an unknown window falls back to the documented interval', heartbeatMsFor(undefined) === DEFAULT_HEARTBEAT_MS, String(heartbeatMsFor(undefined)))
+    check('a nonsense window falls back too', heartbeatMsFor(0) === DEFAULT_HEARTBEAT_MS && heartbeatMsFor('45s') === DEFAULT_HEARTBEAT_MS)
+    check('the interval is a third of the relay’s window', heartbeatMsFor(45_000) === 15_000, String(heartbeatMsFor(45_000)))
+    check('a tight window gets a proportional beat', heartbeatMsFor(9_000) === 3_000, String(heartbeatMsFor(9_000)))
+    check('an aggressive window is clamped so it cannot flood the relay', heartbeatMsFor(300) === 1_000, String(heartbeatMsFor(300)))
+    check('a very wide window is clamped to the ceiling', heartbeatMsFor(3_600_000) === DEFAULT_HEARTBEAT_MS, String(heartbeatMsFor(3_600_000)))
+
+    // Real timers, small interval: beats arrive, stop() is final, and a rejecting
+    // report is swallowed rather than becoming an unhandled rejection.
+    let beats = 0
+    const stop = startBusyHeartbeat({ intervalMs: 20, report: () => { beats += 1 } })
+    await sleep(120)
+    stop()
+    const afterStop = beats
+    check('a running turn gets its heartbeats', afterStop >= 2, `${String(afterStop)} beats in 120ms`)
+    await sleep(80)
+    check('stopping the heartbeat ends it', beats === afterStop, `${String(beats)} vs ${String(afterStop)}`)
+
+    let rejections = 0
+    const stopRejecting = startBusyHeartbeat({
+      intervalMs: 20,
+      report: () => {
+        rejections += 1
+        return Promise.reject(new Error('relay is down'))
+      }
+    })
+    await sleep(120)
+    stopRejecting()
+    check('a failing heartbeat is swallowed, never thrown at the turn', rejections >= 2, `${String(rejections)} attempts`)
+
+    let slowCalls = 0
+    const stopSlow = startBusyHeartbeat({
+      intervalMs: 10,
+      // A heartbeat that never settles must not queue up work either: the timer
+      // fires again regardless, because the beat is not awaited.
+      report: () => {
+        slowCalls += 1
+        return new Promise(() => {})
+      }
+    })
+    await sleep(80)
+    stopSlow()
+    check('a heartbeat that hangs does not stall the timer', slowCalls >= 2, `${String(slowCalls)} attempts`)
+
+    check('a nonsense interval starts nothing at all', (() => {
+      let called = 0
+      const noop = startBusyHeartbeat({ intervalMs: 0, report: () => { called += 1 } })
+      noop()
+      return called === 0
+    })())
   }
 
   // ── the client against the fake relay ────────────────────────────────────

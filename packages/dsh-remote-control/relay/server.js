@@ -564,7 +564,16 @@ function agentHello(body) {
   }
   node.lastSeenAt = Date.now()
   broadcastRoster()
-  return { nodeId: node.nodeId, name: node.name, pollHoldMs: config.pollHoldMs, guest: node.guest.enabled }
+  // `offlineAfterMs` rides the ack so a node can keep its "still working" heartbeat
+  // inside this relay's liveness window instead of guessing at it. Without that,
+  // a turn longer than the window is reported as an offline machine.
+  return {
+    nodeId: node.nodeId,
+    name: node.name,
+    pollHoldMs: config.pollHoldMs,
+    offlineAfterMs: config.offlineAfterMs,
+    guest: node.guest.enabled
+  }
 }
 
 /**

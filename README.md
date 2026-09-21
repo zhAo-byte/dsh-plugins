@@ -146,7 +146,7 @@ bundle 通道已经带了这一行，重复 id 会让 profile 启动失败。
 
 | 入口 | 需要什么 | 内容 |
 | --- | --- | --- |
-| `npm test` | **只要 Node** | relay 109 · node 126 · 自带预设安装 35 · 提问接管 12 |
+| `npm test` | **只要 Node** | relay 113 · node 137 · 自带预设安装 35 · 提问接管 12 |
 | `npm run test:harness` | 磁盘上有真 Harness | runner 115 · live 43 · 设置 11 · 配置卡片 12 |
 | `npm run test:ui` | 一个 Chromium | 问答页 + 游客页 64 |
 

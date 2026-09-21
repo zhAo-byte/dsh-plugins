@@ -24,6 +24,7 @@
 import { hostname, platform, release } from 'node:os'
 import { RelayAuthError, RelayClient, RelayUnreachableError } from './client.js'
 import { deriveNodeId, resolveConfig } from './config.js'
+import { heartbeatMsFor, startBusyHeartbeat } from './heartbeat.js'
 import { RemoteQuestionBridge } from './questions.js'
 import { RemoteRunner, normalizeWorkspaces } from './runner.js'
 
@@ -359,6 +360,15 @@ export async function apply(ctx, config) {
       logger,
       timeoutMs: resolved.questionTimeoutMs
     })
+    /**
+     * The relay's liveness window, learned from its `hello` ack.
+     *
+     * Zero until the first ack arrives, which `heartbeatMsFor` reads as "use the
+     * default". It lives here rather than in the config because the relay owns the
+     * number: a deployment that widens or tightens `DSH_REMOTE_OFFLINE_AFTER_MS`
+     * changes the heartbeat with it, and there is no second setting to keep in step.
+     */
+    let livenessMs = 0
     const runner = new RemoteRunner({
       ctx: scoped,
       config: { ...resolved, ...identity, workspaces, guest },
@@ -396,25 +406,39 @@ export async function apply(ctx, config) {
      */
     const handleCommand = async (command) => {
       const label = typeof command.prompt === 'string' ? command.prompt.replace(/\s+/g, ' ').slice(0, 70) : ''
+      const detail = label === '' ? 'running a remote turn' : label
       logger?.info?.(`dsh-remote-control: running ${command.commandId} in ${command.workspace}`)
-      await client.reportQuietly({
-        nodeId: identity.nodeId,
-        status: 'busy',
-        detail: label === '' ? 'running a remote turn' : label
+      await client.reportQuietly({ nodeId: identity.nodeId, status: 'busy', detail })
+      // The poll loop is blocked for the whole turn below, and the relay reads
+      // silence as death: without this, every turn longer than the liveness window
+      // is shown as 离线 and the relay refuses new questions rather than queueing
+      // them behind the turn. See `lib/heartbeat.js`; `livenessMs` is the window
+      // the relay told us it uses, so the beat fits the deployment rather than a
+      // guess baked in here.
+      const stopHeartbeat = startBusyHeartbeat({
+        intervalMs: heartbeatMsFor(livenessMs),
+        report: () => client.reportQuietly({ nodeId: identity.nodeId, status: 'busy', detail })
       })
-      const result = await runner.run(command)
-      if (result.ok) {
-        logger?.info?.(`dsh-remote-control: ${command.commandId} finished in ${String(result.durationMs)}ms`)
-      } else {
-        logger?.warn?.(`dsh-remote-control: ${command.commandId} failed: ${result.error}`)
+      try {
+        const result = await runner.run(command)
+        if (result.ok) {
+          logger?.info?.(`dsh-remote-control: ${command.commandId} finished in ${String(result.durationMs)}ms`)
+        } else {
+          logger?.warn?.(`dsh-remote-control: ${command.commandId} failed: ${result.error}`)
+        }
+        await client.reportQuietly({
+          nodeId: identity.nodeId,
+          status: 'idle',
+          detail: '',
+          commandId: command.commandId,
+          result
+        })
+      } finally {
+        // Stopped only after the outcome was reported, so a beat can never land
+        // between the result and the idle report and leave a finished turn looking
+        // busy on the page.
+        stopHeartbeat()
       }
-      await client.reportQuietly({
-        nodeId: identity.nodeId,
-        status: 'idle',
-        detail: '',
-        commandId: command.commandId,
-        result
-      })
     }
 
     /**
@@ -434,6 +458,7 @@ export async function apply(ctx, config) {
         try {
           const ack = await client.hello({ ...identity, workspaces: runner.workspaces(), guest: guestAdvertisement() })
           if (typeof ack.pollHoldMs === 'number' && ack.pollHoldMs > 0) pollHoldMs = ack.pollHoldMs
+          if (typeof ack.offlineAfterMs === 'number' && ack.offlineAfterMs > 0) livenessMs = ack.offlineAfterMs
           if (!announced) {
             const advertised = runner.workspaces()
             report(
