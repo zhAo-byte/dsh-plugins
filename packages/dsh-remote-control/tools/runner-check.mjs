@@ -88,8 +88,14 @@ class FakeSession {
    * @param {object} [message] - the admitted user message, when there was one.
    */
   commitReply(text, reason = { kind: 'completed' }, message) {
+    // The real Harness does not log the turn boundary and the prompt in a fixed
+    // order: a freshly created session opens `turn/start` **before** the first
+    // prompt is admitted, a resumed one opens it after. This fixture only modelled
+    // the second order, which is exactly why the extraction bug below stayed
+    // invisible — `turnOpensFirst` lets a check pin the first one.
+    if (this.turnOpensFirst === true) this.events.push({ type: 'turn/start', data: {} })
     if (message !== undefined) this.events.push({ type: 'user/message', data: message })
-    this.events.push({ type: 'turn/start', data: {} })
+    if (this.turnOpensFirst !== true) this.events.push({ type: 'turn/start', data: {} })
     this.events.push({
       type: 'assistant/message',
       data: { message: { content: text === '' ? [] : [{ type: 'text', text }] } }
@@ -213,6 +219,7 @@ function fakeHarness(options = {}) {
       create: (request) => {
         ledger.creates.push(request)
         const handle = new FakeHandle(request.sessionId, ledger)
+        handle.session.turnOpensFirst = options.turnOpensFirst === true
         handles.set(request.sessionId, handle)
         stored.set(request.sessionId, { cwd: request.meta?.cwd, agentPreset: request.meta?.agentPreset })
         // Real creation composes the agent before publishing it, so the setup
@@ -222,6 +229,7 @@ function fakeHarness(options = {}) {
       resume: (request) => {
         ledger.resumes.push(request)
         const handle = new FakeHandle(request.resumeSessionId, ledger)
+        handle.session.turnOpensFirst = options.turnOpensFirst === true
         handles.set(request.resumeSessionId, handle)
         return Promise.resolve(request.setup({ name: 'agent-scope' })).then(() => handle)
       },
@@ -470,6 +478,25 @@ try {
       JSON.stringify(ledger.permissions)
     )
     check('the session is titled from the question', ledger.titles[0]?.title === 'what changed today?', JSON.stringify(ledger.titles))
+    // The regression this pins, found on the first real remote turn ever run: a
+    // freshly created session logs `turn/start` **before** the prompt is admitted,
+    // and an extraction that insists on seeing a start *after* the prompt finds
+    // none, skips the answer and the `turn/end`, and reports
+    // "the turn ended without recording an outcome" for a turn that completed.
+    {
+      const opened = await makeRunner({}, { turnOpensFirst: true })
+      const result = await opened.runner.run(command())
+      check(
+        'a first turn that opens before the prompt still yields its answer',
+        result.ok === true && result.text === 'answer',
+        JSON.stringify(result)
+      )
+      check(
+        'and it is not reported as a turn with no recorded outcome',
+        String(result.error ?? '') !== 'the turn ended without recording an outcome',
+        String(result.error)
+      )
+    }
     check(
       'the created session is handed to the question bridge',
       tracked.includes(String(result.sessionId)),

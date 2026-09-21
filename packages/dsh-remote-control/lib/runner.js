@@ -182,6 +182,14 @@ function helpers() {
  * the prompt's message identity is known the walk starts at that message, so the
  * attribution is exact even if the other end's turn was admitted first.
  *
+ * **The turn boundary and the prompt do not arrive in a fixed order.** A freshly
+ * created session logs `turn/start` *before* the prompt is admitted; a resumed
+ * session logs it after. Both orders are therefore accepted, and only a second
+ * `turn/start` inside the window means a turn that is not ours. Assuming the
+ * resumed order was a real bug, not a theoretical one: the first live remote turn
+ * on a real Harness reported "the turn ended without recording an outcome" while
+ * the answer was committed in the log. See the note inside this function.
+ *
  * @param {object} session - live Session.
  * @param {number} firstSeq - log length captured before the prompt.
  * @param {Function} SessionSeq - the branded-sequence constructor.
@@ -189,17 +197,37 @@ function helpers() {
  * @returns {{ text: string, reason: object|undefined }} last text and turn outcome.
  */
 export function summarizeTurn(session, firstSeq, SessionSeq, messageId) {
-  let started = false
+  const located = messageId === undefined ? undefined : promptSeq(session, firstSeq, SessionSeq, messageId)
+  const start = located ?? firstSeq
+  /**
+   * Whether the walk is already inside the turn that owns the prompt.
+   *
+   * Locating the prompt is proof of that, and requiring a `turn/start` *after* it
+   * was wrong in the case that matters most. A freshly created session starts
+   * `turn/start` **before** the first prompt is admitted — the observed order is
+   * `turn/start` → `user/message` (seq 6 then 10 in a real log) — so the walk found
+   * no start after the prompt, skipped the answer and the `turn/end`, and reported
+   * "the turn ended without recording an outcome" for a turn that had completed and
+   * whose reply was sitting in the log. The page showed a failure instead of an
+   * answer.
+   *
+   * `sawTurnStart` is separate from `started` so the interleaving guard still
+   * works: a *second* `turn/start` in the window means a turn began that is not
+   * ours, which is the shared-session case this stops on. One `turn/start` after the
+   * prompt is the ordinary resumed-session order and is simply absorbed.
+   */
+  let started = located !== undefined
+  let sawTurnStart = false
   let text = ''
   let reason
-  const start = (messageId === undefined ? undefined : promptSeq(session, firstSeq, SessionSeq, messageId)) ?? firstSeq
   const length = session.seq
   for (let seq = start; seq < length; seq += 1) {
     const event = session.eventAt(SessionSeq(seq))
     if (event === undefined) continue
     if (event.type === 'turn/start') {
       // A turn that begins after ours ended is somebody else's.
-      if (started) break
+      if (sawTurnStart) break
+      sawTurnStart = true
       started = true
       continue
     }

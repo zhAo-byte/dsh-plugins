@@ -712,6 +712,23 @@ npm run test:harness           # = runner-check + live-check + settings-check + 
 npm run test:ui                # 真 Chromium 里把问答页跑一遍
 ```
 
+**这里记一个真踩到的坑，因为它说明了「假数据比没有数据更危险」。** 第一次真正从页面上发起
+远程回合时（游客问「在吗？」），日志里明明写着 `turn/end reason={"kind":"completed"}`、回答也
+完整落盘，页面却显示失败：`the turn ended without recording an outcome`。
+
+原因在 `summarizeTurn`：它从**我们的提问**那一格开始扫，却要求**之后**出现 `turn/start` 才算
+「这一轮是我们的」。而真实 Harness 对**新建会话的第一轮**记的顺序是 `turn/start`（seq 6）在
+`user/message`（seq 10）**之前**——于是 `started` 永远是 false，回答和 `turn/end` 一起被跳过，
+`reason` 为 `undefined`。恢复顺序（resume）恰好相反，`turn/start` 在提问之后。
+
+那为什么三个检查都没抓到？`runner-check` 的假 Harness 只造了**恢复顺序**
+（`commitMessage` 先 push `user/message` 再 push `turn/start`）；`live-check` 为了不依赖模型
+凭据，**刻意在碰 Harness 之前就拒绝命令**；`ui-check` 里那段「回答」是 relay 伪造的历史。
+也就是说：**这个插件的取回答路径，在第一次真跑之前从来没被真跑过**，而唯一的假数据恰好是
+能工作的那一种顺序。修法是承认两种顺序都合法（只有 window 里出现**第二个** `turn/start`
+才说明那一轮不是我们的），并且两边各补一条断言——`runner-check` 加了 `turnOpensFirst` 选项
+来造真实顺序。把修复还原后这两条断言会红，红出的正是那句话。
+
 `presets-check` 盯的是「自带预设到底写了谁的目录」这一件事：全新安装、重复运行是 no-op、
 快照变了才更新且先备份、**没有本插件戳的目录一个字都不动**、快照删掉的文件要跟着删、
 源目录读不到时报告失败而不是抛异常。最后两条不是洁癖：抛异常会发生在插件加载期，
@@ -802,10 +819,10 @@ href）。手写渲染器最典型的 bug 正好落在这两条之间：它可�
 
 ```
 relay-check     109/109
-node-check      124/124
+node-check      126/126
 presets-check    35/35
 questions-check  12/12
-runner-check    113/113
+runner-check    115/115
 live-check       43/43
 settings-check   11/11
 card-check       12/12

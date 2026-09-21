@@ -749,6 +749,46 @@ try {
       return summary.text === 'ours' && turnFailure(summary.reason) === undefined
     })()
   )
+  // The ordering that a real Harness produces for a *freshly created* session, taken
+  // from an actual session log: `turn/start` (seq 6) comes before the admitted
+  // prompt (seq 10), the answer (19) and the `turn/end` (21). `firstSeq` is inside
+  // that turn, because `ask()` captures it after `whenIdle()` returns while turn 1
+  // is already running. Requiring a `turn/start` after the prompt made this the one
+  // case that failed: the answer was in the log and the plugin reported "the turn
+  // ended without recording an outcome" instead of showing it.
+  check(
+    'a turn that opens before the admitted prompt still yields its answer',
+    (() => {
+      const events = [
+        { type: 'permission/preset' },
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'step/start' },
+        { type: 'user/message', data: { id: 'ours' } },
+        { type: 'request/header' },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'the answer' }] } } },
+        { type: 'step/end' },
+        { type: 'turn/end', data: { reason: { kind: 'completed' } } }
+      ]
+      const summary = summarizeTurn({ seq: events.length, eventAt: (seq) => events[seq] }, 3, (value) => value, 'ours')
+      return summary.text === 'the answer' && turnFailure(summary.reason) === undefined
+    })()
+  )
+  check(
+    'a second turn in the window is still not ours, even with the prompt located',
+    (() => {
+      const events = [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'user/message', data: { id: 'ours' } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'our answer' }] } } },
+        { type: 'turn/end', data: { reason: { kind: 'completed' } } },
+        { type: 'turn/start', data: { turn: 2 } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'somebody else' }] } } },
+        { type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'X', message: 'y' } } } }
+      ]
+      const summary = summarizeTurn({ seq: events.length, eventAt: (seq) => events[seq] }, 1, (value) => value, 'ours')
+      return summary.text === 'our answer' && turnFailure(summary.reason) === undefined
+    })()
+  )
   check(
     'the reply is attributed to the admitted prompt, not to the first turn in the window',
     (() => {
