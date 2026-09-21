@@ -211,8 +211,65 @@ window.__ModuleLoader__.load({
           label: '权限预设',
           hint: '固定给远程会话的权限，默认 workspace-write：越界操作会弹在你这台机器上等确认。'
         }),
+        pathListField('guestWorkspaces', {
+          label: '游客工作台（每行一个绝对路径）',
+          hint:
+            '游客能访问的**唯一**目录白名单，必须是上面工作台的子集；留空则游客模式没有可用的工作台。' +
+            '写在这里的目录不会因为注册表模式而扩大。',
+          placeholder: '/Users/me/demo'
+        }),
+        textField('guestAgentPreset', {
+          label: '游客 Agent 预设',
+          hint: '游客会话用哪个 agent 预设，默认 reader（随插件自带安装的只读分析 agent）。'
+        }),
+        textField('guestPermissionPreset', {
+          label: '游客权限预设',
+          hint: '固定给游客会话的权限，默认 read-only：只读，改不了任何文件。'
+        }),
+        numberField('guestMaxPromptChars', {
+          label: '游客单条提问上限（字符）',
+          hint: '游客一条提问最长多少字符，默认 8000。节点和页面各拦一道。'
+        }),
         numberField('reconnectMinMs', { label: '重连最小间隔（毫秒）' }),
         numberField('reconnectMaxMs', { label: '重连最大间隔（毫秒）' })
+      ]
+    }
+
+    /**
+     * The card's switches, in the order they render.
+     *
+     * Separate from `fieldSpecs` because these write the moment they are toggled
+     * rather than staging an edit: a switch is a decision with one visible
+     * consequence, and "stage it, then remember to press save" is how a door ends
+     * up in a state the operator did not intend. `defaultOn` records which way an
+     * absent value reads, because the host and the card must agree — `enabled`
+     * defaults to on, `guestEnabled` only to `true` (see `lib/config.js`).
+     *
+     * @returns {object[]} the switch specs.
+     */
+    function booleanSpecs() {
+      return [
+        {
+          field: 'enabled',
+          label: '启用这台机器的远程控制',
+          defaultOn: true,
+          on: '已启用。',
+          off: '已停用，节点会断开。'
+        },
+        {
+          field: 'guestEnabled',
+          label: '开放游客入口（无需密码，只能读、只能访问上面的游客工作台）',
+          defaultOn: false,
+          on: '游客入口已开放：中转台 /guest 任何人都能进，立即生效。',
+          off: '游客入口已关闭，中转台会立刻拒绝新的游客。'
+        },
+        {
+          field: 'installBundledPresets',
+          label: '随插件安装自带的 agent 预设（游客模式用的 reader）',
+          defaultOn: true,
+          on: '已开启：下次加载插件时会把自带预设写进 $DSH_HOME/.agent-presets。',
+          off: '已关闭：自带预设不再写入，reader 需要你自己装。'
+        }
       ]
     }
     //#endregion
@@ -362,6 +419,15 @@ window.__ModuleLoader__.load({
             '越界操作会弹在你这台机器的 DSH 里等确认——中转台和页面都没有审批按钮。'
         )
       )
+      children.push(
+        react.createElement(
+          'div',
+          { key: 'guest-note', className: 'rc-warn' },
+          '游客入口是一个没有密码的公开页面：打开链接的人可以用「游客 Agent 预设」在这台机器上提问，' +
+            '范围仅限「游客工作台」列出的目录。只读靠两层硬约束——预设自身没有写工具，' +
+            '权限又钉在 read-only；关掉游客开关或在中转台上设 DSH_REMOTE_GUEST=off 都能立刻关门。'
+        )
+      )
 
       if (!ready) {
         children.push(
@@ -392,26 +458,29 @@ window.__ModuleLoader__.load({
         )
       }
 
-      children.push(
-        react.createElement('label', { key: 'enabled', className: 'rc-check' }, [
-          react.createElement('input', {
-            key: 'cb',
-            type: 'checkbox',
-            checked: value.enabled !== false,
-            disabled: !writable,
-            onChange: (event) => {
-              if (!writable) return
-              setSaving(true)
-              setStatus(undefined)
-              void (event.target.checked ? setField('enabled', true) : setField('enabled', false))
-                .then(() => setStatus({ kind: 'ok', text: event.target.checked ? '已启用。' : '已停用，节点会断开。' }))
-                .catch((error) => setStatus({ kind: 'err', text: `保存失败：${error?.message ?? error}` }))
-                .finally(() => setSaving(false))
-            }
-          }),
-          '启用这台机器的远程控制'
-        ])
-      )
+      for (const spec of booleanSpecs()) {
+        const checked = spec.defaultOn === true ? value[spec.field] !== false : value[spec.field] === true
+        children.push(
+          react.createElement('label', { key: spec.field, className: 'rc-check' }, [
+            react.createElement('input', {
+              key: 'cb',
+              type: 'checkbox',
+              checked,
+              disabled: !writable,
+              onChange: (event) => {
+                if (!writable) return
+                setSaving(true)
+                setStatus(undefined)
+                void setField(spec.field, event.target.checked)
+                  .then(() => setStatus({ kind: 'ok', text: event.target.checked ? spec.on : spec.off }))
+                  .catch((error) => setStatus({ kind: 'err', text: `保存失败：${error?.message ?? error}` }))
+                  .finally(() => setSaving(false))
+              }
+            }),
+            spec.label
+          ])
+        )
+      }
 
       children.push(
         react.createElement('div', { key: 'actions', className: 'rc-row' }, [

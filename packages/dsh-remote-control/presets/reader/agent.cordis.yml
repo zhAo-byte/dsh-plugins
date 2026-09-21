@@ -1,0 +1,189 @@
+# 只读代码分析（reader）—— 收窄版 agent preset。
+#
+# 从内置 standard 预设裁剪而来：留下"看代码"需要的手脚（读文件、检索、技能、提问、
+# 待办），摘掉一切能改东西的东西（write / edit，Shell，子代理，工作流）。
+# 目的不是省 token，是限定这个身份的权限面。
+#
+# ★ 权限边界的诚实说明（三层，强度不同，别把软的说成硬的）：
+#
+#   硬的一层 A —— 白名单 guard（fail-closed，由 ./readonly-tools.mjs 注册）。
+#     在 preset 的 standing scope 上挂一个 guard：**凡是不在只读白名单里的调用名，
+#     一律拒掉**，不看它是谁注册的。这条是真正的边界 —— 因为"不挂"并不等于"没有"：
+#       · tool-fs 是**一套四个工具**（read / read_image / write / edit），官方没有
+#         "只挂 read"的开关（它的 Config 只有 readLimit 之类的读上限）；
+#       · 更要紧的是 **host 层会有工具注册进 global 层**，而 global 层的工具
+#         每个 agent 都继承。本机就有现成的例子：`dsh-codex-bridge/mcp`
+#         （inject: ['tools']）把 Codex 的 MCP 服务器工具注册进 ctx.tools，
+#         settings.yaml 记着 mcpServers: 2 —— 那些 `mcp__<server>__<tool>`
+#         对一个只读 preset 来说是没见过的能力面。
+#     所以只读必须靠**白名单收口**，而不是靠"我没挂那一行"。
+#
+#   硬的一层 B —— 目录收口（让模型看不见，别去试）。
+#     在**每个 agent 自己的 scope** 上 restrict({allow: 白名单})。
+#     为什么必须在 agent 层而不是 preset 层（这是读过 dsh-tools 的 view/guard
+#     实现、并用真实 ToolRuntime 实测过的，不是拍的）：
+#       · view() 有一条「自己的层豁免」——restriction 只过滤**继承来的**工具，
+#         自己层注册的不受自己层 restriction 约束。preset 的 standing scope 正是
+#         注册 read/write 的那个层，在里面 restrict 无效；而且 restrict() 的
+#         known-name 校验只认继承来的名字，会当场抛 `names unknown global tool`。
+#         → 实测：preset 层 restrict 被拒，agent 层 restrict 生效。
+#       · guard 没有这条豁免：guardReason() 走 global + 整条 scope 链，
+#         preset 层注册的 guard 对链上每个 agent 都生效 → 一次注册、永久兜底。
+#     两层合起来的效果：目录里看不见，就算被点名也执行不了。
+#     （guard 是硬边界，restrict 只是目录干净；restrict 失败只降级为警告。）
+#
+#   软的一层 —— persona 的行为约定。它管的是"别绕路"（例如别要求用户代跑命令），
+#     不是"改不了"；改不了是上面两层给的。**别把 persona 当权限边界。**
+#
+#   ★ 顺手把"只读"和"沙箱 read-only"分清楚：本 preset 不依赖沙箱模式。
+#     沙箱模式是**会话级**设置（GUI 可切、settings 可存），preset 改不了它，
+#     所以"只读"不能建在它上面。反过来，本 preset 在 workspace-write 下也照样只读
+#     —— 因为白名单里根本没有能写的能力。
+#
+#   ★ 这个 preset 里没有 bash，是刻意的：Shell 是唯一"绕过工具面写盘"的通道
+#     （重定向、sed -i、git checkout……）。没有 Shell，"不能修改"才是硬性质，
+#     而不是一句承诺。代价是：跑不了 git log / git diff / 编译 / 测试。
+#     想要"只读 Shell"的话，加 tool-bash 那一行**并且**把它加进 readonly-tools.mjs
+#     的白名单才行（只加行会被 guard 拒掉）；但那时写边界就退回 persona + 沙箱模式。
+#
+#   ★ 建议的会话权限：无所谓。给它 workspace-write + 审批关闭最省事：
+#     白名单里没有写能力，越界写入不会被触发，审批也不会弹。
+#
+# 本文件是 AGENT-PLANE 组合：注册表本体、沙箱与审批栈、模型路由、持久化都在
+# host 组合（base + web）里。publish service 的行必须待在带 isolate realm 的组里，
+# 否则第二个会话挂载同一 preset 时会撞名，roster 会直接拒绝挂载。
+
+# ── 身份 ────────────────────────────────────────────────────────────────────
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    prefix: |-
+      你是一个只读的代码分析员。你的职责是读代码、找证据、讲清楚，然后给结论 —— 你改不了任何文件，也不应该试图去改。
+
+      ── 能力边界（硬的，不是约定）──────────────────────────────────────
+
+      - 你手里的工具只有这几个：read、read_image、glob、grep、skill、
+        ask_user_question、todo_write。**其余一律被拒** —— 包括 write / edit、
+        包括 bash / Shell，也包括部署里可能接进来的其他工具（MCP 之类）。
+      - 写文件、打补丁、跑命令、新建或删除文件一律做不到，调用会直接被拒；
+        这不是"请你不要"，是运行时拒绝。
+      - 不要试图绕过：不要要求用户"帮你把这条命令跑了"来间接达成修改，
+        也不要把改动写成脚本让用户粘贴。需要改代码时，把**改什么、为什么、
+        改在哪个文件哪一处**写清楚，交给有写权限的人。
+      - 结论直接写在回复里 —— 你写不了报告文件。
+
+      ── 怎么分析（先证据，后结论）──────────────────────────────────────
+
+      - 先定位再精读：用 glob / grep 找入口和引用，再用 read 读原文，
+        不要凭文件名猜内容。
+      - 讲行为必须带调用链：谁调用谁、参数从哪来、状态存在哪、失败怎么走，
+        逐层写清楚，并给出 `文件:行` 定位。
+      - **严格标注证据强度**：✅ 读到的原文 / ⚠️ 推断（写清依据）/ ❓ 没查到。
+        找不到就写找不到，**绝不编造函数名、字段名、行号或调用关系**。
+      - 一个结论一个证据。不确定的部分单独列出来，不要混进结论里当事实。
+      - 读大文件时用 read 的分页（offset / limit）一小段一小段读，
+        不要指望一次读完；需要全局视野时先用 grep 缩小范围。
+
+      ── 只做什么 ─────────────────────────────────────────────────────
+
+      - 只读分析：代码理解与走读、调用链追踪、缺陷与回归判断、影响面分析、
+        方案与设计的评审、给改动提要求。
+      - 用户要你**动手改**的时候，说明你的权限边界，然后把改动方案交付出去：
+        改哪个文件、改成什么、为什么、怎么验证。
+
+      ── 压缩时的保留要求 ───────────────────────────────────────────────
+
+      - 必须保留：分析目标的文件与行号、读到的关键代码片段、调用链与数据流结论、
+        证据强度标注（哪几条是 ✅、哪几条只是 ⚠️）、未解项、用户问的问题。
+      - 可以丢弃：读过的无关文件内容、被推翻的猜测、检索过程的中间输出。
+      - 判据：压缩之后另一个模型必须能**接着把结论讲完**，而不需要重读一遍代码。
+    suffix: Your working directory is {{cwd}}.
+
+# AGENTS.md 一类的项目说明文件，按 host 默认方式加载。
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── 文件系统：读的能力 ──────────────────────────────────────────────────────
+#
+# ⚠️ 这一行挂上的是 **read + read_image + write + edit 四个工具**，官方没有
+# 「只挂 read」的配置项。所以下面紧跟一行 readonly-tools，用白名单把能写的那两个
+# 挡在外面 —— 删掉那一行，这个 preset 就不再只读了。
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+# 只读白名单：guard（硬闸，拒掉一切不在清单里的调用）+ 目录收口。
+# 机制、依据与实测见文件顶部「硬的一层 A / B」，实现见 ./readonly-tools.mjs。
+- id: readonly-tools
+  name: ./readonly-tools.mjs
+
+# 检索（glob / grep）—— 只读，原样保留。
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── 随身的操作手册 ──────────────────────────────────────────────────────────
+#
+# customSkillDirs 指向 preset 自己的 skills/ 目录，手册跟着 preset 一起走：
+# 复制或迁移这个 preset 时手册不会被落下。baseUrl 是组合文件所在的目录。
+# host 层的全局技能目录（~/.codex/skills 等）照常合并进目录，不受影响。
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+  config:
+    customSkillDirs:
+      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── 上下文压缩 ──────────────────────────────────────────────────────────────
+#
+# 读代码和大文件很容易把上下文撑满，这一组必须保留。compaction-basic 通过
+# ctx.get 读 toolResultPruner，所以两者要待在同一个 realm 里；tokenMeter 故意
+# 不放进来，它留在 host 层。
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── 剩余模型可见行 ──────────────────────────────────────────────────────────
+
+# 分析目标不明确时问用户，而不是猜。
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+# 多文件的分析任务步骤多，需要进度表。只记在会话里，不落盘。
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# ── 刻意没有挂的行（这就是「别的不许碰」） ──────────────────────────────────
+#
+#   tool-bash / tool-pwsh ......... Shell = 绕过工具面写盘的唯一通道，见文件顶部
+#   tool-jobs ..................... 没有 Shell，就没有后台任务可管
+#   tool-subagent / workflow ...... 派活会把范围扩出去，而且子 agent 是新身份
+#   tool-web ...................... 只读代码，不查网（要查再加）
+#   tool-goal / plan mode ......... 长期目标与实施计划不属于"读代码"这个身份
+#   present ....................... 交付产物会写盘
+#
+# 想再加回来任何一行，先确认它不 publish service；如果是，必须连同它的消费者
+# 一起放进带 isolate realm 的组里。

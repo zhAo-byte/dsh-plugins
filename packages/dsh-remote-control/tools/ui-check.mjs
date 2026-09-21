@@ -366,7 +366,15 @@ try {
     workspaces: [
       { name: 'deepseek', path: '/Users/dev/deepseek' },
       { name: 'notes', path: '/Users/dev/notes' }
-    ]
+    ],
+    // One machine with a visitor door open, so the guest section below drives the
+    // real page against a real roster instead of a fixture it invented.
+    guest: {
+      enabled: true,
+      agentPreset: 'reader',
+      permissionPreset: 'read-only',
+      workspaces: [{ name: 'notes', path: '/Users/dev/notes' }]
+    }
   })
 
   // Seed one answered turn so the page has real history to render on load. The
@@ -411,8 +419,24 @@ try {
     commandId: seedCommand.commandId,
     result: seededAnswer
   })
+  // The real node re-sends its whole identity on every hello, guest block included;
+  // this stand-in does the same, because a hello that omits the block now means
+  // "this machine has no door".
   keepAlive = setInterval(() => {
-    void asNode('/api/agent/hello', { nodeId: 'mac-1', name: 'Studio Mac' }).catch(() => {})
+    void asNode('/api/agent/hello', {
+      nodeId: 'mac-1',
+      name: 'Studio Mac',
+      workspaces: [
+        { name: 'deepseek', path: '/Users/dev/deepseek' },
+        { name: 'notes', path: '/Users/dev/notes' }
+      ],
+      guest: {
+        enabled: true,
+        agentPreset: 'reader',
+        permissionPreset: 'read-only',
+        workspaces: [{ name: 'notes', path: '/Users/dev/notes' }]
+      }
+    }).catch(() => {})
   }, 5_000)
 
   // ── the browser ──────────────────────────────────────────────────────────
@@ -941,6 +965,103 @@ try {
   }
   check('a transient message renders inside the viewport', toastOnScreen, String(toastBox))
 
+  // ── the visitor's door, in a real browser ────────────────────────────────
+  // The relay checks above prove the protocol; this proves the *page* a stranger
+  // actually lands on. Three things have to be true at once: nobody is asked for a
+  // password, the visitor is told which door they came in through, and the machine
+  // offers only the directories it opened to visitors.
+  {
+    const guestPage = await devtools.createPage()
+    await devtools.navigate(guestPage, `${relayUrl}/guest`)
+    const entered = await waitFor(
+      () => devtools.evaluate(guestPage, `document.body.classList.contains('booting') || document.getElementById('app').classList.contains('on')`),
+      (value) => value === true,
+      15_000
+    )
+    check('the guest page enters without being asked for anything', entered)
+    const gateShown = await devtools.evaluate(guestPage, `getComputedStyle(document.getElementById('gate')).display !== 'none'`)
+    check('no login card is left on screen for a visitor', gateShown === false, 'the gate is still visible on /guest')
+    const badge = await devtools.evaluate(guestPage, `(() => {
+      const el = document.getElementById('mode-badge');
+      return JSON.stringify({ hidden: el.hidden, text: el.textContent });
+    })()`)
+    check('the page says it is the visitor door', JSON.parse(String(badge)).text === '游客' && JSON.parse(String(badge)).hidden === false, String(badge))
+    const guestNodes = await waitFor(
+      () => devtools.evaluate(guestPage, `document.getElementById('nodes').textContent`),
+      (text) => String(text).includes('Studio Mac'),
+      15_000
+    )
+    check('the visitor sees the machine that opened a door', guestNodes)
+    const guestWorkspaces = await devtools.evaluate(guestPage, `document.getElementById('workspaces').textContent`)
+    check(
+      'the visitor is offered the guest workspace',
+      String(guestWorkspaces).includes('notes'),
+      String(guestWorkspaces)
+    )
+    check(
+      'and not the operator workspace beside it',
+      !String(guestWorkspaces).includes('deepseek'),
+      `the sidebar listed an operator-only directory: ${String(guestWorkspaces)}`
+    )
+    // Visibility, not the `hidden` property: `hidden` is only `display: none` in
+    // the UA stylesheet, so an author `display` rule (`.btn { display:inline-flex }`)
+    // silently wins. The first version of this page set the attribute and left the
+    // broadcast button on screen, which is exactly what this reads for.
+    const guestChrome = await devtools.evaluate(guestPage, `(() => {
+      const hint = document.getElementById('hint').textContent;
+      return JSON.stringify({
+        broadcastVisible: getComputedStyle(document.getElementById('broadcast')).display !== 'none',
+        readOnlyHint: hint.includes('只读'),
+        carriesOwnerSession: hint.includes('续接会话'),
+        ownerUrlVisible: getComputedStyle(document.getElementById('guest-door')).display !== 'none'
+      });
+    })()`)
+    const chrome = JSON.parse(String(guestChrome))
+    check('the visitor is not offered a broadcast button', chrome.broadcastVisible === false, String(guestChrome))
+    check('the visitor is told the agent is read-only', chrome.readOnlyHint === true, String(guestChrome))
+    check(
+      'the visitor does not inherit the operator’s stored conversation',
+      chrome.carriesOwnerSession === false,
+      `the guest page continued the operator's session id: ${String(guestChrome)}`
+    )
+    check('a visitor is not shown the operator’s door panel', chrome.ownerUrlVisible === false, String(guestChrome))
+    const guestShot = join(workdir, '07-guest.png')
+    const guestImage = await devtools.send('Page.captureScreenshot', { format: 'png' }, guestPage)
+    await writeFile(guestShot, Buffer.from(guestImage.data, 'base64'))
+
+    // A visitor arrives with a stored identity that the relay no longer knows —
+    // it expired, or the relay restarted — which is the ordinary case rather than
+    // an error case. The page must quietly mint a new one instead of showing the
+    // visitor a credential failure for something they never had.
+    const stalePage = await devtools.createPage()
+    await devtools.send(
+      'Page.addScriptToEvaluateOnNewDocument',
+      { source: `localStorage.setItem('dsh-remote-control-guest-token', 'a-token-the-relay-forgot');` },
+      stalePage
+    )
+    await devtools.navigate(stalePage, `${relayUrl}/guest`)
+    const recovered = await waitFor(
+      () => devtools.evaluate(stalePage, `document.getElementById('app').classList.contains('on')`),
+      (value) => value === true,
+      15_000
+    )
+    check('a stale visitor identity is replaced rather than reported as an error', recovered)
+    const recoveryError = await devtools.evaluate(stalePage, `document.getElementById('gate-err').textContent`)
+    check('and no error is left on screen for it', String(recoveryError) === '', String(recoveryError))
+
+    // The operator's own page is where the door is discoverable, so the link has
+    // to be there and has to point at the mount point this page was served from.
+    const ownerLink = await devtools.evaluate(
+      sessionId,
+      `(() => {
+        const box = document.getElementById('guest-door');
+        return JSON.stringify({ hidden: box.hidden, url: document.getElementById('guest-door-url').textContent });
+      })()`
+    )
+    const link = JSON.parse(String(ownerLink))
+    check('the operator page offers the visitor link', link.hidden === false && link.url.endsWith('/guest'), String(ownerLink))
+  }
+
   // ── the production mount: the same page behind a stripped prefix ─────────
   // This is the case that matters in deployment and the one a root-mounted test
   // cannot see. nginx serves the page at `/harness/` but passes `/` to the relay
@@ -1016,7 +1137,7 @@ try {
   proxy.closeAllConnections?.()
 
   process.stdout.write(`\nui-check: ${String(checks - failures)}/${String(checks)} passed\n`)
-  process.stdout.write(`ui-check: screenshots ${workdir}/0{1,2,3,4,5,6}-*.png\n`)
+  process.stdout.write(`ui-check: screenshots ${workdir}/0{1,2,3,4,5,6,7}-*.png\n`)
 } catch (error) {
   failures += 1
   process.stdout.write(`\nui-check: harness error — ${error?.stack ?? error}\n`)

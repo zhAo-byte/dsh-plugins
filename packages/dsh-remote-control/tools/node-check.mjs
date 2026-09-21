@@ -20,7 +20,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { RelayAuthError, RelayClient, RelayUnreachableError, normalizeRelayUrl } from '../lib/client.js'
 import { deriveNodeId } from '../lib/config.js'
-import { normalizeWorkspaces } from '../lib/runner.js'
+import { RemoteRunner, callerOf, normalizeWorkspaces } from '../lib/runner.js'
 
 let failures = 0
 let checks = 0
@@ -304,6 +304,200 @@ try {
       'an unrelated string is not a sentinel, and does not silently become one',
       resolveConfig({ ...base, workspaces: 'nonsense' }).registryMode === false
     )
+  }
+
+  // ── the guest door's configuration ───────────────────────────────────────
+  // The guest keys are security-relevant switches, so their *defaults* are
+  // asserted rather than assumed: a door that opens because a field was merely
+  // present is the failure this block exists to catch.
+  {
+    const { resolveConfig } = await import('../lib/config.js')
+    const base = { relayUrl: 'http://h', nodeToken: 't' }
+    const off = resolveConfig(base)
+    check('the guest door is closed by default', off.guest.enabled === false)
+    check('the guest agent defaults to the bundled read-only one', off.guest.agentPreset === 'reader', off.guest.agentPreset)
+    check('the guest permission defaults to read-only', off.guest.permissionPreset === 'read-only', off.guest.permissionPreset)
+    check('the guest prompt cap has a default', off.guest.maxPromptChars === 8_000, String(off.guest.maxPromptChars))
+    check('a closed door carries no guest workspaces', off.guest.workspaces.length === 0)
+    check('the bundled presets are installed by default', off.installBundledPresets === true)
+    check('an explicit opt-out is honoured', resolveConfig({ ...base, installBundledPresets: false }).installBundledPresets === false)
+
+    const open = resolveConfig({
+      ...base,
+      guestEnabled: true,
+      guestWorkspaces: ['/tmp/demo'],
+      guestAgentPreset: 'reader',
+      guestPermissionPreset: 'read-only',
+      guestMaxPromptChars: 500
+    })
+    check('an explicit boolean true opens the door', open.guest.enabled === true)
+    check('the guest list is carried through for normalization', open.guest.workspaces.length === 1 && open.guest.workspaces[0] === '/tmp/demo')
+    check('the guest prompt cap is honoured', open.guest.maxPromptChars === 500)
+
+    // The asymmetry with `enabled` is deliberate and worth pinning: this switch
+    // publishes an unauthenticated page, so only a real boolean opens it.
+    check(
+      'the string "true" does not open the door',
+      resolveConfig({ ...base, guestEnabled: 'true' }).guest.enabled === false
+    )
+    check('a truthy non-boolean does not open the door', resolveConfig({ ...base, guestEnabled: 1 }).guest.enabled === false)
+    check(
+      'a non-list guest workspace value falls back to none',
+      resolveConfig({ ...base, guestEnabled: true, guestWorkspaces: '/tmp' }).guest.workspaces.length === 0
+    )
+  }
+
+  // ── the guest scope is checked against the owner list ────────────────────
+  // The subset rule is the security property behind "guests can only reach what
+  // the operator already granted", and it is checkable without a Harness: it is a
+  // pure function of the resolved config plus the normalized owner list. A mistake
+  // closes the door rather than stopping the node — the operator's own remote
+  // control must not go down because of a key about guests.
+  {
+    const { prepareGuest } = await import('../lib/index.js')
+    const { resolveConfig } = await import('../lib/config.js')
+    const owner = [
+      { name: 'proj', path: '/workspace/proj' },
+      { name: 'demo', path: '/workspace/demo' }
+    ]
+    const resolvedFor = (guest) => resolveConfig({ relayUrl: 'http://h', nodeToken: 't', ...guest })
+
+    const off = prepareGuest(resolvedFor({}), owner)
+    check('a closed door needs no problem reported', off.problem === undefined && off.guest.enabled === false)
+
+    const good = prepareGuest(
+      resolvedFor({ guestEnabled: true, guestWorkspaces: [{ name: 'demo', path: '/workspace/demo' }] }),
+      owner
+    )
+    check('a guest list inside the owner list is accepted', good.problem === undefined && good.guest.enabled === true, JSON.stringify(good))
+    check('and it is normalized like the owner list is', good.guest.workspaces[0]?.path === '/workspace/demo', JSON.stringify(good.guest.workspaces))
+    const expanded = prepareGuest(resolvedFor({ guestEnabled: true, guestWorkspaces: ['~/demo'] }), [{ name: 'd', path: homedir() + '/demo' }])
+    check(
+      'a ~ path is expanded before the subset check',
+      expanded.problem === undefined && expanded.guest.workspaces[0].path === join(homedir(), 'demo'),
+      JSON.stringify(expanded)
+    )
+
+    const outside = prepareGuest(
+      resolvedFor({ guestEnabled: true, guestWorkspaces: [{ name: 'elsewhere', path: '/workspace/elsewhere' }] }),
+      owner
+    )
+    check('a guest directory the operator does not offer closes the door', outside.guest.enabled === false, JSON.stringify(outside))
+    check('and says which directory was wrong', String(outside.problem).includes('/workspace/elsewhere'), String(outside.problem))
+    check('and says the door stayed closed', String(outside.problem).includes('stays closed'), String(outside.problem))
+
+    const empty = prepareGuest(resolvedFor({ guestEnabled: true }), owner)
+    check('an open door with no directory closes rather than stopping the node', empty.guest.enabled === false, JSON.stringify(empty))
+    check('and names the key that is missing', String(empty.problem).includes('guestWorkspaces'), String(empty.problem))
+
+    const nonsense = prepareGuest(resolvedFor({ guestEnabled: true, guestWorkspaces: ['relative/dir'] }), owner)
+    check('an unusable guest path closes the door with a reason', nonsense.guest.enabled === false && typeof nonsense.problem === 'string', JSON.stringify(nonsense))
+
+    // Registry mode has no fixed owner list to compare against, so the explicit
+    // guest directories are simply carried: the runtime intersection is what keeps
+    // them inside the operator's live set.
+    const registry = prepareGuest(
+      resolveConfig({ relayUrl: 'http://h', nodeToken: 't', workspaces: 'registry', guestEnabled: true, guestWorkspaces: ['/workspace/anything'] }),
+      []
+    )
+    check('registry mode carries the explicit guest list without a subset check', registry.problem === undefined && registry.guest.enabled === true, JSON.stringify(registry))
+  }
+
+  // ── who a relay command is from, and what each caller may do ─────────────
+  // The runner is the half that has to refuse a guest turn even when the relay
+  // asks for it, so the caller boundary is checked here as a pure function plus a
+  // runner that never touches the Harness (only its workspace resolution does).
+  {
+    check('a command without a role is the operator’s', callerOf({}).role === 'owner', JSON.stringify(callerOf({})))
+    check('an explicit owner role stays the operator’s', callerOf({ role: 'owner' }).role === 'owner')
+    check('a guest role is carried with its principal', callerOf({ role: 'guest', principal: 'g-1' }).principal === 'g-1')
+    check('a guest command with no principal resolves empty, to be refused', callerOf({ role: 'guest' }).principal === '')
+    check('a blank principal is trimmed away', callerOf({ role: 'guest', principal: '   ' }).principal === '')
+    check('an unknown role is treated as the operator’s', callerOf({ role: 'root' }).role === 'owner')
+
+    const runnerFor = (guest) =>
+      new RemoteRunner({
+        ctx: {},
+        config: {
+          nodeId: 'n',
+          workspaces: [
+            { name: 'proj', path: '/workspace/proj' },
+            { name: 'notes', path: '/workspace/notes' },
+            { name: 'secret', path: '/workspace/secret' }
+          ],
+          agentPreset: 'standard',
+          permissionPreset: 'workspace-write',
+          guest
+        },
+        logger: {}
+      })
+
+    const closed = runnerFor({ enabled: false, workspaces: [{ name: 'proj', path: '/workspace/proj' }] })
+    check('a closed node offers no guest workspaces', closed.guestWorkspaces().length === 0)
+    check(
+      'and refuses a guest turn even if one arrives',
+      (await closed.run({ commandId: 'c', workspace: '/workspace/proj', prompt: 'hi', role: 'guest', principal: 'g' })).error ===
+        'this node does not accept guest turns'
+    )
+
+    const openRunner = runnerFor({
+      enabled: true,
+      workspaces: [
+        { name: 'proj', path: '/workspace/proj' },
+        { name: 'gone', path: '/workspace/gone' }
+      ],
+      agentPreset: 'reader',
+      permissionPreset: 'read-only',
+      maxPromptChars: 10
+    })
+    check(
+      'only guest workspaces the operator still offers are advertised',
+      openRunner.guestWorkspaces().length === 1 && openRunner.guestWorkspaces()[0].path === '/workspace/proj',
+      JSON.stringify(openRunner.guestWorkspaces())
+    )
+    check('a guest path resolves for a guest', openRunner.resolveWorkspace('/workspace/proj', 'guest') === '/workspace/proj')
+    check(
+      'an operator-only path does not resolve for a guest',
+      (() => {
+        try {
+          openRunner.resolveWorkspace('/workspace/notes', 'guest')
+          return false
+        } catch (error) {
+          // The refusal may name the path the guest asked for and the paths it was
+          // offered — but never the operator's other directories, which would make
+          // a rejected guess into a directory listing.
+          return error.message.includes('not offered to guests') && !error.message.includes('/workspace/secret')
+        }
+      })()
+    )
+    check('the same path still resolves for the operator', openRunner.resolveWorkspace('/workspace/notes', 'owner') === '/workspace/notes')
+    const guestPosture = openRunner.postureFor({ role: 'guest', principal: 'g-1' })
+    check(
+      'a guest posture carries the guest preset, permission and principal',
+      guestPosture.agentPreset === 'reader' && guestPosture.permissionPreset === 'read-only' && guestPosture.principal === 'g-1',
+      JSON.stringify(guestPosture)
+    )
+    const ownerPosture = openRunner.postureFor({ role: 'owner', principal: 'owner' })
+    check(
+      'an operator posture carries the configured preset and permission',
+      ownerPosture.agentPreset === 'standard' && ownerPosture.permissionPreset === 'workspace-write',
+      JSON.stringify(ownerPosture)
+    )
+    const tooLong = await openRunner.run({
+      commandId: 'c2',
+      workspace: '/workspace/proj',
+      prompt: 'x'.repeat(11),
+      role: 'guest',
+      principal: 'g-1'
+    })
+    check('an over-long guest question is refused by the node too', String(tooLong.error).includes('longer than'), JSON.stringify(tooLong))
+    const noPrincipal = await openRunner.run({
+      commandId: 'c3',
+      workspace: '/workspace/proj',
+      prompt: 'hi',
+      role: 'guest'
+    })
+    check('a guest turn without a principal is refused', String(noPrincipal.error).includes('visitor'), JSON.stringify(noPrincipal))
   }
 
   // ── the client against the fake relay ────────────────────────────────────

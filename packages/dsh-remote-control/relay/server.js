@@ -84,7 +84,30 @@ const config = {
    */
   questionTimeoutMs: numberFromEnv('DSH_REMOTE_QUESTION_TIMEOUT_MS', 330_000),
   /** Set when a TLS-terminating proxy supplies the public origin, for logs. */
-  publicOrigin: process.env.DSH_REMOTE_PUBLIC_ORIGIN ?? ''
+  publicOrigin: process.env.DSH_REMOTE_PUBLIC_ORIGIN ?? '',
+  /**
+   * The master switch for the guest door.
+   *
+   * On unless explicitly turned off, because the door only exists for nodes that
+   * advertise one: with `guestEnabled: false` on every node (the default there),
+   * `/guest` lists nothing and every guest route is a 403. Keeping the relay's own
+   * switch default-on means enabling guests is one node-side setting rather than
+   * a coordinated change to a server the operator may not administer; turning it
+   * off here is the kill switch that needs no node cooperation at all.
+   */
+  guestEnabled: process.env.DSH_REMOTE_GUEST !== 'off',
+  /** Longest guest question the relay forwards. The node caps it again. */
+  guestMaxPromptChars: numberFromEnv('DSH_REMOTE_GUEST_MAX_PROMPT', 8_000),
+  /** How long an unused anonymous guest identity stays valid. */
+  guestTokenTtlMs: numberFromEnv('DSH_REMOTE_GUEST_TOKEN_TTL_MS', 12 * 60 * 60 * 1000),
+  /** Cap on live guest identities, so an open door cannot grow without bound. */
+  guestMaxVisitors: numberFromEnv('DSH_REMOTE_GUEST_MAX_VISITORS', 64),
+  /** Commands one visitor may have waiting on one node, in flight or queued. */
+  guestMaxOutstanding: numberFromEnv('DSH_REMOTE_GUEST_MAX_OUTSTANDING', 2),
+  /** Guest entries a single node's queue may hold, across all visitors. */
+  guestMaxQueue: numberFromEnv('DSH_REMOTE_GUEST_MAX_QUEUE', 4),
+  /** How many guest identities one address may mint per hour. */
+  guestEntersPerHour: numberFromEnv('DSH_REMOTE_GUEST_ENTERS_PER_HOUR', 20)
 }
 
 // ── state ──────────────────────────────────────────────────────────────────
@@ -107,6 +130,17 @@ class NodeRecord {
     this.platform = ''
     this.version = ''
     this.workspaces = []
+    /**
+     * The guest door this node advertises.
+     *
+     * Kept separate from `workspaces` rather than merged into it, because the two
+     * lists answer different questions and only one of them may be shown to a
+     * visitor. `enabled: false` is the default, so a node that never mentions
+     * guests is closed rather than implicitly open.
+     *
+     * @type {{ enabled: boolean, workspaces: Array<{name: string, path: string}>, agentPreset: string, permissionPreset: string }}
+     */
+    this.guest = { enabled: false, workspaces: [], agentPreset: '', permissionPreset: '' }
     this.status = 'idle'
     this.detail = ''
     this.lastSeenAt = Date.now()
@@ -124,8 +158,51 @@ class NodeRecord {
 
 /** @type {Map<string, NodeRecord>} */
 const nodes = new Map()
-/** @type {Map<string, {nodeId: string, commandId: string}>} */
+/**
+ * Commands a node has picked up or is about to.
+ *
+ * The record carries the caller as well as the node, because that is what decides
+ * who may read the outcome and who may answer the question a turn asks. It is the
+ * relay's own record of what *it* submitted, so a node's report cannot promote a
+ * guest command into an operator one.
+ *
+ * @type {Map<string, {nodeId: string, commandId: string, role: 'owner'|'guest', guestId: string}>}
+ */
 const inFlight = new Map()
+/**
+ * Anonymous visitor identities, keyed by the opaque token the page holds.
+ *
+ * A visitor gets an identity without presenting anything, which is the point of
+ * the feature — but "no password" must not mean "no identity": without one, every
+ * visitor would share one conversation view, could answer another visitor's
+ * question, and could continue another visitor's session. The identity is minted
+ * by the relay, never by the node, and it is what the node records on the session
+ * it creates.
+ *
+ * @type {Map<string, {guestId: string, createdAt: number, lastSeenAt: number}>}
+ */
+const guestTokens = new Map()
+/**
+ * Sessions a visitor created: `guestId -> sessionId -> nodeId`.
+ *
+ * The relay's own copy of the node's session ledger. The node refuses a session
+ * it did not create, so this is not the security boundary — it is what turns
+ * "wrong session" into a 403 the page can explain instead of a failed turn.
+ *
+ * @type {Map<string, Map<string, string>>}
+ */
+const guestSessions = new Map()
+/**
+ * Guest identities minted per client address, in the last hour.
+ *
+ * `/api/guest/enter` is the one route with no credential at all, so it is the one
+ * route worth rate-limiting: without this, a script could mint unbounded
+ * identities, and every identity is a conversation the machine may be asked to
+ * run.
+ *
+ * @type {Map<string, number[]>}
+ */
+const guestEnters = new Map()
 /**
  * Questions a node is holding open, keyed by `nodeId` then `questionId`.
  *
@@ -138,7 +215,15 @@ const inFlight = new Map()
  * @type {Map<string, Map<string, {questionId: string, nodeId: string, questions: Array<object>, commandId: string, workspace: string, at: number, deliver: (outcome: object) => void, res: import('node:http').ServerResponse, timer: NodeJS.Timeout, settled: boolean, ended: boolean}>>}
  */
 const openQuestions = new Map()
-/** @type {Set<import('node:http').ServerResponse>} browser event-stream subscribers */
+/**
+ * Browser event-stream subscribers, each with the view it is entitled to.
+ *
+ * A record rather than the bare response, because the roster is now projected per
+ * audience: the same event means different things to the operator and to a
+ * visitor, so the subscriber has to carry who it is.
+ *
+ * @type {Set<{ res: import('node:http').ServerResponse, viewer: { role: string, guestId: string } }>}
+ */
 const subscribers = new Set()
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -219,14 +304,39 @@ async function readJsonBody(req, limit = 1_048_576) {
   }
 }
 
+/** The operator's view: everything the relay knows. */
+const OWNER_VIEW = Object.freeze({ role: 'owner', guestId: '' })
+
 /**
- * Public projection of a node: what the control page is allowed to know.
+ * Public projection of a node, for one kind of viewer.
+ *
+ * Two projections rather than one, because the two audiences must not be able to
+ * read each other's facts. A guest sees the guest door's directories and nothing
+ * else of this machine: not the operator's workspace list, not its platform and
+ * version, and not a `detail` line — that field carries a slice of whatever turn
+ * is running, which for the operator's turn is the operator's own prompt text.
  *
  * @param {NodeRecord} node - stored record.
+ * @param {{ role: string, guestId: string }} [viewer] - who is reading.
  * @returns {object} page-facing shape.
  */
-function publicNode(node) {
+function publicNode(node, viewer = OWNER_VIEW) {
   const online = Date.now() - node.lastSeenAt <= config.offlineAfterMs
+  if (viewer.role === 'guest') {
+    return {
+      nodeId: node.nodeId,
+      name: node.name,
+      guest: true,
+      workspaces: node.guest.workspaces,
+      status: node.status,
+      detail: guestDetail(node, viewer),
+      online,
+      lastSeenAt: node.lastSeenAt,
+      connectedAt: node.connectedAt,
+      queued: node.queue.filter((command) => command.guestId === viewer.guestId).length,
+      questions: pendingQuestionsOf(node.nodeId, viewer)
+    }
+  }
   return {
     nodeId: node.nodeId,
     name: node.name,
@@ -242,26 +352,102 @@ function publicNode(node) {
     // Pending questions ride the roster rather than the transcript because they
     // are live state: a page that loads mid-turn has to see the open card, and a
     // transcript is a record of what already happened.
-    questions: pendingQuestionsOf(node.nodeId)
+    questions: pendingQuestionsOf(node.nodeId, viewer),
+    // The door's state, for the operator only: it is their exposure, and their page
+    // is where the link to it is offered.
+    guest: {
+      enabled: node.guest.enabled,
+      agentPreset: node.guest.agentPreset,
+      permissionPreset: node.guest.permissionPreset,
+      workspaces: node.guest.workspaces
+    }
   }
+}
+
+/**
+ * What a guest may be told about a node's current activity.
+ *
+ * Never the operator's `detail` string: it is a 70-character slice of a running
+ * prompt, so forwarding it would put the operator's own words on a public page.
+ * A guest learns whether the machine is busy and whether the busy turn is theirs,
+ * which is what the page actually needs to explain a wait.
+ *
+ * @param {NodeRecord} node - stored record.
+ * @param {{ role: string, guestId: string }} viewer - the reading visitor.
+ * @returns {string} a guest-safe status line.
+ */
+function guestDetail(node, viewer) {
+  if (node.status !== 'busy') return ''
+  const mine = [...inFlight.values()].some((record) => record.nodeId === node.nodeId && record.guestId === viewer.guestId)
+  return mine ? '正在运行你的提问' : '正在运行其他会话'
+}
+
+/**
+ * The nodes one viewer may see at all.
+ *
+ * A node with the door shut is not listed to a guest, rather than listed with an
+ * empty directory list: "this machine exists but you may do nothing here" is a
+ * fact about somebody else's machine, and there is no use the page has for it.
+ *
+ * @param {{ role: string, guestId: string }} viewer - who is reading.
+ * @returns {NodeRecord[]} the visible records.
+ */
+function visibleNodes(viewer) {
+  const all = [...nodes.values()]
+  if (viewer.role !== 'guest') return all
+  return all.filter((node) => node.guest.enabled && node.guest.workspaces.length > 0)
 }
 
 /**
  * The public projection of one node's pending questions.
  *
  * @param {string} nodeId - owning node.
+ * @param {{ role: string, guestId: string }} [viewer] - who is reading.
  * @returns {Array<object>} questions the page may render and answer.
  */
-function pendingQuestionsOf(nodeId) {
+function pendingQuestionsOf(nodeId, viewer = OWNER_VIEW) {
   const held = openQuestions.get(nodeId)
   if (held === undefined) return []
-  return [...held.values()].map((entry) => ({
-    questionId: entry.questionId,
-    commandId: entry.commandId,
-    workspace: entry.workspace,
-    at: entry.at,
-    questions: entry.questions
-  }))
+  return [...held.values()]
+    .filter((entry) => viewer.role !== 'guest' || entry.guestId === viewer.guestId)
+    .map((entry) => ({
+      questionId: entry.questionId,
+      commandId: entry.commandId,
+      workspace: entry.workspace,
+      at: entry.at,
+      questions: entry.questions
+    }))
+}
+
+/**
+ * Whether one viewer may see one transcript line.
+ *
+ * Ownership is the whole test, and it is one-way: the operator sees everything
+ * (it is their machine and the audit trail of the public door lives here), while a
+ * visitor sees exactly the turns their own identity issued.
+ *
+ * @param {object} entry - transcript entry.
+ * @param {{ role: string, guestId: string }} viewer - who is reading.
+ * @returns {boolean} true when the entry is visible.
+ */
+function visibleEntry(entry, viewer) {
+  return viewer.role !== 'guest' || (entry.guestId !== undefined && entry.guestId === viewer.guestId)
+}
+
+/**
+ * Write one event-stream frame to one subscriber, per that subscriber's view.
+ *
+ * Filtering happens per subscriber rather than per broadcast because the two
+ * audiences are subscribed to the same roster: a single filtered payload for
+ * everybody is exactly the bug this shape prevents.
+ *
+ * @param {{ res: import('node:http').ServerResponse, viewer: object }} subscriber - the subscriber.
+ * @param {object} payload - the event object.
+ */
+function writeTo(subscriber, payload) {
+  const { res } = subscriber
+  if (res.writableEnded) return
+  res.write(`data: ${JSON.stringify(payload)}\n\n`)
 }
 
 /**
@@ -273,15 +459,16 @@ function pendingQuestionsOf(nodeId) {
  * @param {string} nodeId - owning node.
  */
 function broadcastQuestions(nodeId) {
-  const payload = JSON.stringify({ type: 'questions', nodeId, questions: pendingQuestionsOf(nodeId) })
-  for (const res of subscribers) res.write(`data: ${payload}\n\n`)
+  for (const subscriber of subscribers) {
+    writeTo(subscriber, { type: 'questions', nodeId, questions: pendingQuestionsOf(nodeId, subscriber.viewer) })
+  }
   broadcastRoster()
 }
-/** Notify every browser subscriber with the current roster. */
+
+/** Notify every browser subscriber with the roster as that subscriber may see it. */
 function broadcastRoster() {
-  const payload = JSON.stringify({ type: 'roster', nodes: [...nodes.values()].map(publicNode) })
-  for (const res of subscribers) {
-    res.write(`data: ${payload}\n\n`)
+  for (const subscriber of subscribers) {
+    writeTo(subscriber, { type: 'roster', nodes: visibleNodes(subscriber.viewer).map((node) => publicNode(node, subscriber.viewer)) })
   }
 }
 
@@ -289,7 +476,7 @@ function broadcastRoster() {
  * Append one transcript line and fan it out to browsers.
  *
  * @param {NodeRecord} node - owning node.
- * @param {object} entry - transcript entry without `at` or `seq`.
+ * @param {object} entry - transcript entry without `at` or `seq`; carries `role` and, for a guest, `guestId`.
  */
 function appendTranscript(node, entry) {
   const record = { seq: (node.transcriptSeq += 1), at: Date.now(), nodeId: node.nodeId, ...entry }
@@ -297,8 +484,10 @@ function appendTranscript(node, entry) {
   if (node.transcript.length > config.transcriptLimit) {
     node.transcript.splice(0, node.transcript.length - config.transcriptLimit)
   }
-  const payload = JSON.stringify({ type: 'transcript', entry: record })
-  for (const res of subscribers) res.write(`data: ${payload}\n\n`)
+  for (const subscriber of subscribers) {
+    if (!visibleEntry(record, subscriber.viewer)) continue
+    writeTo(subscriber, { type: 'transcript', entry: record })
+  }
 }
 
 /**
@@ -323,7 +512,11 @@ function deliverOrQueue(node, command) {
 /**
  * `POST /api/agent/hello` — register or refresh a node's advertised facts.
  *
- * @param {object} body - `{ nodeId, name?, platform?, version?, workspaces? }`.
+ * The `guest` block is always applied, including when it says `enabled: false`: a
+ * node that was reconfigured has to be able to close a door this relay still
+ * remembers, and "the field was absent" must not leave a stale door open.
+ *
+ * @param {object} body - `{ nodeId, name?, platform?, version?, workspaces?, guest? }`.
  * @returns {object} accepted identity.
  */
 function agentHello(body) {
@@ -346,9 +539,32 @@ function agentHello(body) {
       }))
       .filter((entry) => entry.path !== '')
   }
+  // The block is applied on every hello, and an absent block means *closed* rather
+  // than "leave whatever was there". The node this relay is written for always sends
+  // the block, so the only caller this changes is one that does not — an older
+  // node, or a hand-written client — and for those the safe reading of "said nothing
+  // about guests" is "has no door". The alternative would let a door outlive the
+  // process that opened it.
+  const guest = body.guest !== null && typeof body.guest === 'object' ? body.guest : {}
+  node.guest = {
+    enabled: guest.enabled === true,
+    // The guest list is filtered against the operator's own list here as well as
+    // on the node. A node is the authority on its directories, but the relay is
+    // the one that hands a name to a visitor, so it refuses to hold a name the
+    // same node never advertised to the operator at all.
+    workspaces: (Array.isArray(guest.workspaces) ? guest.workspaces : [])
+      .filter((entry) => entry !== null && typeof entry === 'object')
+      .map((entry) => ({
+        name: typeof entry.name === 'string' ? entry.name : '',
+        path: typeof entry.path === 'string' ? entry.path : ''
+      }))
+      .filter((entry) => entry.path !== '' && node.workspaces.some((owner) => owner.path === entry.path)),
+    agentPreset: typeof guest.agentPreset === 'string' ? guest.agentPreset : '',
+    permissionPreset: typeof guest.permissionPreset === 'string' ? guest.permissionPreset : ''
+  }
   node.lastSeenAt = Date.now()
   broadcastRoster()
-  return { nodeId: node.nodeId, name: node.name, pollHoldMs: config.pollHoldMs }
+  return { nodeId: node.nodeId, name: node.name, pollHoldMs: config.pollHoldMs, guest: node.guest.enabled }
 }
 
 /**
@@ -406,10 +622,19 @@ function agentReport(body) {
   }
   const commandId = typeof body.commandId === 'string' ? body.commandId : undefined
   if (commandId !== undefined) {
+    // The caller is read from the relay's own record of the submission, not from
+    // the node's report: a node (or a compromised node) must not be able to
+    // relabel a guest turn as the operator's, which would publish it to the wrong
+    // audience.
+    const caller = inFlight.get(commandId)
     inFlight.delete(commandId)
     const result = body.result !== null && typeof body.result === 'object' ? body.result : {}
+    const role = caller?.role ?? 'owner'
+    const guestId = caller?.guestId ?? ''
     appendTranscript(node, {
       kind: result.ok === true ? 'answer' : 'error',
+      role,
+      guestId,
       commandId,
       prompt: typeof result.prompt === 'string' ? result.prompt : '',
       workspace: typeof result.workspace === 'string' ? result.workspace : '',
@@ -418,6 +643,13 @@ function agentReport(body) {
       error: typeof result.error === 'string' ? result.error : '',
       durationMs: typeof result.durationMs === 'number' ? result.durationMs : 0
     })
+    // The relay's copy of "which sessions this visitor owns", so the next command
+    // that names one is refused before it reaches the node rather than after.
+    if (role === 'guest' && guestId !== '' && typeof result.sessionId === 'string' && result.sessionId !== '') {
+      const owned = guestSessions.get(guestId) ?? new Map()
+      owned.set(result.sessionId, node.nodeId)
+      guestSessions.set(guestId, owned)
+    }
     if (node.status !== 'idle') {
       node.status = 'idle'
       node.detail = ''
@@ -468,10 +700,16 @@ async function agentAsk(body, res) {
   const questionId = randomUUID()
   const commandId = commandFor(nodeId)
   const workspace = workspaceFor(commandId)
+  // Who asked decides who may answer. A visitor's card must not appear on another
+  // visitor's page, and an answer from a third party would stall the turn it
+  // belongs to.
+  const caller = commandId === '' ? undefined : inFlight.get(commandId)
   const entry = {
     questionId,
     commandId,
     workspace,
+    role: caller?.role ?? 'owner',
+    guestId: caller?.guestId ?? '',
     questions,
     at: Date.now(),
     res,
@@ -583,15 +821,45 @@ function requireNode(body) {
 /**
  * `GET /api/state` — full snapshot for the control page.
  *
+ * @param {URL} url - the request URL, carrying an optional `nodeId` focus.
  * @returns {object} roster plus requested transcript.
  */
 function controlState(url) {
+  return stateFor(url, OWNER_VIEW)
+}
+
+/**
+ * `GET /api/guest/state` — the same snapshot, narrowed to one visitor.
+ *
+ * @param {URL} url - the request URL, carrying an optional `nodeId` focus.
+ * @param {{ role: string, guestId: string }} viewer - the visiting identity.
+ * @returns {object} the visitor's roster and its own transcript.
+ */
+function guestState(url, viewer) {
+  return stateFor(url, viewer)
+}
+
+/**
+ * Build one page snapshot for one audience.
+ *
+ * Shared by both entry points so the two can never disagree about what a
+ * transcript is: the only difference is the viewer, and every projection below it
+ * is keyed on that.
+ *
+ * @param {URL} url - the request URL.
+ * @param {{ role: string, guestId: string }} viewer - who is reading.
+ * @returns {object} the snapshot.
+ */
+function stateFor(url, viewer) {
   const focus = url.searchParams.get('nodeId')
+  const focused = focus === null ? undefined : nodes.get(focus)
+  const transcript = focused === undefined ? [] : focused.transcript.filter((entry) => visibleEntry(entry, viewer))
   return {
-    nodes: [...nodes.values()].map(publicNode),
-    transcript: focus === null ? [] : (nodes.get(focus)?.transcript ?? []),
+    nodes: visibleNodes(viewer).map((node) => publicNode(node, viewer)),
+    transcript,
     pollHoldMs: config.pollHoldMs,
-    offlineAfterMs: config.offlineAfterMs
+    offlineAfterMs: config.offlineAfterMs,
+    guest: { enabled: config.guestEnabled, mode: viewer.role === 'guest' ? 'guest' : 'owner' }
   }
 }
 
@@ -604,6 +872,64 @@ function controlState(url) {
 function controlCommand(body) {
   const node = nodes.get(typeof body.nodeId === 'string' ? body.nodeId : '')
   if (node === undefined) throw new HttpError(404, 'that nodeId is not registered')
+  return submitCommand(node, body, OWNER_VIEW)
+}
+
+/**
+ * `POST /api/guest/command` — submit one question as a visitor.
+ *
+ * The refusals here are the door's shape: the node must have opened the door, the
+ * directory must be one of the directories it opened, the question must fit the
+ * cap, and the visitor must not already have work waiting. The node refuses all of
+ * the same things again on arrival — this half exists so the page can explain the
+ * refusal, and so an abusive visitor is stopped before the node is asked at all.
+ *
+ * @param {object} body - `{ nodeId, workspace, prompt, sessionId? }`.
+ * @param {{ role: string, guestId: string }} viewer - the visiting identity.
+ * @returns {object} accepted command summary.
+ */
+function guestCommand(body, viewer) {
+  const node = nodes.get(typeof body.nodeId === 'string' ? body.nodeId : '')
+  if (node === undefined) throw new HttpError(404, 'that nodeId is not registered')
+  if (!node.guest.enabled) throw new HttpError(403, `node ${node.nodeId} does not offer guest access`)
+  if (Date.now() - node.lastSeenAt > config.offlineAfterMs) {
+    throw new HttpError(409, `node ${node.nodeId} is offline; the command was not queued`)
+  }
+  const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
+  if (prompt.length > config.guestMaxPromptChars) {
+    throw new HttpError(400, `a guest question may be at most ${String(config.guestMaxPromptChars)} characters`)
+  }
+  const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() !== '' ? body.sessionId.trim() : undefined
+  if (sessionId !== undefined) {
+    // Continuity is per visitor: a session this visitor did not create is refused
+    // here rather than silently starting a new conversation on the node.
+    const owned = guestSessions.get(viewer.guestId)
+    if (owned === undefined || owned.get(sessionId) !== node.nodeId) {
+      throw new HttpError(403, 'that conversation does not belong to this visitor')
+    }
+  }
+  const mine =
+    [...inFlight.values()].filter((record) => record.guestId === viewer.guestId).length +
+    node.queue.filter((command) => command.guestId === viewer.guestId).length
+  if (mine >= config.guestMaxOutstanding) {
+    throw new HttpError(429, `you already have ${String(mine)} question(s) waiting on ${node.nodeId}; wait for one to finish`)
+  }
+  const queued = node.queue.filter((command) => command.role === 'guest').length
+  if (queued >= config.guestMaxQueue) {
+    throw new HttpError(429, 'the guest queue for this machine is full; try again in a moment')
+  }
+  return submitCommand(node, body, viewer)
+}
+
+/**
+ * Admit and hand off one question, for either audience.
+ *
+ * @param {NodeRecord} node - target node.
+ * @param {object} body - `{ workspace, prompt, sessionId? }`.
+ * @param {{ role: string, guestId: string }} viewer - the caller.
+ * @returns {object} accepted command summary.
+ */
+function submitCommand(node, body, viewer) {
   if (Date.now() - node.lastSeenAt > config.offlineAfterMs) {
     throw new HttpError(409, `node ${node.nodeId} is offline; the command was not queued`)
   }
@@ -611,19 +937,43 @@ function controlCommand(body) {
   if (prompt === '') throw new HttpError(400, 'prompt must not be empty')
   const workspace = typeof body.workspace === 'string' && body.workspace.trim() !== '' ? body.workspace.trim() : undefined
   if (workspace === undefined) throw new HttpError(400, 'workspace is required')
-  const known = node.workspaces.some((entry) => entry.path === workspace)
-  if (!known) throw new HttpError(400, `workspace ${JSON.stringify(workspace)} is not advertised by ${node.nodeId}`)
+  const advertised = viewer.role === 'guest' ? node.guest.workspaces : node.workspaces
+  if (!advertised.some((entry) => entry.path === workspace)) {
+    throw new HttpError(
+      400,
+      viewer.role === 'guest'
+        ? `workspace ${JSON.stringify(workspace)} is not offered to guests by ${node.nodeId}`
+        : `workspace ${JSON.stringify(workspace)} is not advertised by ${node.nodeId}`
+    )
+  }
   const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() !== '' ? body.sessionId.trim() : undefined
   const command = {
     commandId: randomUUID(),
     kind: 'question',
     workspace,
     prompt,
+    // The node decides the posture from these two: `role` picks the workspace list
+    // and the presets, `principal` decides which sessions this caller may continue.
+    role: viewer.role,
+    principal: viewer.role === 'guest' ? viewer.guestId : 'owner',
     ...(sessionId === undefined ? {} : { sessionId }),
     issuedAt: Date.now()
   }
-  inFlight.set(command.commandId, { nodeId: node.nodeId, commandId: command.commandId })
-  appendTranscript(node, { kind: 'question', commandId: command.commandId, prompt, workspace, sessionId: sessionId ?? '' })
+  inFlight.set(command.commandId, {
+    nodeId: node.nodeId,
+    commandId: command.commandId,
+    role: viewer.role,
+    guestId: viewer.role === 'guest' ? viewer.guestId : ''
+  })
+  appendTranscript(node, {
+    kind: 'question',
+    role: viewer.role,
+    guestId: viewer.role === 'guest' ? viewer.guestId : '',
+    commandId: command.commandId,
+    prompt,
+    workspace,
+    sessionId: sessionId ?? ''
+  })
   deliverOrQueue(node, command)
   return { commandId: command.commandId, queued: node.queue.length }
 }
@@ -642,6 +992,28 @@ function controlCommand(body) {
  * @returns {object} acknowledgement naming the command the answer settled.
  */
 function controlAnswer(body) {
+  return answerQuestion(body, OWNER_VIEW)
+}
+
+/**
+ * `POST /api/guest/answer` — answer a held question as a visitor.
+ *
+ * @param {object} body - `{ nodeId, questionId, answers }`.
+ * @param {{ role: string, guestId: string }} viewer - the visiting identity.
+ * @returns {object} acknowledgement naming the command the answer settled.
+ */
+function guestAnswer(body, viewer) {
+  return answerQuestion(body, viewer)
+}
+
+/**
+ * Settle one open question from one audience.
+ *
+ * @param {object} body - `{ nodeId, questionId, answers }`.
+ * @param {{ role: string, guestId: string }} viewer - who is answering.
+ * @returns {object} acknowledgement.
+ */
+function answerQuestion(body, viewer) {
   const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : ''
   const questionId = typeof body.questionId === 'string' ? body.questionId.trim() : ''
   if (nodeId === '' || questionId === '') throw new HttpError(400, 'nodeId and questionId are required')
@@ -651,6 +1023,11 @@ function controlAnswer(body) {
   const entry = openQuestions.get(nodeId)?.get(questionId)
   if (entry === undefined) throw new HttpError(409, 'that question is no longer waiting for an answer')
   if (entry.settled) throw new HttpError(409, 'that question was already settled')
+  // Ownership before vocabulary: a visitor answering somebody else's card must be
+  // refused as a trespass rather than told whether their invented labels matched.
+  if (viewer.role === 'guest' && entry.guestId !== viewer.guestId) {
+    throw new HttpError(403, 'that question was not asked of this visitor')
+  }
   const answers = admitAnswers(body.answers, entry.questions)
   if (answers === undefined) {
     throw new HttpError(400, 'answers must match the questions that were asked, using the option labels they offered')
@@ -659,14 +1036,101 @@ function controlAnswer(body) {
   return { ok: true, questionId, commandId: entry.commandId }
 }
 
+// ── the guest door ─────────────────────────────────────────────────────────
+
+/**
+ * The client address a guest identity is metered against.
+ *
+ * Best effort, and deliberately so: behind the deployment's nginx the socket
+ * address is always the proxy, which would collapse every visitor into one
+ * bucket, so the forwarded chain is used instead. A client can put anything in
+ * that chain — which is acceptable here because this counter is a speed bump
+ * against bulk minting, not an authorization decision.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request.
+ * @returns {string} a bucket key.
+ */
+function clientAddress(req) {
+  const forwarded = req.headers['x-forwarded-for']
+  if (typeof forwarded === 'string' && forwarded.trim() !== '') return forwarded.split(',')[0].trim()
+  return req.socket.remoteAddress ?? 'unknown'
+}
+
+/** Drop guest identities that have not been used within their lifetime. */
+function sweepGuestTokens() {
+  const now = Date.now()
+  for (const [token, record] of guestTokens) {
+    if (now - record.lastSeenAt > config.guestTokenTtlMs) {
+      guestTokens.delete(token)
+      guestSessions.delete(record.guestId)
+    }
+  }
+  for (const [address, stamps] of guestEnters) {
+    const recent = stamps.filter((at) => now - at < 3_600_000)
+    if (recent.length === 0) guestEnters.delete(address)
+    else guestEnters.set(address, recent)
+  }
+}
+
+/**
+ * Resolve a presented guest token into a viewer, refreshing its liveness.
+ *
+ * @param {string|undefined} token - the token the page holds.
+ * @returns {{ role: 'guest', guestId: string }|undefined} the viewer, or undefined when unusable.
+ */
+function guestViewer(token) {
+  if (typeof token !== 'string' || token === '') return undefined
+  const record = guestTokens.get(token)
+  if (record === undefined) return undefined
+  if (Date.now() - record.lastSeenAt > config.guestTokenTtlMs) {
+    guestTokens.delete(token)
+    guestSessions.delete(record.guestId)
+    return undefined
+  }
+  record.lastSeenAt = Date.now()
+  return { role: 'guest', guestId: record.guestId }
+}
+
+/**
+ * `POST /api/guest/enter` — mint an anonymous visitor identity.
+ *
+ * This is the only route with no credential at all, which is the point of the
+ * feature and the reason it is also the only route that is metered: without a
+ * limit, a script could mint identities without bound, and every identity is a
+ * conversation this machine may be asked to run.
+ *
+ * @param {import('node:http').IncomingMessage} req - the request, for its address.
+ * @returns {object} `{ token, guestId, expiresInMs }`.
+ */
+function guestEnter(req) {
+  sweepGuestTokens()
+  const address = clientAddress(req)
+  const recent = guestEnters.get(address) ?? []
+  if (recent.length >= config.guestEntersPerHour) {
+    throw new HttpError(429, 'too many guest sessions from this address in the last hour; try again later')
+  }
+  if (guestTokens.size >= config.guestMaxVisitors) {
+    throw new HttpError(503, 'this relay is at its guest capacity; try again later')
+  }
+  recent.push(Date.now())
+  guestEnters.set(address, recent)
+  const token = randomUUID()
+  const guestId = `guest-${randomUUID().slice(0, 12)}`
+  guestTokens.set(token, { guestId, createdAt: Date.now(), lastSeenAt: Date.now() })
+  return { token, guestId, expiresInMs: config.guestTokenTtlMs }
+}
+
 /**
  * `GET /api/events` — server-sent roster and transcript updates.
  *
- * The control page is a thin client: every fact it renders arrives here.
+ * The control page is a thin client: every fact it renders arrives here. The
+ * subscriber's view is registered with the stream, because the same event means
+ * different things to the operator and to a visitor.
  *
  * @param {import('node:http').ServerResponse} res - response to hold open.
+ * @param {{ role: string, guestId: string }} [viewer] - who is subscribing.
  */
-function controlEvents(res) {
+function controlEvents(res, viewer = OWNER_VIEW) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-store',
@@ -674,8 +1138,11 @@ function controlEvents(res) {
     'x-accel-buffering': 'no'
   })
   res.write('retry: 3000\n\n')
-  res.write(`data: ${JSON.stringify({ type: 'roster', nodes: [...nodes.values()].map(publicNode) })}\n\n`)
-  subscribers.add(res)
+  const subscriber = { res, viewer }
+  res.write(
+    `data: ${JSON.stringify({ type: 'roster', nodes: visibleNodes(viewer).map((node) => publicNode(node, viewer)) })}\n\n`
+  )
+  subscribers.add(subscriber)
   const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15_000)
   res.on('close', () => {
     clearInterval(keepAlive)
@@ -749,10 +1216,13 @@ function normalizePrefix(value) {
 }
 
 /**
- * Every POST route and the method it accepts.
+ * Every route and the method it accepts.
  *
  * Routing is table-driven so that "does this path exist" and "is this the right
- * verb" stay separate answers.
+ * verb" stay separate answers. The guest routes are a separate namespace rather
+ * than a flag on the operator's routes: the two audiences are authorized by
+ * different credentials, and a URL that means "act as the operator" must not be
+ * reachable with a visitor's token even by accident.
  */
 const ROUTE_METHODS = {
   '/api/agent/hello': 'POST',
@@ -761,7 +1231,12 @@ const ROUTE_METHODS = {
   '/api/agent/ask': 'POST',
   '/api/agent/question/settled': 'POST',
   '/api/command': 'POST',
-  '/api/answer': 'POST'
+  '/api/answer': 'POST',
+  '/api/guest/enter': 'POST',
+  '/api/guest/state': 'GET',
+  '/api/guest/events': 'GET',
+  '/api/guest/command': 'POST',
+  '/api/guest/answer': 'POST'
 }
 
 const server = createServer((req, res) => {
@@ -769,14 +1244,43 @@ const server = createServer((req, res) => {
   const token = presentedToken(req, url)
 
   const run = async () => {
-    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/guest' || url.pathname === '/guest/')) {
+      // The same page file serves both audiences; it reads which one it is from
+      // its own URL and calls the matching API namespace.
       await servePage(res, req.headers['x-forwarded-prefix'])
       return
     }
 
     const isAgentRoute = url.pathname.startsWith('/api/agent/')
-    const expected = isAgentRoute ? config.agentToken : config.controlToken
-    if (token === undefined || !secretEquals(token, expected)) {
+    const isGuestRoute = url.pathname.startsWith('/api/guest/')
+
+    if (isGuestRoute && !config.guestEnabled) {
+      // The relay's kill switch, answered before any token is looked at: closing
+      // the door has to work without the cooperation of every node.
+      sendJson(res, 404, { error: 'the guest door is closed on this relay' })
+      return
+    }
+
+    /**
+     * Who is calling, decided by credential and by route namespace.
+     *
+     * `undefined` means the credential was missing or wrong, and the only route
+     * that may proceed without one is the guest entry point — that route mints the
+     * identity every other guest route requires.
+     *
+     * @type {{ role: string, guestId: string }|undefined}
+     */
+    let viewer
+    if (isAgentRoute) {
+      viewer = token !== undefined && secretEquals(token, config.agentToken) ? { role: 'agent', guestId: '' } : undefined
+    } else if (url.pathname === '/api/guest/enter') {
+      viewer = { role: 'public', guestId: '' }
+    } else if (isGuestRoute) {
+      viewer = guestViewer(token)
+    } else {
+      viewer = token !== undefined && secretEquals(token, config.controlToken) ? OWNER_VIEW : undefined
+    }
+    if (viewer === undefined) {
       sendJson(res, 401, { error: 'unauthorized' })
       return
     }
@@ -784,11 +1288,19 @@ const server = createServer((req, res) => {
     // The EventSource subscriber cannot send headers, so its token rides the
     // query string and is the only route that accepts that form.
     if (req.method === 'GET' && url.pathname === '/api/events') {
-      controlEvents(res)
+      controlEvents(res, viewer)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/state') {
       sendJson(res, 200, controlState(url))
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/guest/events') {
+      controlEvents(res, viewer)
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/api/guest/state') {
+      sendJson(res, 200, guestState(url, viewer))
       return
     }
 
@@ -804,7 +1316,12 @@ const server = createServer((req, res) => {
       sendJson(res, 405, { error: `${url.pathname} accepts ${method}` })
       return
     }
-    const body = await readJsonBody(req)
+    // The entry route is the one POST whose body is optional (the page sends
+    // none), so its read is tolerant — but it still drains the request, since a
+    // body left in the socket is a connection the next keep-alive request has to
+    // wait behind.
+    const raw = await readJsonBody(req)
+    const body = url.pathname === '/api/guest/enter' ? (raw ?? {}) : raw
     if (body === null) {
       sendJson(res, 400, { error: 'body must be a JSON object' })
       return
@@ -828,6 +1345,15 @@ const server = createServer((req, res) => {
       case '/api/answer':
         sendJson(res, 200, controlAnswer(body))
         return
+      case '/api/guest/enter':
+        sendJson(res, 200, guestEnter(req))
+        return
+      case '/api/guest/answer':
+        sendJson(res, 200, guestAnswer(body, viewer))
+        return
+      case '/api/guest/command':
+        sendJson(res, 200, guestCommand(body, viewer))
+        return
       default:
         sendJson(res, 200, controlCommand(body))
     }
@@ -842,7 +1368,7 @@ const server = createServer((req, res) => {
   })
 })
 
-/** Mark nodes offline whose last poll is older than the threshold. */
+/** Mark nodes offline whose last poll is older than the threshold, and expire guest identities. */
 const reaper = setInterval(() => {
   let changed = false
   const now = Date.now()
@@ -853,6 +1379,7 @@ const reaper = setInterval(() => {
       changed = true
     }
   }
+  sweepGuestTokens()
   if (changed) broadcastRoster()
 }, 5_000)
 reaper.unref()
@@ -860,7 +1387,8 @@ reaper.unref()
 server.listen(config.port, config.host, () => {
   process.stdout.write(
     `dsh-remote-control relay listening on http://${config.host}:${String(config.port)}` +
-      `${config.publicOrigin === '' ? '' : ` (public: ${config.publicOrigin})`}\n`
+      `${config.publicOrigin === '' ? '' : ` (public: ${config.publicOrigin})`}` +
+      `, guest door ${config.guestEnabled ? 'available' : 'closed'}\n`
   )
 })
 
@@ -881,7 +1409,7 @@ function shutdown(signal) {
     for (const entry of held.values()) entry.deliver({ questionId: entry.questionId, settled: true, reason: 'shutdown' })
     openQuestions.delete(nodeId)
   }
-  for (const res of subscribers) res.end()
+  for (const subscriber of subscribers) subscriber.res.end()
   subscribers.clear()
   server.close(() => process.exit(0))
   setTimeout(() => process.exit(0), 2_000).unref()

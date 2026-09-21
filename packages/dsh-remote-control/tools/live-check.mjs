@@ -174,13 +174,24 @@ try {
   const relayPort = relay.address().port
   const relayUrl = `http://127.0.0.1:${String(relayPort)}/relay`
 
+  // The guest door is switched on here on purpose: it is the configuration that
+  // makes the plugin install its bundled agent preset and resolve two preset names
+  // against the real Harness, and both of those are invisible in a config where
+  // the door is shut. The guest directory is a sub-directory of the operator's, so
+  // the two lists differ and the role boundary can be exercised.
+  const guestArea = join(workdir, 'guest-area')
+  await mkdir(guestArea, { recursive: true })
   await writeFile(
     join(profileDir, 'cordis.patch.yml'),
     `# Written by tools/live-check.mjs in a throwaway DSH_HOME.\n- id: remote-control\n  config:\n` +
       `    relayUrl: '${relayUrl}'\n` +
       `    nodeToken: 'live-check-node-token'\n` +
       `    displayName: 'live-check node'\n` +
-      `    workspaces:\n      - { name: livecheck, path: ${JSON.stringify(workdir)} }\n`
+      `    workspaces:\n` +
+      `      - { name: livecheck, path: ${JSON.stringify(workdir)} }\n` +
+      `      - { name: guest-area, path: ${JSON.stringify(guestArea)} }\n` +
+      `    guestEnabled: true\n` +
+      `    guestWorkspaces:\n      - { name: guest-area, path: ${JSON.stringify(guestArea)} }\n`
   )
 
   // ── the composed tree must carry the row and its config ──────────────────
@@ -241,6 +252,58 @@ try {
   check('the node advertised a platform string', typeof hello?.body?.platform === 'string' && hello.body.platform !== '')
   check('the node advertised a stable node id', /^node-[0-9a-f]{12}$/.test(String(hello?.body?.nodeId)), String(hello?.body?.nodeId))
 
+  // ── the bundled agent preset, and the two names it needs ─────────────────
+  // Guest mode's agent is not something DSH can fetch — the preset root takes a
+  // path — so the plugin writes its own snapshot into the DSH home at load. Both
+  // the file landing there and the name *resolving* are asserted, because they fail
+  // differently: a missing file is an install bug, an unresolvable name is a
+  // composition bug, and either one turns every guest turn into an opaque error on
+  // a public page.
+  const installedPreset = join(dshHome, '.agent-presets', 'reader')
+  check(
+    'the bundled agent preset is installed into the DSH home',
+    existsSync(join(installedPreset, 'agent.cordis.yml')) && existsSync(join(installedPreset, 'preset.yml')),
+    installedPreset
+  )
+  check('the installed preset carries the ownership stamp', existsSync(join(installedPreset, '.dsh-bundled-preset.json')))
+  check('the installed preset keeps its read-only gate', existsSync(join(installedPreset, 'readonly-tools.mjs')))
+  check(
+    'the audit line says the preset was installed rather than already current',
+    log.includes('agent preset "reader"'),
+    log.split('\n').filter((line) => line.includes('agent preset')).join(' | ') || 'no preset line'
+  )
+  check(
+    'the guest agent preset resolves in the real Harness',
+    !log.includes('agent preset "reader" does not resolve'),
+    log.split('\n').filter((line) => line.includes('guest agent preset')).join(' | ')
+  )
+  check(
+    'the guest permission preset resolves in the real Harness',
+    !log.includes('guest permission preset') || !log.includes('does not resolve'),
+    log.split('\n').filter((line) => line.includes('guest permission preset')).join(' | ')
+  )
+  check(
+    'the announcement states the door is open',
+    /guest on \(1 workspace\(s\)/.test(log),
+    log.split('\n').filter((line) => line.includes('workspace(s)')).join(' | ')
+  )
+  check(
+    'the open door is called out as a warning',
+    log.includes('guest mode: anyone who opens the relay') && log.includes(guestArea),
+    log.split('\n').filter((line) => line.includes('guest mode')).join(' | ') || 'no guest-mode line'
+  )
+
+  const helloGuestBlock = hello?.body?.guest
+  check('the node advertised the guest door to the relay', helloGuestBlock?.enabled === true, JSON.stringify(helloGuestBlock))
+  check(
+    'the advertised guest list is the guest one, not the operator one',
+    Array.isArray(helloGuestBlock?.workspaces) &&
+      helloGuestBlock.workspaces.length === 1 &&
+      helloGuestBlock.workspaces[0].path === guestArea,
+    JSON.stringify(helloGuestBlock?.workspaces)
+  )
+  check('the advertisement names the guest presets', helloGuestBlock?.agentPreset === 'reader' && helloGuestBlock?.permissionPreset === 'read-only', JSON.stringify(helloGuestBlock))
+
   const polled = relayState.seen.find((entry) => entry.path === '/relay/api/agent/poll')
   check('the node parked a long-poll for work', polled !== undefined)
   check('the poll reports the node idle', polled?.body?.idle === true)
@@ -282,6 +345,111 @@ try {
   )
   check('the node went busy before running', relayState.seen.some((entry) => entry.path === '/relay/api/agent/report' && entry.body?.status === 'busy'))
   check('the node returned to idle', outcome?.body?.status === 'idle')
+
+  // ── a guest turn is refused at the role boundary, without a model ────────
+  // The operator's own directory is advertised to the relay but was never opened
+  // to visitors, so a guest command naming it must die on the role check. That
+  // exercises delivery → runner entry → the caller boundary → report, through the
+  // real plugin, with no model and no credentials involved.
+  if (relayState.holding !== null) {
+    const held = relayState.holding
+    relayState.holding = null
+    held.writeHead(200, { 'content-type': 'application/json' })
+    held.end(
+      JSON.stringify({
+        command: {
+          commandId: 'live-check-cmd-2',
+          kind: 'question',
+          workspace: workdir,
+          prompt: 'the operator directory, as a visitor',
+          role: 'guest',
+          principal: 'guest-live-check'
+        }
+      })
+    )
+  }
+  const guestDeadline = Date.now() + 30_000
+  let guestOutcome
+  while (Date.now() < guestDeadline) {
+    guestOutcome = relayState.seen.find((entry) => entry.body?.result?.commandId === 'live-check-cmd-2')
+    if (guestOutcome !== undefined) break
+    await sleep(200)
+  }
+  check('a guest turn reaches the runner and is reported back', guestOutcome !== undefined)
+  check('the guest turn is refused', guestOutcome?.body?.result?.ok === false, JSON.stringify(guestOutcome?.body?.result))
+  check(
+    'the refusal is the guest boundary, not a missing model',
+    String(guestOutcome?.body?.result?.error).includes('not offered to guests'),
+    String(guestOutcome?.body?.result?.error)
+  )
+  check(
+    'the refusal does not leak the operator workspace list',
+    !String(guestOutcome?.body?.result?.error).includes('not advertised by this node'),
+    String(guestOutcome?.body?.result?.error)
+  )
+  check('the guest turn is reported as a guest turn', guestOutcome?.body?.result?.role === 'guest', JSON.stringify(guestOutcome?.body?.result?.role))
+
+  // ── a broken guest config must not take the operator down ───────────────
+  // `guestEnabled: true` with no directories is the mistake the settings card makes
+  // easiest — the two keys sit side by side and only one of them is a switch. The
+  // door must stay shut and say why, while the node the operator actually relies on
+  // keeps registering. Asserting this needs a second boot, and it is worth one: the
+  // tempting implementation (throw during `apply`) would make the whole plugin a
+  // no-op, and the symptom of that is "remote control stopped working" with the
+  // reason buried in a log nobody read.
+  {
+    await stopGuarded(backend)
+    backend = undefined
+    await writeFile(
+      join(profileDir, 'cordis.patch.yml'),
+      `# Written by tools/live-check.mjs in a throwaway DSH_HOME.\n- id: remote-control\n  config:\n` +
+        `    relayUrl: '${relayUrl}'\n` +
+        `    nodeToken: 'live-check-node-token'\n` +
+        `    displayName: 'live-check broken guest'\n` +
+        `    workspaces:\n      - { name: livecheck, path: ${JSON.stringify(workdir)} }\n` +
+        `    guestEnabled: true\n`
+    )
+    const mark = relayState.seen.length
+    const second = spawnGuarded(dsh, ['--profile', 'web', '--port', '0', '--no-open'], {
+      cwd: workdir,
+      env: { ...process.env, DSH_HOME: dshHome },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    backend = second
+    let brokenLog = ''
+    second.stdout.setEncoding('utf8')
+    second.stdout.on('data', (chunk) => {
+      brokenLog += chunk
+    })
+    second.stderr.setEncoding('utf8')
+    second.stderr.on('data', (chunk) => {
+      brokenLog += chunk
+    })
+    const brokenDeadline = Date.now() + 60_000
+    while (Date.now() < brokenDeadline && !brokenLog.includes('dsh-remote-control: node "')) {
+      if (second.exitCode !== null) break
+      await sleep(250)
+    }
+    check(
+      'the node still starts with a broken guest config',
+      brokenLog.includes('dsh-remote-control: node "'),
+      brokenLog.split('\n').filter((line) => line.includes('dsh-remote-control')).slice(0, 4).join(' | ') || 'no plugin output'
+    )
+    check(
+      'the mistake is reported at error level',
+      brokenLog.includes('the guest door stays closed: guestEnabled is true but guestWorkspaces is empty'),
+      brokenLog.split('\n').filter((line) => line.includes('guest door')).join(' | ') || 'the mistake was not reported'
+    )
+    const brokenHello = relayState.seen.slice(mark).filter((entry) => entry.path === '/relay/api/agent/hello').at(-1)
+    check('the relay is told the door is closed', brokenHello?.body?.guest?.enabled === false, JSON.stringify(brokenHello?.body?.guest))
+    check(
+      'and no guest directory is advertised',
+      Array.isArray(brokenHello?.body?.guest?.workspaces) && brokenHello.body.guest.workspaces.length === 0,
+      JSON.stringify(brokenHello?.body?.guest)
+    )
+    check('the operator announcement still happens', brokenLog.includes('guest off'), brokenLog.split('\n').filter((line) => line.includes('workspace(s)')).join(' | '))
+    check('the backend is still alive after the mistake', second.exitCode === null, `exit ${String(second.exitCode)}`)
+  }
 
   process.stdout.write(`\nlive-check: ${String(checks - failures)}/${String(checks)} passed\n`)
 } catch (error) {

@@ -62,3 +62,32 @@
     # Set false to validate the configuration and log the verdict without
     # connecting. Useful for checking a machine before pointing it at a relay.
     # enabled: true
+
+    # ── the visitor door (optional) ──────────────────────────────────────────
+    #
+    # Off by default, and it needs a real boolean `true` rather than merely being
+    # present: this switch publishes an unauthenticated page that can drive an
+    # agent on this machine. What it opens is narrow on purpose — the directories
+    # below, and a read-only agent — but the link itself is the only credential,
+    # so read section 五·五 of README.md before turning it on.
+    #
+    # guestEnabled: true
+    #
+    # The ONLY directories a guest may name. With an explicit `workspaces` list
+    # above, this must be a subset of it (checked at load); in registry mode it is
+    # intersected with the live registry on every read, so opening the registry
+    # never widens a guest's reach.
+    #
+    # guestWorkspaces:
+    #   - { name: demo, path: '~/Desktop/demo' }
+    #
+    # `reader` is the read-only analysis agent this package installs for you (see
+    # README section 八·五). It has no write tool and no Shell at all; the
+    # permission below is a second, independent layer.
+    # guestAgentPreset: reader
+    # guestPermissionPreset: read-only
+    # guestMaxPromptChars: 8000
+
+    # Write the agent presets this package ships into $DSH_HOME/.agent-presets.
+    # A directory this plugin did not install is never touched.
+    # installBundledPresets: true

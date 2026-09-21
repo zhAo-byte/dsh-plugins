@@ -30,6 +30,22 @@ EnvironmentFile=/etc/dsh-remote-relay.env
 Environment=DSH_REMOTE_RELAY_HOST=127.0.0.1
 Environment=DSH_REMOTE_RELAY_PORT=8787
 
+# The public guest door. Each node decides for itself whether it offers one (its
+# `guestEnabled` setting); this is the relay-wide kill switch, and it takes effect
+# without any machine's cooperation:
+#
+#   Environment=DSH_REMOTE_GUEST=off
+#
+# Everything else about the door already has a working default, and all of it is a
+# limit rather than a credential — there is no guest secret to configure:
+#
+#   DSH_REMOTE_GUEST_MAX_VISITORS       live anonymous identities (64)
+#   DSH_REMOTE_GUEST_MAX_OUTSTANDING    questions one visitor may have waiting (2)
+#   DSH_REMOTE_GUEST_MAX_QUEUE          guest questions one machine may queue (4)
+#   DSH_REMOTE_GUEST_MAX_PROMPT         longest guest question, in characters (8000)
+#   DSH_REMOTE_GUEST_TOKEN_TTL_MS       idle lifetime of an identity (12h)
+#   DSH_REMOTE_GUEST_ENTERS_PER_HOUR    identities one address may mint per hour (20)
+
 ExecStart=/usr/bin/node /opt/dsh-remote-control/relay/server.js
 
 Restart=on-failure

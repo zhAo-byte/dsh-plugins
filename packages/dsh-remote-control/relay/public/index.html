@@ -260,6 +260,20 @@
     backdrop-filter: blur(12px);
   }
   .head-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  /* The visitor's marker: which door this document came in through, stated where
+     the reader is looking, because the two doors have different powers. */
+  .badge {
+    flex: none; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 650;
+    color: var(--warn); background: rgba(224, 169, 74, .12); border: 1px solid rgba(224, 169, 74, .3);
+  }
+  .guest-door-body { display: flex; align-items: center; gap: 8px; padding: 2px 14px 0; }
+  .guest-door-body code {
+    flex: 1; min-width: 0; padding: 5px 8px; border-radius: 6px; font-size: 11.5px;
+    color: var(--fg-dim); background: var(--surface-3); border: 1px solid var(--line);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .guest-door-body .btn { flex: none; padding: 5px 9px; font-size: 11.5px; }
+  .guest-door-hint { padding: 6px 14px 0; font-size: 11px; line-height: 1.5; color: var(--fg-faint); }
   header .t {
     font-weight: 650; font-size: 14.5px; letter-spacing: -.01em;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -639,18 +653,31 @@
         <span>公网中转台</span>
       </span>
     </div>
-    <h1>输入控制令牌</h1>
-    <p>relay 上的 <code>DSH_REMOTE_CONTROL_TOKEN</code>。验证通过后令牌只存在这台设备的浏览器里。</p>
-    <div class="field">
-      <label for="gate-token">控制令牌</label>
-      <input id="gate-token" class="input" type="password" placeholder="control token"
-             autocomplete="current-password" spellcheck="false" autofocus>
+    <div id="gate-owner">
+      <h1>输入控制令牌</h1>
+      <p>relay 上的 <code>DSH_REMOTE_CONTROL_TOKEN</code>。验证通过后令牌只存在这台设备的浏览器里。</p>
+      <div class="field">
+        <label for="gate-token">控制令牌</label>
+        <input id="gate-token" class="input" type="password" placeholder="control token"
+               autocomplete="current-password" spellcheck="false" autofocus>
+      </div>
+    </div>
+    <!--
+      The visitor's card, shown instead of the token form on /guest. It is static
+      markup toggled by script rather than built in JS, because the gate is
+      measured while hidden (body.booting) and a card that appears only after a
+      round trip would flash.
+    -->
+    <div id="gate-guest" hidden>
+      <h1>游客模式</h1>
+      <p>这是一个<b>无需密码</b>的公开入口。你会用一台机器上的<b>只读分析 agent</b>，
+         只能访问它明确开放的工作台，改不了任何文件。</p>
     </div>
     <div class="err" id="gate-err" role="alert"></div>
     <div class="gate-actions">
-      <button class="btn btn-primary" type="submit">进入控制台</button>
+      <button class="btn btn-primary" type="submit" id="gate-submit">进入控制台</button>
     </div>
-    <div class="gate-foot">令牌缺失或不匹配时，relay 一律返回 401，页面不会泄露任何节点信息。</div>
+    <div class="gate-foot" id="gate-foot">令牌缺失或不匹配时，relay 一律返回 401，页面不会泄露任何节点信息。</div>
   </form>
 </div>
 
@@ -674,6 +701,19 @@
       <div id="nodes"></div>
       <div class="aside-label"><span>工作台</span></div>
       <div id="workspaces"></div>
+      <!--
+        The visitor's door, offered to the operator when at least one machine has
+        opened one. It is the operator's own exposure, so the link (and the fact
+        that it exists at all) belongs on their page rather than only in a README.
+      -->
+      <div id="guest-door" hidden>
+        <div class="aside-label"><span>游客入口</span></div>
+        <div class="guest-door-body">
+          <code id="guest-door-url"></code>
+          <button class="btn btn-ghost" type="button" id="guest-door-copy">复制链接</button>
+        </div>
+        <div class="guest-door-hint" id="guest-door-hint"></div>
+      </div>
     </div>
     <div class="aside-foot">
       <span class="dot" id="live-dot"></span>
@@ -688,6 +728,7 @@
         <svg class="ico" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
       </button>
       <div class="head-main">
+        <span class="badge" id="mode-badge" hidden>游客</span>
         <span class="t" id="title">未选择</span>
         <span class="s" id="subtitle"></span>
       </div>
@@ -725,13 +766,33 @@
 <script>
 'use strict'
 
-const TOKEN_KEY = 'dsh-remote-control-token'
+/**
+ * Which audience this document is.
+ *
+ * One page file serves both, because everything that renders a turn — the
+ * Markdown renderer, the tabs, the question cards, the composer — is the same
+ * work for both audiences, and a second copy would drift. What differs is which
+ * API namespace the page calls and whether it needs a credential to get in:
+ * `/guest` mints an anonymous identity, `/` demands the operator's token.
+ *
+ * Read from `location.pathname` rather than from `document.baseURI`, because the
+ * injected `<base>` is the *mount prefix* (`/harness/` under the deployment's
+ * reverse proxy) and says nothing about which door was used.
+ */
+const GUEST = /\/guest\/?$/.test(location.pathname)
+
+const TOKEN_KEY = GUEST ? 'dsh-remote-control-guest-token' : 'dsh-remote-control-token'
 // Bumped when the shape changed from `nodeId -> sessionId` to
 // `targetKey -> sessionId`. Reusing the old key would read a node-keyed map as a
 // target-keyed one, so every lookup would miss and the symptom would be "it
 // forgot my conversation" rather than anything that looks like a bug.
-const SESSION_KEY = 'dsh-remote-control-sessions-v2'
-const TARGETS_KEY = 'dsh-remote-control-targets-v1'
+// Per-audience keys, like TOKEN_KEY. The two doors are served from one origin, so
+// they share `localStorage` — and a visitor's page reading the operator's tab list
+// and session ids would try to continue conversations that are not theirs (the
+// relay refuses, but the visitor gets an error instead of an empty page). Keeping
+// them apart also means signing out of one door does not disturb the other.
+const SESSION_KEY = GUEST ? 'dsh-remote-control-guest-sessions-v1' : 'dsh-remote-control-sessions-v2'
+const TARGETS_KEY = GUEST ? 'dsh-remote-control-guest-targets-v1' : 'dsh-remote-control-targets-v1'
 const POLL_FALLBACK_MS = 10000
 
 /** Static icon markup. Never interpolated with remote data, so `innerHTML` is safe. */
@@ -812,12 +873,22 @@ const $ = (id) => document.getElementById(id)
 const API_BASE = new URL('./', document.baseURI).pathname.replace(/\/$/, '')
 
 /**
+ * The API namespace this document may call.
+ *
+ * A separate namespace per audience, not a flag on one set of routes: the guest
+ * routes are authorized by an anonymous token and can only ever name a guest
+ * workspace, so a page that was tricked into calling the operator's namespace
+ * would still be refused by the relay's own check.
+ */
+const API_ROOT = GUEST ? '/api/guest' : '/api'
+
+/**
  * Build one API URL.
- * @param {string} path - API path beginning with a slash.
+ * @param {string} path - namespace-relative path beginning with a slash, e.g. `/state`.
  * @returns {string} the resolved path.
  */
 function endpoint(path) {
-  return API_BASE + path
+  return API_BASE + API_ROOT + path
 }
 
 // ── transport ──────────────────────────────────────────────────────────────
@@ -1917,6 +1988,15 @@ function answerNode(answer) {
   const who = document.createElement('div')
   who.className = 'who'
   who.textContent = failed ? '失败' : 'DSH'
+  // On the operator's page a visitor's turn is marked as one: this log is the
+  // audit trail of a public door, and an anonymous question that looks exactly
+  // like the operator's own would hide the thing it is there to show.
+  if (answer.role === 'guest') {
+    const mark = document.createElement('span')
+    mark.className = 'badge'
+    mark.textContent = '游客'
+    who.append(' ', mark)
+  }
   const content = document.createElement('div')
   // A failure is a plain string from the relay and stays verbatim; an answer is
   // Markdown. The copy button below is handed the raw source either way, so what
@@ -2151,7 +2231,7 @@ function questionCard(entry) {
       }
     })
     try {
-      await api('/api/answer', { body: { nodeId: entry.nodeId, questionId: entry.questionId, answers } })
+      await api('/answer', { body: { nodeId: entry.nodeId, questionId: entry.questionId, answers } })
       // The card is retired by the push that follows, not by a local guess: this
       // is the same rule the composer follows, and it is what keeps a second
       // browser answering the same question from rendering two states.
@@ -2222,6 +2302,12 @@ function renderLog() {
       const q = document.createElement('div')
       q.className = 'q'
       q.textContent = group.q.prompt
+      if (group.q.role === 'guest') {
+        const mark = document.createElement('span')
+        mark.className = 'badge'
+        mark.textContent = '游客'
+        q.prepend(mark, ' ')
+      }
       turn.append(q)
     }
     for (const answer of group.answers) turn.append(answerNode(answer))
@@ -2264,12 +2350,19 @@ function renderHint() {
   if (state.targets.length > 1) parts.push({ html: `共 <code>${state.targets.length}</code> 个标签` })
   // A pending question changes what the composer is for, so the hint says which
   // of the two things the reader is looking at.
-  parts.push(
-    target !== null && questionFor(target.nodeId, target.workspace) !== null
-      ? { html: '这个目标正在等你回答上面的问题 · 也可以继续输入下一条指令' }
-      : { html: '权限 <code>workspace-write + ask</code>；回答提问不等于批准越界操作，审批仍只在本机' }
-  )
-  parts.push({ html: 'Enter 发送 · ⇧Enter 换行 · ⌘/Ctrl+Enter 广播', cls: 'hint-kbd' })
+  const asking = target !== null && questionFor(target.nodeId, target.workspace) !== null
+  if (asking) {
+    parts.push({ html: '这个目标正在等你回答上面的问题 · 也可以继续输入下一条指令' })
+  } else if (GUEST) {
+    // The visitor's posture is stated, not implied: the page is the only place a
+    // visitor is told what the machine will and will not do for them, and the
+    // agent has no write tools at all — so promising an approval flow here would
+    // be describing a channel this door does not have.
+    parts.push({ html: '游客模式：只读分析 agent，改不了任何文件；越界操作不会被批准，只会被拒绝' })
+  } else {
+    parts.push({ html: '权限 <code>workspace-write + ask</code>；回答提问不等于批准越界操作，审批仍只在本机' })
+  }
+  parts.push({ html: GUEST ? 'Enter 发送 · ⇧Enter 换行' : 'Enter 发送 · ⇧Enter 换行 · ⌘/Ctrl+Enter 广播', cls: 'hint-kbd' })
   $('hint').innerHTML = parts
     .map((part) => `<span class="hint-item${part.cls === undefined ? '' : ` ${part.cls}`}">${part.html}</span>`)
     .join('')
@@ -2313,6 +2406,7 @@ function renderHeader() {
 function renderAll() {
   renderNodes()
   renderWorkspaces()
+  renderGuestDoor()
   renderTabs()
   renderHeader()
   renderLog()
@@ -2320,6 +2414,68 @@ function renderAll() {
   $('send').disabled = activeTarget() === null
   $('broadcast').disabled = state.targets.length === 0
 }
+
+/**
+ * The public URL a visitor would open, if this deployment has one open.
+ *
+ * Derived from where the page itself is served rather than from a configured
+ * value: the relay is mounted under a prefix the page already resolved
+ * (`API_BASE`), and the guest door is the same mount point plus `/guest`. A
+ * hard-coded URL would be wrong on every deployment but the one it was written
+ * for, which is the failure this avoids.
+ *
+ * @returns {string} the absolute guest URL.
+ */
+function guestUrl() {
+  return `${location.origin}${API_BASE}/guest`
+}
+
+/**
+ * Show the operator which machines have opened a visitor door.
+ *
+ * Only for the operator, and only when a door is actually open: a guest does not
+ * need to be told about the door they are already standing in, and an operator
+ * whose machines are all closed should not be shown a link that leads nowhere.
+ */
+function renderGuestDoor() {
+  const box = $('guest-door')
+  if (box === null) return
+  if (GUEST) { setHidden(box, true); return }
+  const open = state.nodes.filter((node) => node.guest?.enabled === true)
+  if (open.length === 0) { setHidden(box, true); return }
+  setHidden(box, false)
+  const url = guestUrl()
+  $('guest-door-url').textContent = url
+  $('guest-door-copy').dataset.url = url
+  const presets = [...new Set(open.map((node) => node.guest.agentPreset).filter((name) => name !== ''))]
+  $('guest-door-hint').textContent =
+    `${open.map((node) => node.name || node.nodeId).join('、')} 已开放游客入口` +
+    `（共 ${open.reduce((total, node) => total + (node.guest.workspaces?.length ?? 0), 0)} 个工作台` +
+    `${presets.length === 0 ? '' : `，agent ${presets.join('/')}`}）。任何人打开这个链接即可使用，无需密码。`
+}
+
+$('guest-door-copy').addEventListener('click', async (event) => {
+  const button = event.currentTarget
+  const url = button.dataset.url ?? ''
+  if (url === '') return
+  let ok = true
+  try {
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(url)
+    else {
+      const area = document.createElement('textarea')
+      area.value = url
+      area.setAttribute('readonly', '')
+      area.style.position = 'fixed'
+      area.style.opacity = '0'
+      document.body.append(area)
+      area.select()
+      ok = document.execCommand('copy')
+      area.remove()
+    }
+  } catch { ok = false }
+  button.textContent = ok ? '已复制' : '复制失败'
+  setTimeout(() => { button.textContent = '复制链接' }, 1500)
+})
 
 // ── selection ──────────────────────────────────────────────────────────────
 
@@ -2336,7 +2492,7 @@ async function loadTranscript(nodeId) {
   if (state.loadedNodes.has(nodeId)) return
   state.loadedNodes.add(nodeId)
   try {
-    const snap = await api(`/api/state?nodeId=${encodeURIComponent(nodeId)}`)
+    const snap = await api(`/state?nodeId=${encodeURIComponent(nodeId)}`)
     state.transcript.set(nodeId, Array.isArray(snap.transcript) ? snap.transcript : [])
     renderTabs()
     renderLog()
@@ -2430,9 +2586,12 @@ function applyTranscript(entry) {
   list.push(entry)
   list.sort((left, right) => (left.seq ?? 0) - (right.seq ?? 0))
   state.transcript.set(entry.nodeId, list)
-  if (entry.kind === 'answer' && entry.sessionId) {
+  if (entry.kind === 'answer' && entry.sessionId && entry.role !== 'guest') {
     // The session belongs to the workspace that ran it, so it is remembered
-    // against that exact target — never against the node as a whole.
+    // against that exact target — never against the node as a whole. A visitor's
+    // session is deliberately not remembered: continuing it from the operator's
+    // page would be refused by the node anyway (the caller does not match), and
+    // the composer would silently start a new conversation instead.
     state.sessions[targetKey(entry.nodeId, entry.workspace ?? '')] = entry.sessionId
     persistSessions()
   }
@@ -2445,7 +2604,7 @@ function connect() {
   if (state.source) state.source.close()
   if (typeof EventSource === 'undefined') { startPolling(); return }
   setLive('busy', '连接中…')
-  const source = new EventSource(`${endpoint('/api/events')}?token=${encodeURIComponent(state.token)}`)
+  const source = new EventSource(`${endpoint('/events')}?token=${encodeURIComponent(state.token)}`)
   state.source = source
   source.onopen = () => setLive('online', '实时同步')
   source.onmessage = (event) => {
@@ -2465,7 +2624,7 @@ function connect() {
 /** Refresh the roster and the active transcript once. */
 async function refresh() {
   try {
-    const snap = await api('/api/state' + (state.active === null ? '' : `?nodeId=${encodeURIComponent(activeTarget()?.nodeId ?? '')}`))
+    const snap = await api('/state' + (state.active === null ? '' : `?nodeId=${encodeURIComponent(activeTarget()?.nodeId ?? '')}`))
     applyRoster(snap.nodes)
     if (state.active !== null && Array.isArray(snap.transcript)) {
       const target = activeTarget()
@@ -2474,7 +2633,52 @@ async function refresh() {
         renderLog()
       }
     }
-  } catch { /* transient; the next tick retries */ }
+  } catch (error) {
+    // Transient by default; the next tick retries. The exception is a visitor whose
+    // identity went away — it expires, and the relay forgets every one of them on
+    // restart, and neither is anything the visitor did. Silently going stale is the
+    // worst answer for a page whose whole job is showing live state, so the page
+    // mints a new identity once rather than sitting there frozen.
+    if (GUEST && isAuthFailure(error)) void reenterAsGuest()
+  }
+}
+
+/**
+ * Whether a failed call means "your identity is no longer valid".
+ *
+ * Matched on the message rather than a status code because `api` is shared by both
+ * audiences and only surfaces the 401 as a message. One place, so a second caller
+ * cannot drift.
+ *
+ * @param {unknown} error - the thrown value.
+ * @returns {boolean} true when the relay rejected the identity.
+ */
+function isAuthFailure(error) {
+  return String(error?.message ?? '').includes('令牌')
+}
+
+/** Guards the recovery so a refused mint is not retried on every poll tick. */
+let guestRecoveryAttempted = false
+
+/**
+ * Mint a fresh visitor identity and reconnect, once.
+ *
+ * If the relay refuses (the door was closed while the page was open, or the address
+ * is over its mint limit), the visitor is told why instead of the page going quiet
+ * — and the attempt is not repeated, because that refusal is an answer rather than
+ * a transient failure.
+ *
+ * @returns {Promise<void>} resolves once recovery settled.
+ */
+async function reenterAsGuest() {
+  if (guestRecoveryAttempted) return
+  guestRecoveryAttempted = true
+  try {
+    await enterAsGuest(null)
+    guestRecoveryAttempted = false
+  } catch (error) {
+    toast(`游客身份需要重新领取：${error.message}`, 'err')
+  }
 }
 
 /** Polling fallback for browsers without EventSource. */
@@ -2524,7 +2728,7 @@ async function copyText(text, button) {
  */
 async function submit(target, prompt) {
   const session = state.sessions[target.key]
-  return api('/api/command', {
+  return api('/command', {
     body: {
       nodeId: target.nodeId,
       workspace: target.workspace,
@@ -2606,11 +2810,11 @@ function newChat() {
 
 /**
  * Verify a token and enter the app.
- * @param {string} token - candidate control token.
+ * @param {string} token - candidate control token, or the guest identity's token on /guest.
  */
 async function enter(token) {
   state.token = token
-  const snap = await api('/api/state')
+  const snap = await api('/state')
   try { localStorage.setItem(TOKEN_KEY, token) } catch {}
   document.body.classList.remove('booting')
   $('gate').style.display = 'none'
@@ -2619,13 +2823,103 @@ async function enter(token) {
   connect()
 }
 
+/**
+ * Mint a fresh anonymous identity and enter.
+ *
+ * The one request the page makes without a credential, which is why it is POSTed
+ * to a single route the relay meters. The body is sent explicitly rather than
+ * omitted: some proxies turn a bodyless POST into a GET.
+ *
+ * @returns {Promise<void>} resolves once the page is in the app or throws.
+ */
+async function enterGuest() {
+  const res = await fetch(API_BASE + '/api/guest/enter', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}'
+  })
+  const text = await res.text()
+  let payload = {}
+  try { payload = text === '' ? {} : JSON.parse(text) } catch { payload = { error: text } }
+  if (!res.ok) throw new Error(payload.error ?? `HTTP ${res.status}`)
+  await enter(payload.token)
+}
+
+/**
+ * Enter as a visitor, replacing a stored identity that no longer works.
+ *
+ * A guest token expires and the relay forgets it on restart, and neither is
+ * anything the visitor did — so the page mints a new one instead of showing a
+ * login error for credentials they never had. A *refusal* from the entry route
+ * (the door was closed, or this address is over its limit) is not retried: that
+ * is a real answer, and it belongs on the screen.
+ *
+ * @param {string|null} token - a stored guest token, if any.
+ * @returns {Promise<void>} resolves once the page is in the app.
+ */
+async function enterAsGuest(token) {
+  if (token !== null && token !== '') {
+    try {
+      await enter(token)
+      return
+    } catch {
+      try { localStorage.removeItem(TOKEN_KEY) } catch {}
+    }
+  }
+  await enterGuest()
+}
+
+/**
+ * Show or hide one element for real.
+ *
+ * The `hidden` attribute alone is not enough here, and this is not theoretical —
+ * the first version of the guest page used it and the broadcast button stayed on
+ * screen: `hidden` is only `display: none` in the UA stylesheet, so any author
+ * `display` rule (`.btn { display: inline-flex }`) wins over it. Setting the
+ * inline style is what the attribute was meant to do.
+ *
+ * @param {HTMLElement} element - the element to toggle.
+ * @param {boolean} hidden - whether it should be invisible.
+ */
+function setHidden(element, hidden) {
+  element.hidden = hidden
+  element.style.display = hidden ? 'none' : ''
+}
+
+/** Put the gate into the shape this document's audience needs. */
+function configureGate() {
+  if (!GUEST) return
+  setHidden($('gate-owner'), true)
+  setHidden($('gate-guest'), false)
+  $('gate-submit').textContent = '以游客身份进入'
+  $('gate-foot').textContent = '无需密码。你只会看到本机开放的游客工作台，看不到任何其他会话。'
+  // The token input is hidden, so autofocus on it would scroll a hidden field.
+  $('gate-token').removeAttribute('autofocus')
+  document.title = 'DSH Remote Control · 游客'
+  // The badge is inside the app shell, so it is revealed here rather than in a
+  // render pass that runs before the gate is dismissed.
+  setHidden($('mode-badge'), false)
+  // Broadcast is a convenience for one person driving several machines; on a
+  // public door it is only a way to fill several queues at once.
+  setHidden($('broadcast'), true)
+  $('prompt').placeholder = '向当前游客工作台提问…'
+}
+
 $('gate-form').addEventListener('submit', async (event) => {
   event.preventDefault()
+  $('gate-err').textContent = ''
+  if (GUEST) {
+    try {
+      await enterAsGuest((() => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } })())
+    } catch (error) {
+      $('gate-err').textContent = error.message
+    }
+    return
+  }
   const token = $('gate-token').value.trim()
   if (token === '') return
   const input = $('gate-token')
   input.classList.remove('bad')
-  $('gate-err').textContent = ''
   try {
     await enter(token)
   } catch (error) {
@@ -2677,10 +2971,22 @@ try {
 } catch { state.sessions = {} }
 
 restoreTargets()
+configureGate()
 renderAll()
 
 const savedToken = (() => { try { return localStorage.getItem(TOKEN_KEY) } catch { return null } })()
-if (savedToken) {
+if (GUEST) {
+  // A visitor never types anything: the identity is minted on arrival. The gate
+  // is held back until that settles so the card does not flash for the common
+  // case, and it is left on screen with the relay's own message when the door
+  // refuses (closed, or this address is over its limit).
+  document.body.classList.add('booting')
+  enterAsGuest(savedToken).catch((error) => {
+    document.body.classList.remove('booting')
+    $('gate').style.display = 'grid'
+    $('gate-err').textContent = error.message
+  })
+} else if (savedToken) {
   // Hold the gate back until the stored token has been checked, so a returning
   // visitor never sees the login card at all.
   document.body.classList.add('booting')

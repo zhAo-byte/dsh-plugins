@@ -27,6 +27,18 @@
  * only while this node is running a turn in it, so a question asked by the
  * person at the machine never gets routed to the page.
  *
+ * **Every command carries a role, and the role decides three things.** A relay
+ * command is either the operator's (`role: 'owner'`) or a visitor's
+ * (`role: 'guest'`, plus the anonymous `principal` the relay issued). The role
+ * picks the workspace allow-list, the agent preset and the permission preset,
+ * and it is recorded *on the session* — so a guest cannot name a session this
+ * node created for the operator, and a second visitor cannot continue the first
+ * visitor's conversation, even if the relay asked them to. The relay enforces
+ * the same rules from its own side; both halves check, because neither trusts
+ * the other. The refusal message for a guest names only the guest's own
+ * workspaces, so a rejected path cannot be used to enumerate the machine's
+ * directories.
+ *
  * Reply extraction follows `dsh-headless`: walk the session log from the
  * sequence captured just before the prompt, keep the last non-empty
  * `assistant/message` text, and read the `turn/end` reason. That is more robust
@@ -43,6 +55,7 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { GUEST_DEFAULTS } from './config.js'
 
 /**
  * Build the list of directories the Harness packages may resolve from.
@@ -242,6 +255,40 @@ export function turnFailure(reason) {
 }
 
 /**
+ * The session-record key for a caller: what a session belongs to.
+ *
+ * Two fields rather than one string because the two questions are different —
+ * "is this the operator or a visitor" decides the posture, and "which visitor"
+ * decides whether one guest may continue another guest's conversation. Both are
+ * compared on every reuse, so a session can only ever be driven by the exact
+ * caller that created it.
+ *
+ * @param {{ role: string, principal: string }} caller - the acting caller.
+ * @returns {string} a comparable key.
+ */
+function callerKey(caller) {
+  return `${caller.role}\u0000${caller.principal}`
+}
+
+/**
+ * Read the caller out of a relay command.
+ *
+ * Anything that is not an explicit guest command is the operator's: the node's
+ * own configuration is what the local GUI and the operator's page have always
+ * produced, and a missing `role` must keep meaning exactly that. A guest command
+ * without a principal is resolved as an empty principal and refused in
+ * `runTurn`, rather than silently collapsing every visitor into one identity.
+ *
+ * @param {object} command - the relay command envelope.
+ * @returns {{ role: 'owner'|'guest', principal: string }} the caller.
+ */
+export function callerOf(command) {
+  if (command?.role !== 'guest') return { role: 'owner', principal: 'owner' }
+  const principal = typeof command.principal === 'string' ? command.principal.trim() : ''
+  return { role: 'guest', principal }
+}
+
+/**
  * The engine that turns relay commands into Harness turns.
  *
  * One instance per node. It records which sessions this node created — that list
@@ -276,7 +323,7 @@ export class RemoteRunner {
      */
     this.questions = questions
     /**
-     * Sessions this node created: `sessionId -> { sessionId, workspacePath }`.
+     * Sessions this node created: `sessionId -> { sessionId, workspacePath, role, principal }`.
      *
      * The relay is a separate trust domain, so a `sessionId` it names is only
      * driveable while this node is the one that created it — that is what stops a
@@ -287,7 +334,11 @@ export class RemoteRunner {
      * stored session id is unknown again and its next question starts a new
      * conversation, exactly as before.
      *
-     * @type {Map<string, { sessionId: string, workspacePath: string }>}
+     * `role` and `principal` are what keep the caller boundary: a session belongs
+     * to the operator or to one visitor, and only that same caller may continue
+     * it. Both are compared by `callerKey`.
+     *
+     * @type {Map<string, { sessionId: string, workspacePath: string, role: string, principal: string }>}
      */
     this.sessions = new Map()
     /** Write handles this node currently owns, i.e. the turns in flight. */
@@ -310,24 +361,107 @@ export class RemoteRunner {
   }
 
   /**
-   * Resolve a relay-supplied workspace path against what this node advertises.
+   * The guest posture, defaulted field by field.
+   *
+   * Read through a resolver rather than straight off `this.config` because the
+   * runner is also constructed by the self-checks without a guest block, and a
+   * runner that threw on a missing field would be untestable. An absent block
+   * resolves to "the door is shut", which is also what a node that never
+   * configured guests should do.
+   *
+   * @returns {{ enabled: boolean, workspaces: Array<{name: string, path: string}>, agentPreset: string, permissionPreset: string, maxPromptChars: number }} the posture.
+   */
+  guestConfig() {
+    const raw = this.config.guest
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const entries = Array.isArray(source.workspaces) ? source.workspaces : []
+    return {
+      enabled: source.enabled === true,
+      workspaces: entries.filter((entry) => entry !== null && typeof entry === 'object' && typeof entry.path === 'string'),
+      agentPreset: typeof source.agentPreset === 'string' && source.agentPreset.trim() !== '' ? source.agentPreset.trim() : GUEST_DEFAULTS.agentPreset,
+      permissionPreset:
+        typeof source.permissionPreset === 'string' && source.permissionPreset.trim() !== ''
+          ? source.permissionPreset.trim()
+          : GUEST_DEFAULTS.permissionPreset,
+      maxPromptChars:
+        typeof source.maxPromptChars === 'number' && Number.isFinite(source.maxPromptChars) && source.maxPromptChars > 0
+          ? source.maxPromptChars
+          : GUEST_DEFAULTS.maxPromptChars
+    }
+  }
+
+  /**
+   * List the workspaces guests may use.
+   *
+   * The intersection with the operator's live list is the safety property, not a
+   * tidiness one: in registry mode the operator's set is decided by which
+   * sessions exist, so a guest path that the registry no longer carries must stop
+   * being offered the moment it does. In explicit mode the configured subset is
+   * already validated at load, and the intersection is then a no-op.
+   *
+   * @returns {Array<{ name: string, path: string }>} guest-visible workspaces.
+   */
+  guestWorkspaces() {
+    const guest = this.guestConfig()
+    if (!guest.enabled) return []
+    const owner = new Set(this.workspaces().map((entry) => entry.path))
+    return guest.workspaces.filter((entry) => owner.has(entry.path)).map((entry) => ({ name: entry.name, path: entry.path }))
+  }
+
+  /**
+   * Resolve a relay-supplied workspace path against what the caller may use.
    *
    * Refusing anything not advertised is the whole point of the allow-list: the
    * relay is a separate trust domain, so a compromised or buggy relay must not be
    * able to name `/etc` as a workspace and have the node comply.
    *
+   * The role is a parameter rather than a property because the two lists answer
+   * two different questions, and the *error message* has to differ with it: a
+   * guest told which paths exist would have been handed a directory listing of
+   * the machine, so a guest only ever learns about the paths it was already
+   * offered.
+   *
    * @param {string} requested - path from the command.
+   * @param {'owner'|'guest'} [role] - who is asking.
    * @returns {string} the advertised absolute path.
-   * @throws {Error} when the path is not advertised.
+   * @throws {Error} when the path is not offered to that caller.
    */
-  resolveWorkspace(requested) {
-    const advertised = this.workspaces()
+  resolveWorkspace(requested, role = 'owner') {
+    const advertised = role === 'guest' ? this.guestWorkspaces() : this.workspaces()
     const match = advertised.find((entry) => entry.path === requested)
     if (match === undefined) {
-      const known = advertised.map((entry) => entry.path).join(', ') || '(none configured)'
-      throw new Error(`workspace ${JSON.stringify(requested)} is not advertised by this node; known: ${known}`)
+      const known = advertised.map((entry) => entry.path).join(', ') || '(none offered)'
+      throw new Error(
+        role === 'guest'
+          ? `workspace ${JSON.stringify(requested)} is not offered to guests; offered: ${known}`
+          : `workspace ${JSON.stringify(requested)} is not advertised by this node; known: ${known}`
+      )
     }
     return match.path
+  }
+
+  /**
+   * The preset and permission a caller's turns run under.
+   *
+   * @param {{ role: 'owner'|'guest', principal: string }} caller - the acting caller.
+   * @returns {{ role: string, principal: string, agentPreset: string, permissionPreset: string }} the posture.
+   */
+  postureFor(caller) {
+    if (caller.role === 'guest') {
+      const guest = this.guestConfig()
+      return {
+        role: 'guest',
+        principal: caller.principal,
+        agentPreset: guest.agentPreset,
+        permissionPreset: guest.permissionPreset
+      }
+    }
+    return {
+      role: 'owner',
+      principal: caller.principal,
+      agentPreset: this.config.agentPreset,
+      permissionPreset: this.config.permissionPreset
+    }
   }
 
   /**
@@ -360,28 +494,62 @@ export class RemoteRunner {
    */
   async runTurn(command) {
     const started = Date.now()
+    // The caller is read before the try so that a *refused* turn still reports who
+    // it came from. The relay records the role of a failure from its own copy of
+    // the submission, and this field is what the operator's page shows beside it —
+    // a refusal that looked like the operator's own would hide a visitor probing
+    // the door.
+    const caller = callerOf(command)
     const base = {
       commandId: command.commandId,
       prompt: typeof command.prompt === 'string' ? command.prompt : '',
       workspace: typeof command.workspace === 'string' ? command.workspace : '',
-      nodeId: this.config.nodeId
+      nodeId: this.config.nodeId,
+      role: caller.role
     }
     try {
       if (this.disposed) throw new Error('this node was stopped')
       const prompt = typeof command.prompt === 'string' ? command.prompt.trim() : ''
       if (prompt === '') throw new Error('prompt is empty')
-      const workspacePath = this.resolveWorkspace(command.workspace)
+      if (caller.role === 'guest') {
+        // Three independent refusals, so a compromised relay cannot smuggle a
+        // guest turn in through a node that never opened the door, borrow the
+        // operator's posture, or use the page as an unbounded text sink.
+        const guest = this.guestConfig()
+        if (!guest.enabled) throw new Error('this node does not accept guest turns')
+        if (caller.principal === '') throw new Error('a guest turn must name the visitor it came from')
+        if (prompt.length > guest.maxPromptChars) {
+          throw new Error(`the question is longer than the ${String(guest.maxPromptChars)} characters a guest turn may carry`)
+        }
+      }
+      const posture = this.postureFor(caller)
+      const workspacePath = this.resolveWorkspace(command.workspace, caller.role)
       const existing = typeof command.sessionId === 'string' ? this.sessions.get(command.sessionId) : undefined
       // A session is created inside one workspace and cannot be moved, so a
       // `sessionId` that arrives alongside a *different* workspace starts a fresh
       // conversation. Continuing the old one would run the question in the wrong
       // directory and report success — a failure with no visible symptom. This is
       // also the trust boundary: an id this node never created is simply unknown.
-      const reusable = existing !== undefined && existing.workspacePath === workspacePath ? existing : undefined
+      //
+      // The caller has to match too, and for the same reason: a session created
+      // for one visitor must not become a second visitor's conversation, and a
+      // guest must never be able to continue the operator's. A mismatch starts a
+      // fresh conversation in the caller's own posture, which is the same safe
+      // outcome a workspace mismatch gets.
+      const reusable =
+        existing !== undefined && existing.workspacePath === workspacePath && callerKey(existing) === callerKey(caller)
+          ? existing
+          : undefined
       const outcome = reusable === undefined
-        ? await this.startConversation(workspacePath, prompt)
-        : await this.continueConversation(reusable, prompt)
-      return { ...base, ok: true, sessionId: outcome.sessionId, text: outcome.text, durationMs: Date.now() - started }
+        ? await this.startConversation(workspacePath, prompt, posture)
+        : await this.continueConversation(reusable, prompt, posture)
+      return {
+        ...base,
+        ok: true,
+        sessionId: outcome.sessionId,
+        text: outcome.text,
+        durationMs: Date.now() - started
+      }
     } catch (error) {
       return {
         ...base,
@@ -397,11 +565,12 @@ export class RemoteRunner {
    *
    * @param {string} workspacePath - advertised absolute workspace path.
    * @param {string} prompt - the question.
+   * @param {{ role: string, principal: string, agentPreset: string, permissionPreset: string }} posture - the caller's preset and permission.
    * @returns {Promise<{ sessionId: string, text: string }>} the answer.
    */
-  async startConversation(workspacePath, prompt) {
+  async startConversation(workspacePath, prompt, posture) {
     const { brandString } = await helpers()
-    const preset = await this.ctx.agentPresets.resolve(this.config.agentPreset)
+    const preset = await this.ctx.agentPresets.resolve(posture.agentPreset)
     await this.ctx.agentPresets.standingKeyFor(preset.id)
     const workspace = await this.ctx.workspaceRegistry.create(workspacePath)
     const sessionId = brandString(`remote-${randomUUID()}`)
@@ -430,9 +599,11 @@ export class RemoteRunner {
     try {
       await workspace.attachSession(sessionId)
       attached = true
-      this.applyPermission(handle.agent, this.config.permissionPreset)
-      this.title(handle.agent, prompt)
-      this.sessions.set(sessionId, { sessionId, workspacePath: workspace.path })
+      this.applyPermission(handle.agent, posture.permissionPreset)
+      this.title(handle.agent, prompt, posture.role)
+      // The posture is recorded with the session, not looked up later: it is what
+      // decides whether a later `sessionId` may continue this conversation at all.
+      this.sessions.set(sessionId, { sessionId, workspacePath: workspace.path, role: posture.role, principal: posture.principal })
     } catch (error) {
       if (attached) await workspace.detachSession(sessionId).catch(() => {})
       await handle.dispose().catch(() => {})
@@ -456,14 +627,19 @@ export class RemoteRunner {
    *   `SessionAlreadyOwnedError`; it would be the wrong answer, because the two
    *   ends are looking at the same conversation.
    *
-   * @param {{ sessionId: string, workspacePath: string }} entry - a session this node created.
+   * @param {{ sessionId: string, workspacePath: string, role: string, principal: string }} entry - a session this node created.
    * @param {string} prompt - the follow-up question.
+   * @param {{ role: string, principal: string, agentPreset: string, permissionPreset: string }} posture - the caller's preset and permission.
    * @returns {Promise<{ sessionId: string, text: string }>} the answer.
    */
-  async continueConversation(entry, prompt) {
+  async continueConversation(entry, prompt, posture) {
     const sessionId = entry.sessionId
     const live = this.ctx.agents.get(sessionId)
     if (live !== undefined) {
+      // Already-live sessions are re-pinned to the caller's posture too: the live
+      // agent may have been created by an earlier turn of the same visitor, and
+      // the permission must not be whatever a local switch left on it.
+      this.applyPermission(live, posture.permissionPreset)
       const text = await this.turn({ sessionId, agent: live, prompt })
       return { sessionId, text }
     }
@@ -472,9 +648,9 @@ export class RemoteRunner {
     // run the question in the wrong place and report success, which is the same
     // failure the workspace check in `runTurn` refuses for a relay-supplied id.
     if (stored?.cwd !== undefined && stored.cwd !== entry.workspacePath) {
-      return this.startConversation(entry.workspacePath, prompt)
+      return this.startConversation(entry.workspacePath, prompt, posture)
     }
-    const handle = await this.resumeConversation(entry, stored)
+    const handle = await this.resumeConversation(entry, stored, posture)
     const text = await this.turn({ sessionId, agent: handle.agent, prompt, handle })
     return { sessionId, text }
   }
@@ -491,12 +667,13 @@ export class RemoteRunner {
    * turn either way — the posture the page promises must not depend on what this
    * conversation was last set to locally.
    *
-   * @param {{ sessionId: string, workspacePath: string }} entry - a session this node created.
+   * @param {{ sessionId: string, workspacePath: string, role: string, principal: string }} entry - a session this node created.
    * @param {{ agentPreset?: string, cwd?: string }|undefined} stored - its stored identity, when readable.
+   * @param {{ role: string, principal: string, agentPreset: string, permissionPreset: string }} posture - the caller's preset and permission.
    * @returns {Promise<object>} the resumed AgentHandle, owned by this turn.
    */
-  async resumeConversation(entry, stored) {
-    const preset = await this.ctx.agentPresets.resolve(stored?.agentPreset ?? this.config.agentPreset)
+  async resumeConversation(entry, stored, posture) {
+    const preset = await this.ctx.agentPresets.resolve(stored?.agentPreset ?? posture.agentPreset)
     await this.ctx.agentPresets.standingKeyFor(preset.id)
     const route = this.ctx.agentDefaultModel.currentSelection()
     let handle
@@ -522,7 +699,7 @@ export class RemoteRunner {
       throw error
     }
     try {
-      this.applyPermission(handle.agent, this.config.permissionPreset)
+      this.applyPermission(handle.agent, posture.permissionPreset)
     } catch (error) {
       // A handle that is not handed back is a lock: the local GUI could not open
       // this conversation again until the backend restarted.
@@ -672,13 +849,20 @@ export class RemoteRunner {
   /**
    * Name the session after its first question so the local GUI is readable.
    *
+   * A guest session is marked as one. The local GUI is how the operator audits
+   * what the public door did — the relay page is not the only place these turns
+   * are visible — and a list of sessions where an anonymous visitor's question is
+   * indistinguishable from the operator's own would hide exactly that.
+   *
    * @param {object} agent - live Agent.
    * @param {string} prompt - the first question.
+   * @param {string} [role] - `'owner'` or `'guest'`.
    */
-  title(agent, prompt) {
+  title(agent, prompt, role = 'owner') {
     try {
       const line = prompt.replace(/\s+/g, ' ').trim().slice(0, 60)
-      this.ctx.sessionTitle?.rename?.(agent.session, line === '' ? 'remote question' : line)
+      const prefix = role === 'guest' ? '[游客] ' : ''
+      this.ctx.sessionTitle?.rename?.(agent.session, `${prefix}${line === '' ? 'remote question' : line}`)
     } catch (error) {
       this.logger?.warn?.(`dsh-remote-control: could not title session: ${error.message}`)
     }

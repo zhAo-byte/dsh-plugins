@@ -36,6 +36,24 @@
  * | `reconnectMinMs` / `reconnectMaxMs` | `2000` / `60000` | reconnect backoff bounds |
  * | `questionTimeoutMs` | `300000` | how long a remote question waits for the page before falling back to the local GUI |
  * | `enabled` | `true` | `false` validates and logs without connecting |
+ * | `installBundledPresets` | `true` | write the agent presets this package ships into the DSH home |
+ * | `guestEnabled` | `false` | open a passwordless guest door on the relay, limited to `guestWorkspaces` |
+ * | `guestWorkspaces` | `[]` | the **only** directories a guest may name; must be a subset of `workspaces` |
+ * | `guestAgentPreset` | `reader` | agent preset guest turns compose from (the bundled read-only one) |
+ * | `guestPermissionPreset` | `read-only` | pinned onto every guest session |
+ * | `guestMaxPromptChars` | `8000` | longest guest question this node will run |
+ *
+ * **The guest keys are flat, not a `guest:` block, on purpose.** The settings
+ * card in the GUI renders from `settings.describe()` and its field list is flat
+ * by construction (`client/lib/client.js`), so a nested block would be editable
+ * only by hand-editing YAML. Flat keys mean the switch and its scope are on the
+ * card the operator actually uses.
+ *
+ * **`guestEnabled` needs an explicit boolean `true`**, where `enabled` defaults
+ * to on (`source.enabled !== false`). The asymmetry is deliberate: one switch
+ * keeps a working plugin working, the other opens an unauthenticated door, and a
+ * door that opens because a field was merely *present* is the wrong default for
+ * the second kind.
  *
  * @module dsh-remote-control/config
  */
@@ -43,6 +61,24 @@
 import { createHash } from 'node:crypto'
 import { homedir, hostname } from 'node:os'
 import { isAbsolute, join } from 'node:path'
+
+/**
+ * The defaults for the guest door, in one place.
+ *
+ * The posture is the whole point of the feature, so it is stated as data rather
+ * than as literals inside the resolver: a guest runs the bundled read-only
+ * `reader` agent under the `read-only` sandbox, on a directory the operator
+ * named. Every one of those three is enforced on the node as well as on the
+ * relay — the relay is a separate trust domain, so it is allowed to *ask*
+ * narrowly, not to be the only thing asking.
+ */
+export const GUEST_DEFAULTS = Object.freeze({
+  enabled: false,
+  workspaces: Object.freeze([]),
+  agentPreset: 'reader',
+  permissionPreset: 'read-only',
+  maxPromptChars: 8_000
+})
 
 /**
  * The defaults, in one place.
@@ -60,7 +96,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   // proxy allows would be cut off there, and the node would report a relay
   // failure instead of the fallback this timeout exists to provide.
   questionTimeoutMs: 300_000,
-  enabled: true
+  enabled: true,
+  installBundledPresets: true,
+  guest: GUEST_DEFAULTS
 })
 
 /**
@@ -83,6 +121,28 @@ function stringOr(value, fallback) {
  */
 function numberOr(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+/**
+ * Resolve the flat `guest*` keys into the one object the runner consumes.
+ *
+ * The list is carried un-normalized (`normalizeWorkspaces` lives in the runner
+ * and expands `~`); what this decides is the *posture*: whether the door is
+ * open, which agent answers, and under which permission.
+ *
+ * @param {object} source - the raw configuration object.
+ * @returns {object} `{ enabled, workspaces, agentPreset, permissionPreset, maxPromptChars }`.
+ */
+function resolveGuest(source) {
+  const rawWorkspaces = source.guestWorkspaces
+  return {
+    // Strictly `true`: see the asymmetry note in the header.
+    enabled: source.guestEnabled === true,
+    workspaces: Array.isArray(rawWorkspaces) ? rawWorkspaces : [...GUEST_DEFAULTS.workspaces],
+    agentPreset: stringOr(source.guestAgentPreset, GUEST_DEFAULTS.agentPreset),
+    permissionPreset: stringOr(source.guestPermissionPreset, GUEST_DEFAULTS.permissionPreset),
+    maxPromptChars: numberOr(source.guestMaxPromptChars, GUEST_DEFAULTS.maxPromptChars)
+  }
 }
 
 /**
@@ -134,7 +194,12 @@ export function resolveConfig(raw = {}) {
     questionTimeoutMs: numberOr(source.questionTimeoutMs, DEFAULT_CONFIG.questionTimeoutMs),
     // Absent means enabled: a row that ships disabled unless you opt in would be
     // the more surprising default for a plugin you installed on purpose.
-    enabled: source.enabled !== false
+    enabled: source.enabled !== false,
+    // Absent means enabled, for the same reason: the presets are how the plugin's
+    // own guest mode works, and a plugin that needed a second manual install step
+    // to function would arrive broken.
+    installBundledPresets: source.installBundledPresets !== false,
+    guest: resolveGuest(source)
   }
 }
 

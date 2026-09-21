@@ -94,7 +94,11 @@ const child = spawnGuarded(process.execPath, [SERVER], {
     DSH_REMOTE_AGENT_TOKEN: AGENT_TOKEN,
     DSH_REMOTE_CONTROL_TOKEN: CONTROL_TOKEN,
     DSH_REMOTE_POLL_HOLD_MS: '1500',
-    DSH_REMOTE_OFFLINE_AFTER_MS: '4000'
+    DSH_REMOTE_OFFLINE_AFTER_MS: '4000',
+    // Small enough to exercise the mint limit inside one check run, and explicit
+    // so the assertion does not depend on the shipped default staying 20.
+    DSH_REMOTE_GUEST_ENTERS_PER_HOUR: '3',
+    DSH_REMOTE_GUEST_MAX_PROMPT: '200'
   },
   stdio: ['ignore', 'pipe', 'pipe']
 })
@@ -451,6 +455,425 @@ try {
     refusedWhenOffline.status === 409,
     `got ${String(refusedWhenOffline.status)}`
   )
+
+  // ── the guest door ───────────────────────────────────────────────────────
+  // The passwordless visitor's half of the protocol. Everything below is either a
+  // boundary (a guest must not reach the operator's facts or another visitor's
+  // conversation) or a limit (an open door must not be an unbounded one), and both
+  // kinds are asserted against the real relay over HTTP.
+  const OWNER_WORKSPACE = '/Users/dev/deepseek'
+  const GUEST_WORKSPACE = '/Users/dev/demo'
+  const NESTED_OTHER = '/Users/dev/notes'
+
+  // Re-register: the liveness section let this node go offline on purpose, and a
+  // command to an offline node is refused before any guest check is reached.
+  const helloGuest = () =>
+    call('/api/agent/hello', {
+      token: AGENT_TOKEN,
+      body: {
+        nodeId: 'mac-1',
+        name: 'Studio Mac',
+        platform: 'darwin 24.0.0',
+        version: 'test/0',
+        workspaces: [
+          { name: 'deepseek', path: OWNER_WORKSPACE },
+          { name: 'demo', path: GUEST_WORKSPACE },
+          { name: 'notes', path: NESTED_OTHER }
+        ],
+        guest: {
+          enabled: true,
+          agentPreset: 'reader',
+          permissionPreset: 'read-only',
+          workspaces: [
+            { name: 'demo', path: GUEST_WORKSPACE },
+            // Never advertised to the operator, so the relay must refuse to hold it
+            // for a visitor even though the node's own guest list mentions it.
+            { name: 'sneaky', path: '/Users/dev/not-advertised' }
+          ]
+        }
+      }
+    })
+  await helloGuest()
+  // A second machine with the door shut: it must be invisible to visitors.
+  await call('/api/agent/hello', {
+    token: AGENT_TOKEN,
+    body: {
+      nodeId: 'mac-2',
+      name: 'Office Box',
+      workspaces: [{ name: 'other', path: '/Users/dev/other' }],
+      guest: { enabled: false, workspaces: [] }
+    }
+  })
+
+  const guestPage = await call('/guest')
+  check('the guest page is served without a token', guestPage.status === 200 && String(guestPage.body).includes('DSH Remote Control'))
+
+  const guestStateNoToken = await call('/api/guest/state')
+  check('a guest route still needs an identity', guestStateNoToken.status === 401, `got ${String(guestStateNoToken.status)}`)
+
+  const enter = await call('/api/guest/enter', { method: 'POST', body: {} })
+  check('a visitor mints an identity', enter.status === 200 && typeof enter.body?.token === 'string', JSON.stringify(enter.body))
+  const guestToken = enter.body.token
+  check('the identity names the visitor', typeof enter.body?.guestId === 'string' && enter.body.guestId.startsWith('guest-'), String(enter.body?.guestId))
+  const second = await call('/api/guest/enter', { method: 'POST', body: {} })
+  const otherToken = second.body.token
+  const otherGuestId = second.body.guestId
+  check('a second visitor gets a different identity', otherToken !== guestToken && otherGuestId !== enter.body.guestId)
+
+  // The two trust domains stay separate in both directions.
+  check(
+    'the operator token cannot call a guest route',
+    (await call('/api/guest/state', { token: CONTROL_TOKEN })).status === 401
+  )
+  check(
+    'the agent token cannot call a guest route',
+    (await call('/api/guest/state', { token: AGENT_TOKEN })).status === 401
+  )
+  check(
+    'a guest identity cannot read the operator snapshot',
+    (await call('/api/state', { token: guestToken })).status === 401
+  )
+  check(
+    'a guest identity cannot register as a node',
+    (await call('/api/agent/hello', { token: guestToken, body: { nodeId: 'x' } })).status === 401
+  )
+
+  const guestSnap = await call('/api/guest/state', { token: guestToken })
+  const guestNodes = guestSnap.body?.nodes ?? []
+  check('a visitor sees only machines with a door', guestNodes.length === 1 && guestNodes[0]?.nodeId === 'mac-1', JSON.stringify(guestNodes.map((node) => node.nodeId)))
+  check(
+    'a visitor sees only the directories it was offered',
+    guestNodes[0]?.workspaces?.length === 1 && guestNodes[0]?.workspaces?.[0]?.path === GUEST_WORKSPACE,
+    JSON.stringify(guestNodes[0]?.workspaces)
+  )
+  check(
+    'a guest directory the operator was never offered is dropped',
+    !(guestNodes[0]?.workspaces ?? []).some((entry) => entry.path === '/Users/dev/not-advertised')
+  )
+  check(
+    'the operator workspace list is not visible to a visitor',
+    !(guestNodes[0]?.workspaces ?? []).some((entry) => entry.path === NESTED_OTHER)
+  )
+  check('a visitor is not told the platform or version', guestNodes[0]?.platform === undefined && guestNodes[0]?.version === undefined)
+  check('the visitor sees the door marked as such', guestNodes[0]?.guest === true)
+  check('the operator still sees both machines', (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.length === 2)
+  check(
+    'the operator snapshot reports the door state',
+    (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.find((node) => node.nodeId === 'mac-1')?.guest?.enabled === true
+  )
+
+  // A hello that says nothing about guests must close the door rather than leave the
+  // previous one in place: otherwise a door opened by a process that is gone stays
+  // open on the relay, which is exactly the state nobody can see.
+  await call('/api/agent/hello', {
+    token: AGENT_TOKEN,
+    body: {
+      nodeId: 'mac-1',
+      name: 'Studio Mac',
+      workspaces: [{ name: 'demo', path: GUEST_WORKSPACE }]
+    }
+  })
+  check(
+    'a hello with no guest block closes the door',
+    (await call('/api/guest/state', { token: guestToken })).body?.nodes?.length === 0,
+    JSON.stringify((await call('/api/guest/state', { token: guestToken })).body?.nodes)
+  )
+  check(
+    'and the operator still sees the machine',
+    (await call('/api/state', { token: CONTROL_TOKEN })).body?.nodes?.some((node) => node.nodeId === 'mac-1') === true
+  )
+  await helloGuest()
+
+  // ── what a guest may name ────────────────────────────────────────────────
+  const guestOutside = await call('/api/guest/command', {
+    token: guestToken,
+    body: { nodeId: 'mac-1', workspace: NESTED_OTHER, prompt: 'read this' }
+  })
+  check(
+    'a guest cannot name a directory outside its list',
+    guestOutside.status === 400,
+    `got ${String(guestOutside.status)} — an operator workspace is not a guest workspace`
+  )
+  const guestOnClosed = await call('/api/guest/command', {
+    token: guestToken,
+    body: { nodeId: 'mac-2', workspace: '/Users/dev/other', prompt: 'read this' }
+  })
+  check('a guest cannot use a machine whose door is shut', guestOnClosed.status === 403, `got ${String(guestOnClosed.status)}`)
+  const guestTooLong = await call('/api/guest/command', {
+    token: guestToken,
+    body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: 'x'.repeat(201) }
+  })
+  check('an over-long guest question is refused', guestTooLong.status === 400, `got ${String(guestTooLong.status)}`)
+
+  // ── a guest turn reaches the node as a guest turn ────────────────────────
+  const guestParked = call('/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+  await sleep(120)
+  const guestAccepted = await call('/api/guest/command', {
+    token: guestToken,
+    body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: 'review this change' }
+  })
+  check('a valid guest command is accepted', guestAccepted.status === 200, JSON.stringify(guestAccepted.body))
+  const guestDelivered = await guestParked
+  check(
+    'the node is told the turn is a guest turn',
+    guestDelivered.body?.command?.role === 'guest',
+    JSON.stringify(guestDelivered.body?.command)
+  )
+  check(
+    'the node is given the visitor the turn came from',
+    guestDelivered.body?.command?.principal === enter.body.guestId,
+    JSON.stringify(guestDelivered.body?.command?.principal)
+  )
+  check(
+    'the operator command stays the operator’s',
+    guestDelivered.body?.command?.principal !== CONTROL_TOKEN && guestDelivered.body?.command?.role !== 'owner'
+  )
+
+  const guestTranscript = (await call('/api/guest/state?nodeId=mac-1', { token: guestToken })).body?.transcript ?? []
+  check(
+    'a visitor sees its own question',
+    guestTranscript.some((entry) => entry.kind === 'question' && entry.prompt === 'review this change'),
+    JSON.stringify(guestTranscript)
+  )
+  check(
+    'and nothing the operator asked',
+    !guestTranscript.some((entry) => entry.prompt === 'summarize the repo' || entry.prompt === 'review my change'),
+    JSON.stringify(guestTranscript.map((entry) => entry.prompt))
+  )
+  const ownerTranscript = (await call('/api/state?nodeId=mac-1', { token: CONTROL_TOKEN })).body?.transcript ?? []
+  check(
+    'the operator sees the visitor’s turn, marked as one',
+    ownerTranscript.some((entry) => entry.prompt === 'review this change' && entry.role === 'guest'),
+    JSON.stringify(ownerTranscript.filter((entry) => entry.prompt === 'review this change'))
+  )
+
+  // ── visitors are isolated from each other ────────────────────────────────
+  const otherSnap = await call('/api/guest/state?nodeId=mac-1', { token: otherToken })
+  const otherTranscript = otherSnap.body?.transcript ?? []
+  check(
+    'a second visitor sees none of the first visitor’s turns',
+    !otherTranscript.some((entry) => entry.prompt === 'review this change'),
+    JSON.stringify(otherTranscript.map((entry) => entry.prompt))
+  )
+  const foreignSession = await call('/api/guest/command', {
+    token: otherToken,
+    body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: 'continue that', sessionId: 'remote-abc' }
+  })
+  check(
+    'a visitor cannot continue a session it did not create',
+    foreignSession.status === 403,
+    `got ${String(foreignSession.status)} — 'remote-abc' belongs to the operator`
+  )
+
+  // ── a question belongs to the visitor that caused it ─────────────────────
+  await call('/api/agent/report', {
+    token: AGENT_TOKEN,
+    body: {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: guestAccepted.body.commandId,
+      result: { ok: true, prompt: 'review this change', workspace: GUEST_WORKSPACE, sessionId: 'guest-session-1', text: 'no findings', durationMs: 12 }
+    }
+  })
+  const guestFollowUp = await call('/api/guest/command', {
+    token: guestToken,
+    body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: 'and the second file?', sessionId: 'guest-session-1' }
+  })
+  check(
+    'a visitor can continue the session it created',
+    guestFollowUp.status === 200,
+    `got ${String(guestFollowUp.status)} — the relay remembers the sessions it minted for this identity`
+  )
+
+  const guestAskParked = call('/api/agent/ask', {
+    token: AGENT_TOKEN,
+    body: { nodeId: 'mac-1', questions: [{ id: 'scope', question: 'which file?', options: [{ label: 'all' }] }] }
+  })
+  await sleep(150)
+  const guestPending = (await call('/api/guest/state', { token: guestToken })).body?.nodes?.find((node) => node.nodeId === 'mac-1')?.questions ?? []
+  check('the visitor sees the question from its own turn', guestPending.length === 1, JSON.stringify(guestPending))
+  check(
+    'a second visitor does not see it',
+    ((await call('/api/guest/state', { token: otherToken })).body?.nodes?.find((node) => node.nodeId === 'mac-1')?.questions ?? []).length === 0
+  )
+  const guestQuestionId = guestPending[0]?.questionId
+  const stolen = await call('/api/guest/answer', {
+    token: otherToken,
+    body: { nodeId: 'mac-1', questionId: guestQuestionId, answers: [{ id: 'scope', selected: ['all'] }] }
+  })
+  check('another visitor cannot answer it', stolen.status === 403, `got ${String(stolen.status)}`)
+  const guestAnswered = await call('/api/guest/answer', {
+    token: guestToken,
+    body: { nodeId: 'mac-1', questionId: guestQuestionId, answers: [{ id: 'scope', selected: ['all'] }] }
+  })
+  check('the visitor that was asked can answer it', guestAnswered.status === 200, JSON.stringify(guestAnswered.body))
+  check('the parked ask received that answer', (await guestAskParked).body?.answers?.[0]?.selected?.[0] === 'all')
+  await call('/api/agent/report', {
+    token: AGENT_TOKEN,
+    body: {
+      nodeId: 'mac-1',
+      status: 'idle',
+      commandId: guestFollowUp.body.commandId,
+      result: { ok: true, prompt: 'and the second file?', workspace: GUEST_WORKSPACE, sessionId: 'guest-session-1', text: 'done', durationMs: 5 }
+    }
+  })
+
+  // ── the door has limits ──────────────────────────────────────────────────
+  await helloGuest()
+  const flood = []
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    flood.push(
+      await call('/api/guest/command', {
+        token: guestToken,
+        body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: `queued ${String(attempt)}` }
+      })
+    )
+  }
+  check(
+    'one visitor cannot queue work without bound',
+    flood.some((response) => response.status === 429),
+    JSON.stringify(flood.map((response) => response.status))
+  )
+  check('and the first questions were still accepted', flood[0]?.status === 200, JSON.stringify(flood[0]?.body))
+
+  // Drain the queue so the node is not left holding commands for later sections —
+  // and *report* each one. A command that is polled off the queue but never
+  // reported keeps its in-flight record, and that record is what the outstanding
+  // budget counts: leaving them would make every later guest question look like a
+  // flood.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const drained = await call('/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+    const command = drained.body?.command
+    if (command === undefined || command === null) break
+    await call('/api/agent/report', {
+      token: AGENT_TOKEN,
+      body: {
+        nodeId: 'mac-1',
+        status: 'idle',
+        commandId: command.commandId,
+        result: { ok: true, prompt: command.prompt, workspace: command.workspace, text: 'ok', durationMs: 1 }
+      }
+    })
+  }
+
+  // ── the visitor's stream is filtered, per subscriber ─────────────────────
+  // The roster broadcast reaches both audiences from one loop, so the filter is
+  // applied per subscriber rather than per event. Getting that wrong is invisible
+  // in every request/response path above: it would only show up as the operator's
+  // work appearing on a stranger's screen.
+  {
+    await helloGuest()
+    const controller = new AbortController()
+    const stream = await fetch(
+      `${baseUrlFrom(child, port)}/api/guest/events?token=${encodeURIComponent(guestToken)}`,
+      { signal: controller.signal }
+    )
+    const reader = stream.body.getReader()
+    const decoder = new TextDecoder()
+    let frames = ''
+    await sleep(150)
+    const pump = async (ms) => {
+      const deadline = Date.now() + ms
+      while (Date.now() < deadline) {
+        const chunk = await Promise.race([
+          reader.read(),
+          sleep(Math.max(1, deadline - Date.now())).then(() => ({ value: undefined }))
+        ])
+        if (chunk.value !== undefined) frames += decoder.decode(chunk.value, { stream: true })
+      }
+    }
+    const ownerPoll = call('/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+    await sleep(120)
+    const ownerSecret = await call('/api/command', {
+      token: CONTROL_TOKEN,
+      body: { nodeId: 'mac-1', workspace: OWNER_WORKSPACE, prompt: 'operator-only-secret' }
+    })
+    await ownerPoll
+    const guestPoll = call('/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+    await sleep(120)
+    const guestMarker = await call('/api/guest/command', {
+      token: guestToken,
+      body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: 'guest-only-marker' }
+    })
+    await guestPoll
+    await pump(800)
+    controller.abort()
+    check(
+      'the visitor stream carries the visitor’s own turn',
+      frames.includes('guest-only-marker'),
+      frames.slice(-300)
+    )
+    check(
+      'and never the operator’s',
+      !frames.includes('operator-only-secret'),
+      'an operator prompt reached a visitor’s event stream'
+    )
+    // Clear both in-flight commands so the queue accounting below is unambiguous.
+    await call('/api/agent/report', { token: AGENT_TOKEN, body: { nodeId: 'mac-1', status: 'idle', commandId: ownerSecret.body.commandId, result: { ok: true, prompt: 'operator-only-secret', workspace: OWNER_WORKSPACE, text: 'ok', durationMs: 1 } } })
+    await call('/api/agent/report', { token: AGENT_TOKEN, body: { nodeId: 'mac-1', status: 'idle', commandId: guestMarker.body.commandId, result: { ok: true, prompt: 'guest-only-marker', workspace: GUEST_WORKSPACE, text: 'ok', durationMs: 1 } } })
+  }
+
+  // The mint route is the one with no credential, so it is the one worth metering.
+  const rateLimited = []
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    rateLimited.push(
+      await call('/api/guest/enter', { method: 'POST', body: {}, headers: { 'x-forwarded-for': '203.0.113.9' } })
+    )
+  }
+  check(
+    'one address cannot mint identities without bound',
+    rateLimited.at(-1)?.status === 429,
+    JSON.stringify(rateLimited.map((response) => response.status))
+  )
+  check('the earlier mints from that address were accepted', rateLimited[0]?.status === 200)
+
+  // ── the relay's kill switch ──────────────────────────────────────────────
+  // Closing the door has to work without any node's cooperation, so it is checked
+  // on a second relay process with the switch off rather than assumed.
+  {
+    const closedPort = port + 1
+    const closed = spawnGuarded(process.execPath, [SERVER], {
+      env: {
+        ...process.env,
+        DSH_REMOTE_RELAY_HOST: '127.0.0.1',
+        DSH_REMOTE_RELAY_PORT: String(closedPort),
+        DSH_REMOTE_AGENT_TOKEN: AGENT_TOKEN,
+        DSH_REMOTE_CONTROL_TOKEN: CONTROL_TOKEN,
+        DSH_REMOTE_GUEST: 'off'
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+    try {
+      await waitForListen(closed)
+      const callClosed = async (path, options = {}) => {
+        const init = { method: options.method ?? 'GET', headers: { ...(options.headers ?? {}) } }
+        if (options.token !== undefined) init.headers.authorization = `Bearer ${options.token}`
+        if (options.body !== undefined) {
+          init.method = 'POST'
+          init.headers['content-type'] = 'application/json'
+          init.body = JSON.stringify(options.body)
+        }
+        const response = await fetch(`http://127.0.0.1:${String(closedPort)}${path}`, init)
+        const text = await response.text()
+        let body
+        try {
+          body = text === '' ? undefined : JSON.parse(text)
+        } catch {
+          body = text
+        }
+        return { status: response.status, body }
+      }
+      const closedEnter = await callClosed('/api/guest/enter', { method: 'POST', body: {} })
+      check('the kill switch refuses new visitors', closedEnter.status === 404, `got ${String(closedEnter.status)}`)
+      const closedState = await callClosed('/api/guest/state', { token: guestToken })
+      check('and refuses every other guest route', closedState.status === 404, `got ${String(closedState.status)}`)
+      const stillOwner = await callClosed('/api/state', { token: CONTROL_TOKEN })
+      check('while the operator route keeps working', stillOwner.status === 200, `got ${String(stillOwner.status)}`)
+      check('and the guest page itself still loads', (await callClosed('/guest')).status === 200)
+    } finally {
+      await stopGuarded(closed)
+    }
+  }
 
   // ── the page under a reverse-proxy prefix ────────────────────────────────
   // The deployment serves this page at `/harness/` while nginx strips the prefix

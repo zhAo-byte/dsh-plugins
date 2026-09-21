@@ -78,6 +78,38 @@ export async function loadSchema() {
      */
     questionTimeoutMs: Schema.number().default(300_000),
     /** Turn the node off without uninstalling it. */
-    enabled: Schema.boolean().default(true)
+    enabled: Schema.boolean().default(true),
+    /**
+     * Write the agent presets this package ships into `$DSH_HOME/.agent-presets`.
+     *
+     * On by default because the plugin's own guest mode runs the bundled
+     * read-only `reader` agent, and a preset cannot be fetched from a package —
+     * DSH's preset root takes a path. A directory this plugin did not install is
+     * never overwritten; see `lib/presets.js`.
+     */
+    installBundledPresets: Schema.boolean().default(true),
+    /**
+     * Open the passwordless guest door on the relay.
+     *
+     * Defaults to off, and unlike `enabled` it needs an explicit `true` rather than
+     * merely being present: this switch publishes an unauthenticated page that can
+     * drive an agent on this machine, and "the field was there" is the wrong reason
+     * for a door to open.
+     */
+    guestEnabled: Schema.boolean().default(false),
+    /**
+     * The directories a guest may name — the only ones.
+     *
+     * A subset of `workspaces` when that is an explicit list (enforced at load);
+     * in registry mode this list is intersected with the live registry on every
+     * read, so a guest never inherits the registry's "anything I opened" reach.
+     */
+    guestWorkspaces: Schema.array(Schema.union([Schema.string(), Schema.object({ name: Schema.string(), path: Schema.string() })])).default([]),
+    /** Agent preset guest turns compose from. Defaults to the bundled read-only `reader`. */
+    guestAgentPreset: Schema.string().default('reader'),
+    /** Permission preset pinned onto every guest session. */
+    guestPermissionPreset: Schema.string().default('read-only'),
+    /** Longest guest question this node will run. */
+    guestMaxPromptChars: Schema.number().default(8_000)
   })
 }

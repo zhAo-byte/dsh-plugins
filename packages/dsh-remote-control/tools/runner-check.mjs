@@ -654,8 +654,116 @@ try {
       tracked.includes(String(first.sessionId)) && released.includes(String(first.sessionId)),
       JSON.stringify({ tracked, released })
     )
+    check(
+      'the shared session is re-pinned to the configured permission too',
+      ledger.permissions.at(-1)?.preset === 'workspace-write',
+      JSON.stringify(ledger.permissions)
+    )
     await runner.dispose()
     check('dispose leaves an agent this node did not create alone', live.disposed === false)
+  }
+
+  // ── a guest turn runs the guest posture, on the guest's own sessions ─────
+  // The relay already refuses a guest turn for an operator directory and a
+  // session that belongs to somebody else. This is the *node's* half of the same
+  // rules, and it is the half that matters when the relay is the thing that is
+  // wrong: the posture comes from the role, and a session records who owns it, so
+  // neither a compromised relay nor a stale session id can widen a visitor's
+  // reach or hand them somebody else's conversation.
+  {
+    const guest = {
+      enabled: true,
+      workspaces: [{ name: 'demo', path: '/workspace/demo' }],
+      agentPreset: 'reader',
+      permissionPreset: 'read-only',
+      maxPromptChars: 40
+    }
+    const { runner, ledger } = await makeRunner({
+      workspaces: [
+        { name: 'proj', path: '/workspace/proj' },
+        { name: 'demo', path: '/workspace/demo' }
+      ],
+      guest
+    })
+    /** One guest turn, from visitor `guest-a` unless told otherwise. */
+    const guestCommand = (overrides = {}) => ({
+      commandId: 'g-1',
+      workspace: '/workspace/demo',
+      prompt: 'review this file',
+      role: 'guest',
+      principal: 'guest-a',
+      ...overrides
+    })
+
+    const firstGuest = await runner.run(guestCommand())
+    check('a guest turn succeeds', firstGuest.ok === true, JSON.stringify(firstGuest))
+    check('the result names the role it ran as', firstGuest.role === 'guest', JSON.stringify(firstGuest.role))
+    check('a guest turn composes the guest preset', ledger.resolvedPresets[0] === 'reader', JSON.stringify(ledger.resolvedPresets))
+    check(
+      'a guest turn is pinned to the guest permission, not the node default',
+      ledger.permissions[0]?.preset === 'read-only',
+      JSON.stringify(ledger.permissions)
+    )
+    check(
+      'a guest session is titled as one so the local GUI shows it',
+      ledger.titles[0]?.title.startsWith('[游客] '),
+      JSON.stringify(ledger.titles[0])
+    )
+    check(
+      'the guest session records the preset so it is resumed on the same composition',
+      ledger.creates[0]?.meta?.agentPreset === 'reader',
+      JSON.stringify(ledger.creates[0]?.meta)
+    )
+
+    const sameVisitor = await runner.run(guestCommand({ commandId: 'g-2', prompt: 'and this one', sessionId: firstGuest.sessionId }))
+    check(
+      'the same visitor continues the same conversation',
+      sameVisitor.sessionId === firstGuest.sessionId && ledger.creates.length === 1,
+      JSON.stringify({ sessionId: sameVisitor.sessionId, creates: ledger.creates.length })
+    )
+    check(
+      'the follow-up re-pins the guest permission',
+      ledger.permissions.at(-1)?.preset === 'read-only',
+      JSON.stringify(ledger.permissions)
+    )
+
+    const otherVisitor = await runner.run(
+      guestCommand({ commandId: 'g-3', prompt: 'mine now', sessionId: firstGuest.sessionId, principal: 'guest-b' })
+    )
+    check(
+      'another visitor cannot continue the first visitor’s conversation',
+      otherVisitor.sessionId !== firstGuest.sessionId && ledger.creates.length === 2,
+      JSON.stringify({ sessionId: otherVisitor.sessionId, creates: ledger.creates.length })
+    )
+    check(
+      'the second visitor’s fresh conversation still uses the guest posture',
+      ledger.mountedPresets.at(-1)?.id === 'reader' && ledger.permissions.at(-1)?.preset === 'read-only',
+      JSON.stringify({ mounted: ledger.mountedPresets.at(-1)?.id, permission: ledger.permissions.at(-1)?.preset })
+    )
+
+    const asOperator = await runner.run(command({ commandId: 'o-1', sessionId: firstGuest.sessionId }))
+    check(
+      'the operator naming a guest session gets a fresh conversation, not that one',
+      asOperator.sessionId !== firstGuest.sessionId && ledger.creates.length === 3,
+      JSON.stringify({ sessionId: asOperator.sessionId, creates: ledger.creates.length })
+    )
+    check(
+      'and runs the operator preset and permission',
+      ledger.resolvedPresets.at(-1) === 'standard' && ledger.permissions.at(-1)?.preset === 'workspace-write',
+      JSON.stringify({ preset: ledger.resolvedPresets.at(-1), permission: ledger.permissions.at(-1)?.preset })
+    )
+
+    const outside = await runner.run(guestCommand({ commandId: 'g-4', workspace: '/workspace/proj' }))
+    check(
+      'a guest cannot run in an operator workspace',
+      outside.ok === false && String(outside.error).includes('not offered to guests'),
+      JSON.stringify(outside)
+    )
+    check(
+      'and the refusal does not leak the operator’s directory list',
+      outside.ok === false && !String(outside.error).includes('/workspace/proj; known'),
+      String(outside.error)
+    )
   }
 
   // ── two commands in flight cannot interleave their turns ────────────────

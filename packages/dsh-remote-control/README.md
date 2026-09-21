@@ -11,7 +11,7 @@
 | 半边 | 跑在哪 | 是什么 |
 | --- | --- | --- |
 | **node 插件** `dsh-remote-control` | 每台装了 DSH 的机器 | 向中转台登记自己（名字、平台、工作台列表），挂一条长轮询等活；拿到问题后在本地开一个**真正的 DSH 会话**跑完，把回答送回去。会话中途要是反过来问你，它也把那个提问转给页面等回答 |
-| **relay 中转台** `relay/server.js` | 一台公网可达的机器 | 在线表 + 信箱 + 一个问答页。**零依赖**，只有一个进程 |
+| **relay 中转台** `relay/server.js` | 一台公网可达的机器 | 在线表 + 信箱 + 一个问答页，外加一个可选的**游客入口**（`/guest`，无需密码、只读、范围受限）。**零依赖**，只有一个进程 |
 
 ---
 
@@ -208,6 +208,10 @@ workspaces: registry
 「一个 feature 拥有自己的设置页，加一个设置从不需要改 shell」，
 已装机的 `agent-presets` 页签就是这么来的（order 20）。
 
+> 装这个插件**不需要另外装 agent 预设**：游客模式用的只读 agent（`reader`）随插件一起打包，
+> 加载时自动写进 `$DSH_HOME/.agent-presets/reader/`；它不会覆盖你自己用手装过的那一份。
+> 见 八·五。
+
 ### 3. 配
 
 重启一次后端，然后打开 **设置 → 插件 → 插件配置**，里面会多出一张
@@ -219,9 +223,19 @@ workspaces: registry
 | 节点令牌 | 中转台 `/etc/dsh-remote-relay.env` 里的 `DSH_REMOTE_AGENT_TOKEN` |
 | 显示名称 | 给它起个名，例如 `我的 Windows 本`（留空会用主机名） |
 | 工作台 | **每行一个绝对路径**，例如 `C:/Users/me/projects` |
+| 游客工作台 | 只有这些目录对游客开放（**必须是上面工作台的子集**；留空就没得开） |
+| 游客 Agent 预设 / 游客权限预设 | 默认 `reader` + `read-only`，也就是「自带的只读分析 agent」 |
+| 游客单条提问上限 | 默认 8000 字符 |
+| 启用这台机器的远程控制 | 开关，立即生效 |
+| 开放游客入口 | 开关，立即生效；打开后中转台 `/guest` 谁都能进（见 五·五） |
+| 随插件安装自带的 agent 预设 | 默认开；关掉就得自己装 `reader` |
 
 保存后节点会用新配置重新连上中转台，**不用再重启**。改完刷新
-<https://icyu.online/harness/> 就能看到这台机器。
+<https://icyu.online/harness/> 就能看到这台机器。开了游客门的机器，操作者页面左下角会
+多出一个「游客入口」区块，带一条可复制的链接，并写明是哪些机器、哪几个工作台。
+
+> 自带 agent 预设的安装发生在**插件加载时**，所以那个开关的改动要重启一次后端才生效；
+> 其余字段都是保存即生效。
 
 > 令牌字段是密码框，**留空 = 保持原值不变**。它的值存在 `~/.dsh/settings.yaml`（`0600`），
 > 也可以直接编辑那个文件，现在这样改同样是立即生效的。
@@ -230,7 +244,9 @@ workspaces: registry
 
 ## 三、命令跑起来之后会发生什么
 
-一次远程提问的完整路径：
+一次远程提问的完整路径（操作者那条；**游客那条走的是同一段代码**，差别只有三个：
+工作台从游客列表里选、预设是 `guestAgentPreset`、权限是 `guestPermissionPreset`，
+以及会话记录里多存一个「这是谁的」——见 五·五）：
 
 ```
 页面 POST /api/command
@@ -344,8 +360,24 @@ DSH 的会话**只有一个写者**：一个打开的写句柄会用内核 flock
 | POST | `/api/command` | 提交 `{ nodeId, workspace, prompt, sessionId? }` |
 | POST | `/api/answer` | 回答 `{ nodeId, questionId, answers }`；问题已不在等待时 409 |
 
+### 游客侧（`Authorization: Bearer <匿名身份>`，路径前缀 `/api/guest`）
+
+游客路由是**单独一个命名空间**，不是「页面路由加一个开关」。两边的凭据不同、能看到的东西
+不同，而一个写着「以操作者身份行事」的 URL 不该因为拿错了 token 就变成访客可达的：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/guest` | 游客页（同一个 `index.html`，按自身路径判断走哪扇门）；不需要任何凭据 |
+| POST | `/api/guest/enter` | **唯一不需要凭据的路由**：领一个匿名身份 `{ token, guestId, expiresInMs }` |
+| GET | `/api/guest/state[?nodeId=]` | 只含开了游客门的机器；工作台只有游客列表；对话记录只有**自己**的 |
+| GET | `/api/guest/events?token=` | 同上，SSE；按订阅者过滤，操作者的提问不会进这条流 |
+| POST | `/api/guest/command` | 提交 `{ nodeId, workspace, prompt, sessionId? }`：用游客工作台、游客预设、游客权限 |
+| POST | `/api/guest/answer` | 回答**自己那一轮**提出的问题；别人那一轮的问题被 403 拒掉 |
+
 `/api/events` 是唯一接受 query token 的路由——`EventSource` 无法设置请求头。
 其余所有路由只认 `Authorization` 头，因此 token 不会出现在日志或 Referer 里。
+游客侧的 `events` 同样如此。四个信任域互不通用：操作者 token 打游客路由 401、
+游客身份打操作者路由 401、任何一边打机器路由 401。
 
 **没有「正在等什么问题」的持久化查询。** 提问是**活的**状态，跟在线表一样只活在进程内存里：
 中转台重启，挂起的提问就没了，节点那边会等不到回答、按超时兜底回落本机 GUI。
@@ -401,6 +433,89 @@ DSH 的会话**只有一个写者**：一个打开的写句柄会用内核 flock
   标签和节点上。
 - **页面没能取消正在跑的回合**。回合跑完之前只能等；本机 GUI 里可以随时中断。
 - **中转台的对话记录上限 200 条**（`DSH_REMOTE_TRANSCRIPT_LIMIT`），按机器分别计。
+
+### 五·五、游客模式：一扇**没有密码**的门
+
+给「想让人试用一下、但不想发令牌」的场景：打开一个 URL 就能用，改动不了任何东西，
+也只能在**这台机器明确开出来的那几个目录**里问。三件事同时成立才算游客模式：
+免密码进入、范围受限、只读身份。
+
+**开关是两个，各自的语义不同：**
+
+| 开关 | 位置 | 默认 | 作用 |
+| --- | --- | --- | --- |
+| `guestEnabled` | 每台机器（设置卡片或 `cordis.patch.yml`） | `false` | 这台机器是否开一扇门；**只认布尔 `true`**，写字符串 `"true"` 不算 |
+| `DSH_REMOTE_GUEST` | 中转台环境变量 | 未设 = 开 | 中转台总闸；设 `off` 后所有 `/api/guest/*` 一律 404，**不需要任何机器配合** |
+
+中转台那侧默认是开的，因为门本身由机器决定：机器没开 `guestEnabled`，`/guest` 上什么都
+看不到，游客路由也只会 403。这样「让某台机器开放游客」是一次本机设置，而不是一次需要
+服务器权限的协同变更；而 `off` 是应急关门闸。
+
+**范围是怎么被限死的（两道，互不信任）：**
+
+1. **中转台**只接受 `node.guest.workspaces` 里的路径。这个列表是机器上报的，而中转台
+   还会把它与**该机器上报给操作者的工作台列表**取交集——机器自己列表里凭空多出来的路径
+   不会被中转台存下来。操作者的工作台列表对游客**根本不下发**。
+2. **节点**再判一次：游客命令的工作台必须同时在游客列表和当前 advertised 列表里。
+   注册表模式（`workspaces: registry`）下这一条是关键——游客列表**永远不镜像注册表**，
+   注册表扩大了操作者的可达范围，不会扩大游客的。
+   被拒时的错误只说「游客可用的那些目录」，**不说机器上还有哪些目录**，否则一条被拒的
+   猜测就成了一次目录枚举。
+
+**身份：一人一个匿名身份，而不是「所有游客是同一个人」。** 免密码不等于免身份。
+`POST /api/guest/enter` 发一个随机 token，中转台把它记成一个 `guestId`，这个 id 会写进
+命令信封（`role: 'guest'` + `principal`）并由节点记在它创建的会话上。于是：
+
+- 游客只看到**自己发起的**对话和提问，看不到别的游客的，也看不到操作者的；
+- 续接会话是要按 `(角色, 身份)` 配对的：游客 A 拿不到 B 的会话，操作者拿不到游客的会话，
+  游客也拿不到操作者的。**两边各判一次**——中转台拦一道（`guestSessions` 记账），
+  节点再拦一道（会话记录里存了角色和身份），因为中转台在威胁模型里不被信任；
+  不匹配时节点**另开一个新会话**而不是报错，所以最坏情况是「多聊了一轮」，不是「泄露了一段对话」。
+- 操作者页面上，游客那一轮会被标上「游客」，本机 GUI 里的会话标题带 `[游客] ` 前缀：
+  这扇门是公开的，它的审计线索必须在操作者看得见的地方。
+
+**只读是怎么保证的（也是两道性质不同的东西）：**
+
+- **agent 预设**：默认 `reader`——随本插件一起安装的只读分析 agent。它**手里根本没有写工具**
+  （没有 `write` / `edit`，没有 Shell，也没有子 agent），并且用一个 fail-closed 白名单把
+  所有不在清单里的调用（包括 host 层注册进来的 MCP 工具）当场拒掉。这是硬边界：
+  「不能改」不是靠一句约定，而是因为这个身份没有那个能力。
+- **权限预设**：默认 `read-only`（沙箱 `read-only` + 审批 `ask`），每个游客回合都重新钉一次。
+  于是就算预设被换掉，写操作也过不了沙箱；真要越界重试，审批会弹在**操作者本机**，
+  而中转台和游客页面都没有审批通道。
+
+**门上的限额**（都是限制，不是凭据——游客侧没有任何共享密钥可配置）：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `DSH_REMOTE_GUEST_MAX_VISITORS` | 64 | 同时在册的匿名身份数 |
+| `DSH_REMOTE_GUEST_MAX_OUTSTANDING` | 2 | 一个游客在同一台机器上最多压几条（含队列） |
+| `DSH_REMOTE_GUEST_MAX_QUEUE` | 4 | 一台机器上游客命令的队列深度 |
+| `DSH_REMOTE_GUEST_MAX_PROMPT` | 8000 | 一条游客提问的长度上限（节点侧同样有一道） |
+| `DSH_REMOTE_GUEST_TOKEN_TTL_MS` | 12h | 匿名身份闲置多久作废；身份作废时页面会**自己再领一个**，不是弹错误 |
+| `DSH_REMOTE_GUEST_ENTERS_PER_HOUR` | 20 | 同一个来源地址每小时最多领几个身份（尽力而为：地址取自 `X-Forwarded-For`） |
+
+**配错了会怎样：门关上，节点照常跑。** `guestEnabled: true` 但 `guestWorkspaces` 是空的（或者
+写了一个操作者自己都没开的工作台）是最容易犯的错——两个键在设置卡片里挨着，只有一个长得像开关。
+这种时候插件**不会把整个节点停掉**（那会让你自己的远程控制因为一个关于游客的字段而失效），
+而是把门按关闭上报给中转台，并每次启动都打一条 error 说明原因：
+
+```
+dsh-remote-control: the guest door stays closed: guestEnabled is true but guestWorkspaces is empty, …
+```
+
+页面上什么都不会出现，日志里原因很清楚——这两件事必须同时成立，否则「我明明开了」和
+「怎么打不开」就会变成一次没有线索的排查。`live-check` 会真启动一次这样的配置来盯住它。
+
+**要诚实说清楚的三件事：**
+
+1. **没有密码 = 链接本身就是凭证。** 谁拿到 `/guest` 这个 URL 谁就能用，范围和身份都不构成
+   障碍。真正的约束是「只读 + 只有那几个目录 + 只能用自己的会话」，不是「只有特定的人能进」。
+   要让链接作废：关掉那台机器的 `guestEnabled`，或者在中转台上设 `DSH_REMOTE_GUEST=off`。
+2. **游客会花你这台机器的模型额度。** 只读限制的是能改什么，不是能问多少。所以有限额那一节；
+   要更严格就把 `DSH_REMOTE_GUEST_MAX_OUTSTANDING` 压到 1，或者只在需要演示时开。
+3. **游客看不到操作者的活动细节。** 机器忙的时候游客只会看到「正在运行其他会话」，
+   因为 `detail` 字段是**正在跑的那条提问的前 70 个字符**——那是操作者自己的话。
 
 ---
 
@@ -483,6 +598,13 @@ proxy_read_timeout 660s;   # 覆盖 300s 的提问等待 + 余量（长轮询也
 而生产环境挂在 `/harness/` 下会彻底不可用。现在 `ui-check` 会起一个**和 nginx 行为一致的代理**
 （剥前缀 + 加头）专门复现这个挂载方式，`relay-check` 里也有一条零依赖的等价断言。
 
+**游客入口不需要任何额外的 location。** `/harness/guest` 被同一条 `location /harness/`
+按前缀匹配上，剥掉前缀后 relay 看到 `/guest`，和 `/` 是同一个页面文件。
+页面是公开的（这是设计），但**每一次游客接口调用仍然带着 relay 发的匿名身份**，
+所以 nginx 这层不需要也不应该加白名单；要关门就设 `DSH_REMOTE_GUEST=off`。
+游客和操作者用的是同一批长轮询（命令轮询 + 等作答的 `/api/guest/ask`），
+所以上面那个 `proxy_read_timeout` 也一并覆盖他们。
+
 ### 3·5、服务器上的代码在哪（部署后必读）
 
 中转台的代码放在服务器 **`/opt/dsh-remote-control/`**，而且**它现在是一个 git 检出**，
@@ -548,9 +670,12 @@ curl -s -o /dev/null -w '%{http_code}\n' https://icyu.online/harness/      # 200
 curl -s -o /dev/null -w '%{http_code}\n' https://icyu.online/harness/api/state    # 401
 # 页面应当可加载，并且带上挂载前缀
 curl -s https://icyu.online/harness/ | grep -o '<base href="[^"]*">'              # <base href="/harness/">
+# 游客页也应当可加载（不需要凭据）；没开游客门的部署，这里同样是 200，
+# 只是页面上会显示「门关着」（/api/guest/enter 返回 404）
+curl -s -o /dev/null -w '%{http_code}\n' https://icyu.online/harness/guest       # 200
 ```
 
-两条都对，就用 `env` 文件里的 control token 打开 `https://icyu.online/harness/`，
+都对了，就用 `env` 文件里的 control token 打开 `https://icyu.online/harness/`，
 再把各台机器的 `nodeToken` 配上。
 
 ### 实测记录（2026-09-16 首次落地）
@@ -576,15 +701,26 @@ TLS         证书链可信（ssl_verify_result=0）
 零依赖。前几个不需要任何运行中的东西：
 
 ```sh
-npm test                       # = 下面三个
+npm test                       # = 下面四个
 node tools/relay-check.mjs     # 真起 relay/server.js，用真 HTTP 打它
 node tools/node-check.mjs      # 真 RelayClient 打假中转台
+node tools/presets-check.mjs   # 自带 agent 预设在临时 DSH_HOME 里真装一遍
 node tools/questions-check.mjs # 真 Cordis + 真 user-questions seam，验提问接管顺序
 
 node tools/runner-check.mjs    # 真 RemoteRunner 打假 Harness（需要磁盘上有 @deepseek-ai/*）
-npm run test:live              # 隔离 DSH_HOME 里真启动 web profile
+npm run test:harness           # = runner-check + live-check + settings-check + card-check
 npm run test:ui                # 真 Chromium 里把问答页跑一遍
 ```
+
+`presets-check` 盯的是「自带预设到底写了谁的目录」这一件事：全新安装、重复运行是 no-op、
+快照变了才更新且先备份、**没有本插件戳的目录一个字都不动**、快照删掉的文件要跟着删、
+源目录读不到时报告失败而不是抛异常。最后两条不是洁癖：抛异常会发生在插件加载期，
+而「不动别人的目录」是防止上游手装的预设被每次重启悄悄退回快照——那个故障没有任何症状。
+
+`relay-check` 现在也把整扇游客门跑一遍（47 条）：四个信任域互不通用、游客看不到操作者
+或别的游客的对话、游客工作台被取交集、越权/超长/超量分别被 400/400/429 拒掉、
+自己那一轮的提问只有自己答得了、SSE 是按订阅者过滤的（操作者的提问不会进游客那条流）、
+以及**在另一个进程里把 `DSH_REMOTE_GUEST=off` 打开**后门确实是关的、而操作者路由照旧。
 
 `questions-check` 是**提问功能唯一一个能证明「接管生效」的检查**。桥接本身好不好测，
 但它**必须排在前面**才起作用——Cordis 的 waterfall 按注册顺序跑，而转发到本机浏览器
@@ -617,6 +753,14 @@ Harness 的代码），解析不到时报告**跳过**而不是失败，所以 `
 现在配置解析集中在 [`lib/config.js`](lib/config.js)，每个字段都有显式默认值，
 而 `live-check` 专门盯死「装上了但没运行」这一类问题。
 
+它同时是**唯一能证明游客那套东西真的成立**的检查，而且不需要模型：它用带游客门的配置启动，
+断言自带的 `reader` 预设**真的落到了隔离 `DSH_HOME` 里**、`agentPresets.resolve('reader')`
+和权限表里的 `read-only` 都**真的解析得开**（解析不开时插件会往日志里写一行错误，这里断言
+那行**不在**）、广告出去的游客列表是游客那一份、然后从长轮询里塞一条 `role: 'guest'` 的命令
+打操作者目录——断言它死在**身份边界**上（`not offered to guests`）而不是死在「没有模型凭据」上。
+最后这条很重要：它证明整条链路（投递 → runner 入口 → 角色判定 → 回报）在没有模型的情况下
+也是通的。
+
 `ui-check` 用 DevTools 协议驱动真 Chromium：注入 token、加载真页面、**在页面上打字并点
 页面自己的发送按钮**，然后自己扮演节点把命令领走回答，断言回答不刷新就出现在页面上；
 也会扮演 agent 反过来提问：等卡片出现、点选项、点提交，断言答案真的到达挂起的那次请求，
@@ -632,6 +776,14 @@ Harness 的代码），解析不到时报告**跳过**而不是失败，所以 `
 href）。手写渲染器最典型的 bug 正好落在这两条之间：它可能过得了前一半、栽在后一半，或者
 反过来。**这个检查当场抓到了一个真 bug**——链接那条分支判断的分组名在正则里根本不存在，
 于是每个 `[文字](url)` 都被当成裸 URL，渲染成了字面的 `[文字](` 加一个链接。
+
+它还跑一遍**游客那一侧**：打开 `/guest` 不需要输入任何东西、页面上出现「游客」标记、
+侧边栏只列游客工作台（操作者的目录不在里面）、没有广播按钮、提示语写明只读、
+**不继承**操作者在这台浏览器里存的会话 id，以及一个过期了的游客身份会被**静默换新**而不是
+报错。这一段当场抓到一个真 bug：`hidden` 属性只是 UA 样式表里的 `display: none`，
+而 `.btn { display: inline-flex }` 是作者样式，于是「游客不该看到广播按钮」的断言
+（查的是 `.hidden` 属性）通过了，**截图上那个按钮还在**。现在那道断言查
+`getComputedStyle`——这类 bug 只有真浏览器看得见，所以它必须在真浏览器里断言。
 
 它已经抓到过几个只有真浏览器才看得见的问题：首次打开时节点列表渲染出来却**没有自动选中**
 （于是工作台、历史、发送按钮全是空的），乐观插入的问句和 SSE 推来的问句重复渲染成两条、
@@ -649,12 +801,15 @@ href）。手写渲染器最典型的 bug 正好落在这两条之间：它可�
 当前实况：
 
 ```
-relay-check     62/62
-node-check      84/84
-questions-check 12/12
-runner-check    98/98
-live-check      21/21
-ui-check        51/51
+relay-check     109/109
+node-check      124/124
+presets-check    35/35
+questions-check  12/12
+runner-check    113/113
+live-check       43/43
+settings-check   11/11
+card-check       12/12
+ui-check         64/64
 ```
 
 提问转发这一层在三个检查里各自被钉住一角，因为它们能看见的东西不同：
@@ -700,6 +855,12 @@ CI（[`.github/workflows/checks.yml`](.github/workflows/checks.yml)）分三层�
 | `reconnectMinMs` / `reconnectMaxMs` | `2000` / `60000` | 断线重连退避区间 |
 | `questionTimeoutMs` | `300000` | 模型提问在页面上等多久；到点回落本机 GUI。**必须小于反代的 `proxy_read_timeout`** |
 | `enabled` | `true` | 设 `false` 只校验配置并打日志，不连接 |
+| `installBundledPresets` | `true` | 是否把自带的 agent 预设写进 `$DSH_HOME/.agent-presets`（见 八·五） |
+| `guestEnabled` | `false` | 是否开一扇游客门。**只认布尔 `true`**——这扇门是公开的，不能因为「字段存在」就打开 |
+| `guestWorkspaces` | `[]` | 游客**唯一**能访问的目录；显式列表模式下必须是 `workspaces` 的子集，否则**只关门、不停节点**并打一条 error（注册表模式下与实时注册表取交集） |
+| `guestAgentPreset` | `reader` | 游客会话用哪个 agent 预设（自带安装的那个只读 agent） |
+| `guestPermissionPreset` | `read-only` | 固定给游客会话的权限预设 |
+| `guestMaxPromptChars` | `8000` | 一条游客提问的长度上限（节点侧同样拦一道） |
 
 改用户设置现在可以直接编辑 `settings.yaml`：
 
@@ -724,6 +885,50 @@ remote-control:
 | `DSH_REMOTE_OFFLINE_AFTER_MS` | `45000` | 多久没轮询算离线（离线节点会被拒绝收新命令） |
 | `DSH_REMOTE_TRANSCRIPT_LIMIT` | `200` | 每台机器保留多少条对话记录 |
 | `DSH_REMOTE_QUESTION_TIMEOUT_MS` | `330000` | 挂起的提问最久等多久；刻意比节点的 `questionTimeoutMs` 长，让节点自己的兜底先触发 |
+| `DSH_REMOTE_GUEST` | 未设 = 开 | 游客门总闸；`off` = 所有 `/api/guest/*` 一律 404 |
+| `DSH_REMOTE_GUEST_MAX_VISITORS` | `64` | 同时在册的匿名游客身份数 |
+| `DSH_REMOTE_GUEST_MAX_OUTSTANDING` | `2` | 一个游客在同一台机器上最多压几条 |
+| `DSH_REMOTE_GUEST_MAX_QUEUE` | `4` | 一台机器上游客命令的队列深度 |
+| `DSH_REMOTE_GUEST_MAX_PROMPT` | `8000` | 一条游客提问的长度上限 |
+| `DSH_REMOTE_GUEST_TOKEN_TTL_MS` | `43200000` | 匿名身份闲置作废时长（12 小时） |
+| `DSH_REMOTE_GUEST_ENTERS_PER_HOUR` | `20` | 每个来源地址每小时的领号上限 |
+
+---
+
+## 八·五、随插件一起安装的 agent 预设（`reader`）
+
+游客模式默认用 `reader`——「只读代码分析」这个 agent 预设。它不是 DSH 内置的，而是**跟着
+本插件一起装的**：`presets/reader/` 是它的一份快照，插件加载时写进
+`$DSH_HOME/.agent-presets/reader/`。
+
+为什么要在插件里做这件事：DSH **没有「从包安装预设」的机制**（preset root 只接受一个路径），
+所以「让用户再手动跑一个 install.sh」等于这个功能默认是坏的——第一个游客提问会以一个
+「预设解析不了」的错误出现在**公网页面**上，而不是出现在能看到原因的地方。
+`installBundledPresets: false` 可以关掉它。
+
+**它只在三种情况下写盘，规则写在 [`lib/presets.js`](lib/presets.js)：**
+
+| 目标目录的状态 | 动作 |
+| --- | --- |
+| 不存在 | 全新安装，并落一个所有权戳 `.dsh-bundled-preset.json`（含每个文件的 sha256） |
+| 存在、有本插件的戳 | 内容与快照不一致才更新；更新前先把旧版整体备份成 `.backup-reader-<时间戳>` |
+| 存在、**没有**戳 | **一个字都不动**，只打一行日志说这是别人装的 |
+
+最后一行是这套东西能用的关键，值得说清为什么：`dsh-agent` 仓库里的 `install.sh` 才是这个
+预设的上游，它用 `rsync --delete` 镜像源目录，**顺手就把戳删掉了**。于是「有人从上游装过
+一次」之后，本插件对那个目录永久保持安静——不会在每次后端重启时把更新的预设悄悄退回插件
+里冻住的那份快照。这类故障没有任何可见症状，只有「重启之后行为变了」，所以它必须靠机制
+而不是靠自觉来避免。
+
+`reader` 的机制细节（白名单闸门、目录收口、为什么不挂 Shell）写在预设自己的
+[`agent.cordis.yml`](presets/reader/agent.cordis.yml) 头部，那是它唯一的事实来源。
+
+```sh
+# 只看会写什么（插件加载时自动执行的就是这一步）
+node -e "import('./lib/presets.js').then(async (m) => console.log(await m.ensureBundledPresets()))"
+# 端到端验证：隔离 DSH_HOME 里真启动一次，断言装上了、名字真的解析得开
+node tools/live-check.mjs
+```
 
 ---
 

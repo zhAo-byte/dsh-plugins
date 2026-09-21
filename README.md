@@ -101,6 +101,15 @@ ln -sfn "$PWD/packages/dsh-codex-bridge/client" ~/.dsh/profiles/web/node_modules
 - **relay 中转台**：零依赖，一个进程，只做在线表 + 信箱 + 问答页。
   不跑 DSH、不跑模型、不存模型凭据。
 
+**游客模式**（可选，默认关）：给每台机器开一扇**不需要密码**的公开门 `/guest`——
+`guestEnabled: true` 之后，拿到链接的人就能用。范围被两道互不信任的检查限死
+（只能访问这台机器明确开出来的那几个工作台），身份是**一人一个匿名 id**
+（看不到操作者、也看不到别的游客的对话），而且默认跑的是随插件一起安装的
+**只读 agent**（`reader`：没有写工具、没有 Shell，权限再钉 `read-only`）。
+中转台上还有 `DSH_REMOTE_GUEST=off` 这个总闸，关门不需要任何机器配合。
+链接本身就是凭证，代价写得很清楚——见
+[`packages/dsh-remote-control/README.md`](packages/dsh-remote-control/README.md) 的五·五。
+
 ```sh
 dsh plugin --profile web add ./packages/dsh-remote-control
 ```
@@ -137,9 +146,9 @@ bundle 通道已经带了这一行，重复 id 会让 profile 启动失败。
 
 | 入口 | 需要什么 | 内容 |
 | --- | --- | --- |
-| `npm test` | **只要 Node** | relay 41 · node 50 |
-| `npm run test:harness` | 磁盘上有真 Harness | runner 51 · live 21 |
-| `npm run test:ui` | 一个 Chromium | 问答页 21 |
+| `npm test` | **只要 Node** | relay 109 · node 124 · 自带预设安装 35 · 提问接管 12 |
+| `npm run test:harness` | 磁盘上有真 Harness | runner 113 · live 43 · 设置 11 · 配置卡片 12 |
+| `npm run test:ui` | 一个 Chromium | 问答页 + 游客页 64 |
 
 ```sh
 cd packages/dsh-remote-control

@@ -31,6 +31,105 @@ import { RemoteRunner, normalizeWorkspaces } from './runner.js'
 export const name = 'dsh-remote-control'
 
 /**
+ * Turn the resolved configuration's guest keys into the posture the runner takes.
+ *
+ * Two checks live here rather than in the resolver, because both need the
+ * *normalized* owner list that only `prepare()` has:
+ *
+ * - an open door with no directory behind it is a configuration mistake;
+ * - with an explicit owner list, a guest directory must be one of them. This is
+ *   the invariant that makes "guests can only reach what the operator already
+ *   granted" checkable by reading two lists, instead of depending on the relay
+ *   being well behaved. In registry mode there is no fixed owner list to compare
+ *   against, so the runtime intersection in `RemoteRunner.guestWorkspaces` is the
+ *   enforcement point instead.
+ *
+ * **A mistake closes the door; it does not stop the node.** Throwing here would
+ * take the operator's own remote control down because of a key about guests —
+ * a strictly worse outcome than a door that stayed shut, and one that arrives
+ * through a settings card where the two keys sit side by side. So the failure is
+ * returned as `problem`, the caller logs it at error level, and the door is
+ * reported to the relay as closed. Silence would be the bad version: an operator
+ * who typed `guestEnabled: true` must be able to tell that nothing opened.
+ *
+ * Exported because the subset rule is the security property, and it is testable
+ * without a Harness — `tools/node-check.mjs` drives it directly.
+ *
+ * @param {object} resolved - output of `resolveConfig`.
+ * @param {Array<{ name: string, path: string }>} ownerWorkspaces - normalized owner list.
+ * @returns {{ guest: object, problem?: string }} the posture, and why the door stayed shut.
+ */
+export function prepareGuest(resolved, ownerWorkspaces) {
+  const guest = resolved.guest
+  const closed = { ...guest, enabled: false, workspaces: [] }
+  if (guest.enabled !== true) return { guest: closed }
+  let workspaces
+  try {
+    workspaces = normalizeWorkspaces(guest.workspaces)
+  } catch (error) {
+    return { guest: closed, problem: `the guest door stays closed: ${error.message}` }
+  }
+  if (workspaces.length === 0) {
+    return {
+      guest: closed,
+      problem: 'the guest door stays closed: guestEnabled is true but guestWorkspaces is empty, so guests would have nothing to run in'
+    }
+  }
+  if (!resolved.registryMode) {
+    const owner = new Set(ownerWorkspaces.map((entry) => entry.path))
+    const outside = workspaces.find((entry) => !owner.has(entry.path))
+    if (outside !== undefined) {
+      return {
+        guest: closed,
+        problem:
+          `the guest door stays closed: guest workspace ${JSON.stringify(outside.path)} is not one of this node's workspaces; ` +
+          'guestWorkspaces must be a subset of workspaces'
+      }
+    }
+  }
+  return { guest: { ...guest, workspaces } }
+}
+
+/**
+ * Check that a guest turn's two preset names actually resolve, and say so if not.
+ *
+ * Both failures are otherwise invisible until a stranger's first question fails,
+ * which is the worst place to discover a typo: the relay page shows a generic
+ * error and nothing on the machine records why. The permission preset is only
+ * checked when the service exposes `resolve`, because a deployment that removed
+ * it would otherwise look like a configuration error rather than a version skew.
+ *
+ * @param {object} scoped - context carrying `agentPresets` and `permissionPresets`.
+ * @param {object} guest - the resolved guest posture.
+ * @param {object} logger - Cordis logger, possibly absent.
+ * @returns {Promise<void>} resolves once both checks were reported.
+ */
+async function preflightGuestPosture(scoped, guest, logger) {
+  try {
+    await scoped.agentPresets.resolve(guest.agentPreset)
+  } catch (error) {
+    report(
+      logger,
+      'error',
+      `guest agent preset ${JSON.stringify(guest.agentPreset)} does not resolve (${error?.message ?? error}); ` +
+        'every guest turn will fail until it is installed'
+    )
+  }
+  const presets = typeof scoped.get === 'function' ? scoped.get('permissionPresets') : undefined
+  if (presets === undefined || typeof presets.resolve !== 'function') return
+  try {
+    presets.resolve(guest.permissionPreset)
+  } catch (error) {
+    report(
+      logger,
+      'error',
+      `guest permission preset ${JSON.stringify(guest.permissionPreset)} does not resolve (${error?.message ?? error}); ` +
+        'every guest turn will fail until it is added to the permission preset table'
+    )
+  }
+}
+
+/**
  * Services the node needs before it may start.
  *
  * These are declared for `ctx.inject` rather than as a plugin-level `inject` on
@@ -67,6 +166,37 @@ export const REQUIRED_SERVICES = ['agents', 'agentPresets', 'agentDefaultModel',
  */
 export async function apply(ctx, config) {
   const logger = ctx.logger
+
+  // ── the agent presets this package ships ─────────────────────────────────
+  //
+  // Installing the plugin has to install the agent it needs, or guest mode
+  // arrives broken: DSH cannot fetch a preset from a package (the preset root
+  // takes a path), so the snapshot in `presets/` is written into the DSH home
+  // here. This runs before the node starts because the first guest turn is
+  // exactly what would otherwise fail, on a public page, with a preset-resolution
+  // error nobody can act on.
+  //
+  // It is deliberately allowed to fail softly. A read-only home, a permissions
+  // problem, or a preset the operator installed by hand are all ordinary
+  // conditions, and none of them justifies a backend that will not load.
+  // `lib/presets.js` owns the rules — notably that a directory without this
+  // plugin's stamp is never touched.
+  if (config?.installBundledPresets !== false) {
+    try {
+      const { ensureBundledPresets } = await import('./presets.js')
+      for (const entry of await ensureBundledPresets()) {
+        if (entry.action === 'current') continue
+        report(logger, entry.action === 'failed' ? 'warn' : 'info', `agent preset "${entry.id}": ${entry.detail}`)
+      }
+    } catch (error) {
+      report(
+        logger,
+        'warn',
+        `the bundled agent presets could not be installed (${error?.message ?? error}); ` +
+          'guest mode needs its agent preset present under $DSH_HOME/.agent-presets'
+      )
+    }
+  }
 
   /**
    * The settings schema, resolved before anything installs it.
@@ -132,14 +262,18 @@ export async function apply(ctx, config) {
       return { error: error.message }
     }
     let workspaces
+    let preparedGuest
     try {
       workspaces = normalizeWorkspaces(resolved.workspaces)
+      preparedGuest = prepareGuest(resolved, workspaces)
     } catch (error) {
       return { error: error.message }
     }
     return {
       resolved,
       workspaces,
+      guest: preparedGuest.guest,
+      ...(preparedGuest.problem === undefined ? {} : { guestProblem: preparedGuest.problem }),
       identity: {
         nodeId: resolved.nodeId === '' ? deriveNodeId() : resolved.nodeId,
         name: resolved.displayName === '' ? hostname() : resolved.displayName,
@@ -202,10 +336,19 @@ export async function apply(ctx, config) {
    * @param {object} scoped - context carrying the Harness services the runner needs.
    */
   const start = (prepared, scoped) => {
-    const { resolved, identity } = prepared
+    const { resolved, identity, guest } = prepared
+    // Reported before anything else: the door stayed shut because of a mistake, and
+    // that has to be said on every (re)start rather than only at load — a settings
+    // edit is the most likely way to make it happen.
+    if (prepared.guestProblem !== undefined) report(logger, 'error', prepared.guestProblem)
     // In registry mode the configured list is ignored and the live registry is the
     // authority. `identity.workspaces` is only ever the startup snapshot used for
     // the announcement; the runner re-reads so the advertised set stays current.
+    //
+    // The guest list is not mirrored, in either mode: guests get the explicit
+    // directories the operator named, intersected at read time with the operator's
+    // live set. Registry mode therefore widens the operator's reachable set
+    // without ever widening a guest's.
     const workspaceProvider = resolved.registryMode ? registryWorkspaceProvider(scoped) : undefined
     const workspaces = workspaceProvider === undefined ? prepared.workspaces : workspaceProvider()
     const controller = new AbortController()
@@ -218,12 +361,32 @@ export async function apply(ctx, config) {
     })
     const runner = new RemoteRunner({
       ctx: scoped,
-      config: { ...resolved, ...identity, workspaces },
+      config: { ...resolved, ...identity, workspaces, guest },
       logger,
       questions,
       ...(workspaceProvider === undefined ? {} : { workspaceProvider })
     })
     liveQuestions.add(questions)
+
+    /**
+     * What the relay may know about the guest door.
+     *
+     * The relay needs the list to refuse a guest command for a directory this node
+     * never opened, and the page needs it to render the choice. It carries the two
+     * preset names as well, so the page can say what a guest turn will actually run
+     * as rather than describing a posture the node might not use.
+     *
+     * Sent on every hello, including when the door is shut: a node that was
+     * reconfigured has to be able to *close* a door the relay still remembers.
+     *
+     * @returns {object} the advertisement.
+     */
+    const guestAdvertisement = () => ({
+      enabled: guest.enabled,
+      agentPreset: guest.agentPreset,
+      permissionPreset: guest.permissionPreset,
+      workspaces: runner.guestWorkspaces()
+    })
 
     /**
      * Execute one command and report its outcome.
@@ -269,7 +432,7 @@ export async function apply(ctx, config) {
       let announced = false
       while (!controller.signal.aborted) {
         try {
-          const ack = await client.hello({ ...identity, workspaces: runner.workspaces() })
+          const ack = await client.hello({ ...identity, workspaces: runner.workspaces(), guest: guestAdvertisement() })
           if (typeof ack.pollHoldMs === 'number' && ack.pollHoldMs > 0) pollHoldMs = ack.pollHoldMs
           if (!announced) {
             const advertised = runner.workspaces()
@@ -279,6 +442,7 @@ export async function apply(ctx, config) {
               `node "${identity.nodeId}" (${identity.name}) → ${client.baseUrl}, ` +
                 `${String(advertised.length)} workspace(s), preset ${resolved.agentPreset}, ` +
                 `permission ${resolved.permissionPreset}, ` +
+                `guest ${guest.enabled ? `on (${String(runner.guestWorkspaces().length)} workspace(s), preset ${guest.agentPreset})` : 'off'}, ` +
                 `workspaces from ${resolved.registryMode ? 'the DSH registry' : 'the configured list'}`
             )
             if (resolved.registryMode) {
@@ -290,6 +454,20 @@ export async function apply(ctx, config) {
                 `registry mode: any directory this machine opens a session in becomes remotely reachable — ${advertised
                   .map((entry) => entry.path)
                   .join(', ')}`
+              )
+            }
+            if (guest.enabled) {
+              // An open door is worth a line in the log every time the node
+              // connects: the operator's exposure should never depend on them
+              // remembering which YAML key they set months ago.
+              report(
+                logger,
+                'warn',
+                `guest mode: anyone who opens the relay's /guest page may run the "${guest.agentPreset}" agent ` +
+                  `(permission ${guest.permissionPreset}) in ${runner
+                    .guestWorkspaces()
+                    .map((entry) => entry.path)
+                    .join(', ')}`
               )
             }
             announced = true
@@ -327,7 +505,8 @@ export async function apply(ctx, config) {
       report(
         logger,
         'info',
-        `disabled (node "${identity.nodeId}", ${String(workspaces.length)} workspace(s), relay ${client.baseUrl})`
+        `disabled (node "${identity.nodeId}", ${String(workspaces.length)} workspace(s), ` +
+          `guest ${guest.enabled ? 'on' : 'off'}, relay ${client.baseUrl})`
       )
       // Nothing will run, so nothing may answer: leaving the bridge live would
       // make a disabled node claim every question of every session it ever
@@ -338,6 +517,13 @@ export async function apply(ctx, config) {
     }
     if (workspaces.length === 0) {
       report(logger, 'warn', 'no workspaces configured; this node will register but offer nothing to run in')
+    }
+    if (guest.enabled) {
+      // The guest posture names two presets that the operator does not type in the
+      // common case; both are checked once here so a missing agent preset is a line
+      // in the log rather than a failure on a public page. Not awaited: resolving a
+      // preset must not delay the node from connecting.
+      void preflightGuestPosture(scoped, guest, logger)
     }
 
     run().catch((error) => {
