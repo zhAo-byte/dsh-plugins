@@ -30,6 +30,20 @@ EnvironmentFile=/etc/dsh-remote-relay.env
 Environment=DSH_REMOTE_RELAY_HOST=127.0.0.1
 Environment=DSH_REMOTE_RELAY_PORT=8787
 
+# The little the relay remembers across a restart: guest identities (so an invited
+# visitor is never asked for a code they no longer have), the invite codes still in
+# their fifteen minutes, the conversation records, and the questions still waiting
+# for a machine.
+#
+# systemd creates this directory, makes it writable for the service, and exports it
+# as `$STATE_DIRECTORY` — which is where the relay looks by default. 0700 because the
+# file inside holds bearer credentials for the guest door.
+#
+# Without this line the relay still runs; it simply forgets, and the startup line
+# says so. `DSH_REMOTE_STATE_FILE=/some/path.json` overrides the location.
+StateDirectory=dsh-remote-relay
+StateDirectoryMode=0700
+
 # The public guest door. Each node decides for itself whether it offers one (its
 # `guestEnabled` setting); this is the relay-wide kill switch, and it takes effect
 # without any machine's cooperation:

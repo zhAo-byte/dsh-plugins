@@ -587,6 +587,58 @@ try {
   responder = () => ({ status: 200, body: { command: null } })
   check('poll maps "no work" to null', (await client.poll({ nodeId: 'n1' }, 1500)) === null)
 
+  // ── what the relay remembers, and where ──────────────────────────────────
+  // Two rules worth pinning without a server: persistence is opt-in (a relay started
+  // by hand must not write bearer credentials into whatever directory it happens to
+  // be in), and a restored file is pruned so it cannot resurrect anything expired.
+  {
+    const { createStateStore, pruneState, stateFilePath } = await import('../relay/state.js')
+    check('nothing configured means nothing is written', stateFilePath({}) === '', JSON.stringify(stateFilePath({})))
+    check('an explicit path wins', stateFilePath({ DSH_REMOTE_STATE_FILE: '/tmp/x.json', STATE_DIRECTORY: '/var/lib/y' }) === '/tmp/x.json')
+    check(
+      'systemd’s state directory is used when there is one',
+      stateFilePath({ STATE_DIRECTORY: '/var/lib/dsh-remote-relay' }) === '/var/lib/dsh-remote-relay/guests.json',
+      stateFilePath({ STATE_DIRECTORY: '/var/lib/dsh-remote-relay' })
+    )
+    const off = createStateStore({ file: '' })
+    check('a store without a path is disabled, not broken', off.persisted === false)
+    off.save({ identities: { 'a': { guestId: 'g' } } })
+    off.flush()
+    check('and saving through it is a no-op', Object.keys(off.load().identities).length === 0)
+
+    const now = Date.now()
+    const pruned = pruneState(
+      {
+        identities: {
+          fresh: { guestId: 'g1', nodeId: 'n', lastSeenAt: now },
+          stale: { guestId: 'g2', nodeId: 'n', lastSeenAt: now - 40 * 24 * 3600 * 1000 }
+        },
+        invites: {
+          live: { code: 'AAAA-AAAA', nodeId: 'n', expiresAt: now + 60_000 },
+          ancient: { code: 'BBBB-BBBB', nodeId: 'n', expiresAt: now - 3600_000 }
+        },
+        sessions: { g1: { s1: 'n' }, g2: { s2: 'n' } },
+        counters: { enters: { '1.2.3.4': [now, now - 2 * 3600_000] } },
+        transcripts: {
+          n: Array.from({ length: 250 }, (_, index) => ({ at: now, kind: 'question', prompt: String(index) })),
+          gone: [{ at: now - 40 * 24 * 3600 * 1000, kind: 'question', prompt: 'old' }]
+        },
+        seq: { n: 250, gone: 1 },
+        queue: { n: [{ commandId: 'c1', issuedAt: now }], gone: [{ commandId: 'c2', issuedAt: now - 3 * 24 * 3600_000 }] },
+        inFlight: { c1: { nodeId: 'n', issuedAt: now }, c2: { nodeId: 'n', issuedAt: now - 3 * 24 * 3600_000 } }
+      },
+      { identityTtlMs: 30 * 24 * 3600 * 1000, inviteMemoryMs: 10 * 60 * 1000, maxIdentities: 64, transcriptLimit: 200 }
+    )
+    check('an expired identity is not resurrected', !('stale' in pruned.identities) && 'fresh' in pruned.identities)
+    check('its sessions go with it', !('g2' in pruned.sessions) && 'g1' in pruned.sessions)
+    check('an expired invite is dropped', 'live' in pruned.invites && !('ancient' in pruned.invites))
+    check('a transcript is capped like the live one', pruned.transcripts.n.length === 200, String(pruned.transcripts.n.length))
+    check('a transcript nobody has touched for a month is dropped', pruned.transcripts.gone === undefined)
+    check('its sequence counter goes with it', pruned.seq.gone === undefined)
+    check('waiting work survives, abandoned work does not', 'c1' in pruned.inFlight && !('c2' in pruned.inFlight))
+    check('an old rate counter is trimmed to the last hour', pruned.counters.enters['1.2.3.4'].length === 1)
+  }
+
   // ── minting an invite code ───────────────────────────────────────────────
   // The settings card's button goes through this call, so the two things worth
   // pinning are the wire shape (the relay's agent route, with the node's token) and

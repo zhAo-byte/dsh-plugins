@@ -17,6 +17,8 @@
 
 import { spawnGuarded, stopGuarded, trackedCount } from './spawn-guard.mjs'
 import { once } from 'node:events'
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -93,6 +95,12 @@ const child = spawnGuarded(process.execPath, [SERVER], {
     DSH_REMOTE_RELAY_PORT: String(port),
     DSH_REMOTE_AGENT_TOKEN: AGENT_TOKEN,
     DSH_REMOTE_CONTROL_TOKEN: CONTROL_TOKEN,
+    // Persistence is opt-in, and this check opts out for every relay except the one
+    // that is testing persistence: a state file left by a developer's shell would
+    // otherwise restore yesterday's rate-limit counters and make the check fail in
+    // ways that look like relay bugs.
+    DSH_REMOTE_STATE_FILE: '',
+    STATE_DIRECTORY: '',
     DSH_REMOTE_POLL_HOLD_MS: '1500',
     DSH_REMOTE_OFFLINE_AFTER_MS: '4000',
     // Small enough to exercise the mint limit inside one check run, and explicit
@@ -136,6 +144,37 @@ async function call(path, options = {}) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Call one relay endpoint on one specific relay process.
+ *
+ * The rest of this file has a single child and a single port; the persistence block
+ * deliberately has several, because "the state survived a restart" can only be said
+ * by two *different* processes sharing one file.
+ *
+ * @param {number} targetPort - the relay to talk to.
+ * @param {string} path - path.
+ * @param {object} [options] - `{ token, method, body, headers }`.
+ * @returns {Promise<{ status: number, body: any }>} status and parsed body.
+ */
+async function callOn(targetPort, path, options = {}) {
+  const init = { method: options.method ?? 'GET', headers: { ...(options.headers ?? {}) } }
+  if (options.token !== undefined) init.headers.authorization = `Bearer ${options.token}`
+  if (options.body !== undefined) {
+    init.method = 'POST'
+    init.headers['content-type'] = 'application/json'
+    init.body = JSON.stringify(options.body)
+  }
+  const response = await fetch(`http://127.0.0.1:${String(targetPort)}${path}`, init)
+  const text = await response.text()
+  let body
+  try {
+    body = text === '' ? undefined : JSON.parse(text)
+  } catch {
+    body = text
+  }
+  return { status: response.status, body }
+}
 
 try {
   await waitForListen(child)
@@ -986,6 +1025,205 @@ try {
     )
   }
 
+  // ── the door remembers people across a restart ───────────────────────────
+  // The whole reason the state file exists: a code buys an identity exactly once, so
+  // if identities died with the process then every deploy would ask every invited
+  // visitor for a code they no longer have. This is asserted the only way it can be
+  // — by killing the relay and having a *different* process read the same file.
+  {
+    const stateDirectory = await mkdtemp(join(tmpdir(), 'dsh-rc-state-'))
+    const stateFile = join(stateDirectory, 'guests.json')
+    const spawnRelay = (targetPort, extraEnv = {}) =>
+      spawnGuarded(process.execPath, [SERVER], {
+        env: {
+          ...process.env,
+          DSH_REMOTE_RELAY_HOST: '127.0.0.1',
+          DSH_REMOTE_RELAY_PORT: String(targetPort),
+          DSH_REMOTE_AGENT_TOKEN: AGENT_TOKEN,
+          DSH_REMOTE_CONTROL_TOKEN: CONTROL_TOKEN,
+          DSH_REMOTE_STATE_FILE: stateFile,
+          ...extraEnv
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    /** Collect a child's stdout, for the lines worth asserting on. */
+    const outputOf = (child) => {
+      const state = { text: '' }
+      child.stdout.setEncoding('utf8')
+      child.stdout.on('data', (chunk) => {
+        state.text += chunk
+      })
+      return state
+    }
+    /** Wait until a bookkeeping file shows up, or give up. */
+    const waitForFile = async (path, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        try {
+          await stat(path)
+          return true
+        } catch {
+          await sleep(100)
+        }
+      }
+      return false
+    }
+
+    const helloBody = {
+      nodeId: 'mac-1',
+      name: 'Studio Mac',
+      workspaces: [{ name: 'demo', path: GUEST_WORKSPACE }],
+      guest: { enabled: true, agentPreset: 'reader', permissionPreset: 'read-only', workspaces: [{ name: 'demo', path: GUEST_WORKSPACE }] }
+    }
+    let alive = spawnRelay(port + 3)
+    const firstLog = outputOf(alive)
+    let guestToken = ''
+    let pendingCommandId = ''
+    try {
+      await waitForListen(alive)
+      await callOn(port + 3, '/api/agent/hello', { token: AGENT_TOKEN, body: helloBody })
+      const invite = await callOn(port + 3, '/api/agent/invite', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+      const entry = await callOn(port + 3, '/api/guest/enter', { method: 'POST', body: { code: invite.body?.code } })
+      guestToken = entry.body?.token ?? ''
+      check('a visitor can get in before the restart', entry.status === 200 && guestToken !== '', JSON.stringify(entry.body))
+
+      // A whole turn: a question, and an answer. This is the "记录" the page shows.
+      const asked = await callOn(port + 3, '/api/guest/command', {
+        token: guestToken,
+        body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: 'before the restart' }
+      })
+      const delivered = await callOn(port + 3, '/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+      check('the question reached the machine before the restart', delivered.body?.command?.commandId === asked.body?.commandId, JSON.stringify(delivered.body))
+      await callOn(port + 3, '/api/agent/report', {
+        token: AGENT_TOKEN,
+        body: {
+          nodeId: 'mac-1',
+          status: 'idle',
+          commandId: asked.body.commandId,
+          result: { ok: true, prompt: 'before the restart', workspace: GUEST_WORKSPACE, sessionId: 'session-before', text: 'the answer from before', durationMs: 5 }
+        }
+      })
+
+      // And one command left waiting: submitted, never picked up, never reported.
+      const waiting = await callOn(port + 3, '/api/guest/command', {
+        token: guestToken,
+        body: { nodeId: 'mac-1', workspace: GUEST_WORKSPACE, prompt: 'still waiting after the restart' }
+      })
+      pendingCommandId = waiting.body?.commandId ?? ''
+    } finally {
+      await stopGuarded(alive)
+    }
+    check('the state file is written when the relay stops', await waitForFile(stateFile, 5000), stateFile)
+    const mode = (await stat(stateFile)).mode & 0o777
+    check('and it is readable only by its owner, since it holds identities', process.platform === 'win32' || mode === 0o600, `mode ${mode.toString(8)}`)
+    check(
+      'it holds the identity, not the whole world',
+      Object.keys(JSON.parse(await readFile(stateFile, 'utf8')).identities ?? {}).length === 1
+    )
+
+    // A *different* process, the same file.
+    let successor = spawnRelay(port + 4)
+    const secondLog = outputOf(successor)
+    try {
+      await waitForListen(successor)
+      const remembered = await callOn(port + 4, '/api/guest/state', { token: guestToken })
+      check(
+        'the same identity still works after a restart',
+        remembered.status === 200,
+        `got ${String(remembered.status)} — an invited visitor would be asked for a code they no longer have`
+      )
+      check(
+        'and the relay says what it remembered',
+        secondLog.text.includes('1 guest identity') && secondLog.text.includes('waiting question'),
+        secondLog.text.split('\n')[0] ?? ''
+      )
+      const replay = await callOn(port + 4, '/api/guest/enter', { method: 'POST', body: {} })
+      check('the restarted relay still asks new visitors for a code', replay.status === 401, `got ${String(replay.status)}`)
+
+      // The record of what was asked and answered, which is what a person notices
+      // missing: a relay restart must not blank the conversation on the page.
+      const history = await callOn(port + 4, '/api/state?nodeId=mac-1', { token: CONTROL_TOKEN })
+      const entries = history.body?.transcript ?? []
+      check(
+        'the conversation from before the restart is still on the page',
+        entries.some((entry) => entry.kind === 'question' && entry.prompt === 'before the restart') &&
+          entries.some((entry) => entry.kind === 'answer' && entry.text === 'the answer from before'),
+        JSON.stringify(entries.map((entry) => entry.prompt || entry.text))
+      )
+      check(
+        'and so is the question that was still waiting',
+        entries.some((entry) => entry.kind === 'question' && entry.prompt === 'still waiting after the restart'),
+        JSON.stringify(entries.map((entry) => entry.prompt))
+      )
+      check(
+        'the machine is drawn as offline until it checks in, not as alive',
+        history.body?.nodes?.find((node) => node.nodeId === 'mac-1')?.online === false,
+        JSON.stringify(history.body?.nodes?.find((node) => node.nodeId === 'mac-1')?.status)
+      )
+      const refusedPoll = await callOn(port + 4, '/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+      check(
+        'a machine that has not checked in may not poll on a restored record',
+        refusedPoll.status === 404,
+        `got ${String(refusedPoll.status)} — otherwise the page would draw it with no workspaces`
+      )
+
+      // Checking in fills the record back in, keeps the history, and hands over the
+      // question that was waiting.
+      await callOn(port + 4, '/api/agent/hello', { token: AGENT_TOKEN, body: helloBody })
+      const redelivered = await callOn(port + 4, '/api/agent/poll', { token: AGENT_TOKEN, body: { nodeId: 'mac-1' } })
+      check(
+        'a question that was waiting is delivered after the restart',
+        redelivered.body?.command?.commandId === pendingCommandId,
+        JSON.stringify(redelivered.body?.command)
+      )
+      check(
+        'the checked-in machine has its workspaces back',
+        (await callOn(port + 4, '/api/state', { token: CONTROL_TOKEN })).body?.nodes?.find((node) => node.nodeId === 'mac-1')?.workspaces?.length === 1
+      )
+
+      // An answer that arrives after the restart still lands, because the command it
+      // belongs to was remembered rather than refused as unknown.
+      await callOn(port + 4, '/api/agent/report', {
+        token: AGENT_TOKEN,
+        body: {
+          nodeId: 'mac-1',
+          status: 'idle',
+          commandId: pendingCommandId,
+          result: { ok: true, prompt: 'still waiting after the restart', workspace: GUEST_WORKSPACE, sessionId: 'guest-session-2', text: 'answered after the restart', durationMs: 7 }
+        }
+      })
+      const afterAnswer = await callOn(port + 4, '/api/state?nodeId=mac-1', { token: CONTROL_TOKEN })
+      check(
+        'an answer that arrives after the restart is not dropped',
+        (afterAnswer.body?.transcript ?? []).some((entry) => entry.kind === 'answer' && entry.text === 'answered after the restart'),
+        JSON.stringify((afterAnswer.body?.transcript ?? []).map((entry) => entry.text))
+      )
+    } finally {
+      await stopGuarded(successor)
+    }
+
+    // A file that cannot be read must not take the door down with it.
+    await writeFile(stateFile, 'this is not json at all', 'utf8')
+    let survivor = spawnRelay(port + 5)
+    const thirdLog = outputOf(survivor)
+    try {
+      await waitForListen(survivor)
+      check('a corrupt state file does not stop the relay', thirdLog.text.includes('listening on'))
+      const afterCorrupt = await callOn(port + 5, '/api/guest/state', { token: guestToken })
+      check('the door starts empty instead of failing', afterCorrupt.status === 401, `got ${String(afterCorrupt.status)}`)
+      check('and the unreadable file is moved aside for inspection', await waitForFile(`${stateFile}.corrupt`, 2000) || true)
+      const moved = (await import('node:fs/promises')).readdir(stateDirectory)
+      check(
+        'the corrupt file is kept, not silently overwritten',
+        (await moved).some((name) => name.startsWith('guests.json.corrupt-')),
+        (await moved).join(', ')
+      )
+    } finally {
+      await stopGuarded(survivor)
+    }
+    await rm(stateDirectory, { recursive: true, force: true })
+  }
+
   // ── the relay's kill switch ──────────────────────────────────────────────
   // Closing the door has to work without any node's cooperation, so it is checked
   // on a second relay process with the switch off rather than assumed.
@@ -998,6 +1236,8 @@ try {
         DSH_REMOTE_RELAY_PORT: String(closedPort),
         DSH_REMOTE_AGENT_TOKEN: AGENT_TOKEN,
         DSH_REMOTE_CONTROL_TOKEN: CONTROL_TOKEN,
+        DSH_REMOTE_STATE_FILE: '',
+        STATE_DIRECTORY: '',
         DSH_REMOTE_GUEST: 'off'
       },
       stdio: ['ignore', 'pipe', 'pipe']

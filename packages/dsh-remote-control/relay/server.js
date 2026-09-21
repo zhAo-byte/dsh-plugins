@@ -25,6 +25,7 @@ import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { admitAnswers, admitQuestions } from '../lib/answers.js'
+import { createStateStore, pruneState, stateFilePath } from './state.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -257,6 +258,91 @@ const guestSessions = new Map()
  * @type {Map<string, number[]>}
  */
 const guestEnters = new Map()
+// ── what survives a restart ────────────────────────────────────────────────
+//
+// Four of the maps below are re-read from a state file at boot and written back
+// (debounced) whenever they change: guest identities, invite codes, session
+// ownership, and the rate counters. Without the first one, every relay restart
+// would ask every invited visitor for a code they no longer have — `state.js`
+// carries the full reasoning, and the roster, transcripts, and open questions stay
+// in memory on purpose.
+const store = createStateStore({
+  logger: (line) => process.stderr.write(`${line}\n`)
+})
+const restored = pruneState(store.load(), {
+  identityTtlMs: config.guestTokenTtlMs,
+  inviteMemoryMs: 10 * 60 * 1000,
+  maxIdentities: config.guestMaxVisitors,
+  transcriptLimit: config.transcriptLimit
+})
+// `true` once anything was restored, purely so the startup line can say whether the
+// door remembers people.
+const restoredCount = Object.keys(restored.identities).length
+for (const [token, record] of Object.entries(restored.identities)) guestTokens.set(token, record)
+for (const [code, record] of Object.entries(restored.invites)) invites.set(code, record)
+for (const [guestId, owned] of Object.entries(restored.sessions)) guestSessions.set(guestId, new Map(Object.entries(owned)))
+for (const [address, stamps] of Object.entries(restored.counters.enters ?? {})) guestEnters.set(address, stamps)
+for (const [address, stamps] of Object.entries(restored.counters.codeAttempts ?? {})) codeAttempts.set(address, stamps)
+
+/**
+ * When the liveness stamp was last written out.
+ *
+ * Refreshing a stamp happens on *every* guest call — several times a minute for an
+ * open page — and it is the least interesting change in the file. Structural changes
+ * (an identity minted or dropped, a code consumed, a session claimed) are written
+ * straight away; a bare "still here" waits for this window. Both are still bounded
+ * by the store's own debounce, and a shutdown writes the newest state regardless.
+ */
+let lastLivenessPersistAt = 0
+
+/**
+ * Persist everything the relay is supposed to remember.
+ *
+ * @param {object} [options] - `{ force }` for a change that is not just a liveness stamp.
+ */
+function persistGuestState({ force = false } = {}) {
+  if (!force && Date.now() - lastLivenessPersistAt < 60_000) return
+  lastLivenessPersistAt = Date.now()
+  store.save({
+    identities: Object.fromEntries(guestTokens),
+    invites: Object.fromEntries(invites),
+    sessions: Object.fromEntries([...guestSessions].map(([guestId, owned]) => [guestId, Object.fromEntries(owned)])),
+    counters: {
+      enters: Object.fromEntries(guestEnters),
+      codeAttempts: Object.fromEntries(codeAttempts)
+    },
+    transcripts: Object.fromEntries([...nodes.values()].map((node) => [node.nodeId, node.transcript])),
+    seq: Object.fromEntries([...nodes.values()].map((node) => [node.nodeId, node.transcriptSeq])),
+    queue: Object.fromEntries([...nodes.values()].map((node) => [node.nodeId, node.queue])),
+    inFlight: Object.fromEntries(inFlight)
+  })
+}
+
+// ── restore the machines that have history or waiting work ─────────────────
+//
+// Records are recreated before any node connects, because a queued command and an
+// unreported result both need somewhere to land: `requireNode` refuses an unknown
+// nodeId, and the node that would ordinarily register it is busy — that is the whole
+// reason its answer is still outstanding. They come back with no workspaces and a
+// zero liveness stamp, which the page draws as an offline machine until it helloes,
+// and a report arriving from one of them refreshes it exactly as usual.
+for (const nodeId of new Set([...Object.keys(restored.transcripts ?? {}), ...Object.keys(restored.queue ?? {})])) {
+  const record = new NodeRecord(nodeId)
+  record.transcript = Array.isArray(restored.transcripts?.[nodeId]) ? restored.transcripts[nodeId] : []
+  record.transcriptSeq = Number(restored.seq?.[nodeId] ?? record.transcript.length)
+  record.queue = Array.isArray(restored.queue?.[nodeId]) ? restored.queue[nodeId] : []
+  record.lastSeenAt = 0
+  record.connectedAt = 0
+  record.status = 'offline'
+  record.detail = 'the relay restarted; waiting for this machine to check in'
+  // Until it says hello, this record may carry a transcript and waiting work but not
+  // be polled; see `agentPoll`.
+  record.provisional = true
+  nodes.set(nodeId, record)
+}
+for (const [commandId, record] of Object.entries(restored.inFlight ?? {})) inFlight.set(commandId, record)
+const restoredQueued = [...nodes.values()].reduce((total, node) => total + node.queue.length, 0)
+
 /**
  * Questions a node is holding open, keyed by `nodeId` then `questionId`.
  *
@@ -678,6 +764,8 @@ function appendTranscript(node, entry) {
     if (!visibleEntry(record, subscriber.viewer)) continue
     writeTo(subscriber, { type: 'transcript', entry: record })
   }
+  // What was asked and answered is the part of this relay a person notices missing.
+  persistGuestState({ force: true })
 }
 
 /**
@@ -694,6 +782,10 @@ function deliverOrQueue(node, command) {
     return
   }
   node.queue.push(command)
+  // A question waiting for a machine that is mid-turn (or mid-restart, on the relay
+  // side) has to survive the relay going down, or the page shows a question that can
+  // never be answered.
+  persistGuestState({ force: true })
   broadcastRoster()
 }
 
@@ -717,6 +809,9 @@ function agentHello(body) {
     node = new NodeRecord(nodeId)
     nodes.set(nodeId, node)
   }
+  // Checked in: this record is the machine's own account of itself again, not a
+  // memory of one.
+  node.provisional = false
   if (typeof body.name === 'string' && body.name.trim() !== '') node.name = body.name.trim()
   if (typeof body.platform === 'string') node.platform = body.platform
   if (typeof body.version === 'string') node.version = body.version
@@ -775,6 +870,14 @@ function agentHello(body) {
  */
 async function agentPoll(body, res) {
   const node = requireNode(body)
+  if (node.provisional === true) {
+    // A record restored from disk knows the machine's history but nothing about what
+    // it looks like now — no name, no workspaces. Accepting a poll here would leave
+    // the page drawing a machine with no workbenches and no guest door until the next
+    // restart. The node treats this exactly like any other failed poll and announces
+    // itself, which is what fills the record back in.
+    throw new HttpError(404, `node ${node.nodeId} has not checked in since the relay restarted; run /api/agent/hello first`)
+  }
   node.lastSeenAt = Date.now()
   if (node.status !== 'idle' && body.idle === true) {
     node.status = 'idle'
@@ -783,6 +886,7 @@ async function agentPoll(body, res) {
   }
   const queued = node.queue.shift()
   if (queued !== undefined) {
+    persistGuestState({ force: true })
     sendJson(res, 200, { command: queued })
     return
   }
@@ -848,6 +952,9 @@ function agentReport(body) {
       const owned = guestSessions.get(guestId) ?? new Map()
       owned.set(result.sessionId, node.nodeId)
       guestSessions.set(guestId, owned)
+      // A visitor's next question continues this conversation, so the relay's copy
+      // of "whose session is this" has to outlive a restart too.
+      persistGuestState({ force: true })
     }
     if (node.status !== 'idle') {
       node.status = 'idle'
@@ -1165,8 +1272,13 @@ function submitCommand(node, body, viewer) {
     nodeId: node.nodeId,
     commandId: command.commandId,
     role: viewer.role,
-    guestId: viewer.role === 'guest' ? viewer.guestId : ''
+    guestId: viewer.role === 'guest' ? viewer.guestId : '',
+    issuedAt: command.issuedAt
   })
+  // The command is now somebody's outstanding work. If the relay restarts before the
+  // node reports, this record is what lets that report land instead of being refused
+  // as an unknown command — the answer is not lost just because the relay bounced.
+  persistGuestState({ force: true })
   appendTranscript(node, {
     kind: 'question',
     role: viewer.role,
@@ -1318,6 +1430,9 @@ function guestViewer(token) {
     return undefined
   }
   record.lastSeenAt = Date.now()
+  // A liveness stamp is all this call changed, so it does not force a write: see
+  // `persistGuestState`.
+  persistGuestState()
   // `nodeId` is the machine the invite was for, or '' for an identity minted
   // while the door required no code. It is what narrows the visitor's roster.
   return { role: 'guest', guestId: record.guestId, nodeId: record.nodeId ?? '' }
@@ -1400,6 +1515,7 @@ function agentInvite(body) {
     consumedAt: 0,
     consumedBy: ''
   })
+  persistGuestState({ force: true })
   return { code, nodeId: node.nodeId, expiresAt: now + config.inviteTtlMs, ttlMs: config.inviteTtlMs }
 }
 
@@ -1468,6 +1584,7 @@ function guestEnter(body, req) {
   const guestId = `guest-${randomUUID().slice(0, 12)}`
   guestTokens.set(token, { guestId, nodeId, createdAt: Date.now(), lastSeenAt: Date.now() })
   if (nodeId !== '') invites.get(normalizeInviteCode(body?.code)).consumedBy = guestId
+  persistGuestState({ force: true })
   return { token, guestId, nodeId, expiresInMs: config.guestTokenTtlMs, cookie: config.guestCookieName }
 }
 
@@ -1492,6 +1609,7 @@ function guestLeave(req, url) {
       guestTokens.delete(token)
       guestSessions.delete(record.guestId)
       forgot = true
+      persistGuestState({ force: true })
     }
   }
   return { ok: true, forgot }
@@ -1809,7 +1927,12 @@ server.listen(config.port, config.host, () => {
   process.stdout.write(
     `dsh-remote-control relay listening on http://${config.host}:${String(config.port)}` +
       `${config.publicOrigin === '' ? '' : ` (public: ${config.publicOrigin})`}` +
-      `, guest door ${config.guestEnabled ? 'available' : 'closed'}\n`
+      `, guest door ${config.guestEnabled ? 'available' : 'closed'}` +
+      (store.persisted
+        ? `, ${String(restoredCount)} guest identit${restoredCount === 1 ? 'y' : 'ies'}` +
+          ` and ${String(restoredQueued)} waiting question(s) remembered from ${store.path}`
+        : ', guest identities are only in memory (set DSH_REMOTE_STATE_FILE or run under systemd StateDirectory to keep them)') +
+      '\n'
   )
 })
 
@@ -1820,6 +1943,10 @@ server.listen(config.port, config.host, () => {
  */
 function shutdown(signal) {
   process.stdout.write(`relay: ${signal} received, closing\n`)
+  // Before anything else, and synchronously: whatever is in memory now is what a
+  // restart has to come back to, and `process.exit` below does not wait.
+  persistGuestState({ force: true })
+  store.flush()
   for (const node of nodes.values()) {
     for (const waiter of node.waiters) waiter(null)
     node.waiters.clear()
